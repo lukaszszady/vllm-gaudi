@@ -38,7 +38,8 @@ from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cach
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemoryProfiler, HabanaProfilerCounterHelper,
                                            format_bytes, setup_profiler)
-from vllm_gaudi.extension.profiling_cfg import bucketing_max_batched_tokens, profiling_max_batched_tokens
+from vllm_gaudi.extension.profiling_cfg import (bucketing_max_batched_tokens, hold_before_exit, profile_exit_delay_s,
+                                                profiling_max_batched_tokens)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
@@ -6035,6 +6036,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             profiler = self._profiler_call(profiler, "step", rank)
         self._profiler_call(profiler, "stop", rank)
         self._barrier_after_profiling(rank)
+        # Same delay on every rank (VLLM_PROFILE_EXIT_DELAY_S, default 0) so the traces can be copied off the pod.
+        hold_before_exit(profile_exit_delay_s())
 
     @staticmethod
     def _barrier_after_profiling(rank: int) -> None:
