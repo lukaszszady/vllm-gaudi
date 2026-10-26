@@ -38,6 +38,7 @@ from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cach
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemoryProfiler, HabanaProfilerCounterHelper,
                                            format_bytes, setup_profiler)
+from vllm_gaudi.extension.profiling_cfg import profiling_max_batched_tokens
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
@@ -1432,8 +1433,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._original_max_num_seqs = self.scheduler_config.max_num_seqs
         if prompt_profile_cfg or decode_profile_cfg:
             self.scheduler_config.max_num_seqs = self.max_model_len
-            if prompt_profile_cfg:
-                self.scheduler_config.max_num_batched_tokens = prompt_profile_cfg[0] * prompt_profile_cfg[1]
+            self.scheduler_config.max_num_batched_tokens = profiling_max_batched_tokens(
+                prompt_profile_cfg, decode_profile_cfg, self.scheduler_config.max_num_batched_tokens)
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
 
         # Attention layers that are only in the KVCacheConfig of the runner
