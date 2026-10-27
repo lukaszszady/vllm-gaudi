@@ -1883,7 +1883,8 @@ def test_size_probe_detects_mod_and_symbolic_division():
 
 
 @pytest.mark.parametrize("prefill_impl", ["chunked", "chunked_vec"])
-@pytest.mark.parametrize("num_seqs,seq_len,vec_chunks", [(1, 150, 2), (3, 150, 2), (3, 150, 4), (3, 64, 0), (2, 37, 16)])
+@pytest.mark.parametrize("num_seqs,seq_len,vec_chunks", [(1, 150, 2), (3, 150, 2), (3, 150, 4),
+                                                          (3, 64, 0), (2, 37, 16)])
 def test_prefill_step_traced_sizes_are_plain_dynamic_dims(prefill_impl, num_seqs, seq_len, vec_chunks):
     """The whole prefill step as hpu_kda_forward calls it: a flat dynamic token dimension is split into
     [num_seqs, tokens // num_seqs] and every reshape names its channel size, so only the token dimension is

@@ -110,6 +110,10 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                 mask = getattr(attn_metadata, "padding_mask_flat", None)
                 if mask is not None:
                     mask = mask.reshape(num_seqs, seq_len)
+
+                def per_seq(x):  # [T, D] -> [num_seqs, seq_len, D]; D named, no inferred dim over the dynamic T
+                    return x.reshape(num_seqs, seq_len, x.shape[-1])
+
                 step_hook = lazy_step_hook()  # lazy and outside HPU graphs only (a mark_step breaks a capture)
                 prefill_impl, chunk_size, mark_step_chunks, vec_chunks = _prefill_settings()
                 prefill = dict(state_idx=state_idx,
@@ -126,14 +130,11 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                     # gate_proj is a strided slice of ``projected`` and is used after the graph break below; the
                     # resume graph would receive it as a view with storage offset (strided_view fails in Synapse)
                     gate_proj = gate_proj.contiguous()
-                    core, slots, conv_rows, ssm_rows = kda_prefill_step(mixed_qkv.reshape(num_seqs, seq_len, mixed_qkv.shape[-1]),
-                                                                        raw_g.reshape(num_seqs, seq_len, raw_g.shape[-1]),
-                                                                        raw_beta.reshape(num_seqs, seq_len, raw_beta.shape[-1]),
-                                                                        **prefill)
+                    core, slots, conv_rows, ssm_rows = kda_prefill_step(per_seq(mixed_qkv), per_seq(raw_g),
+                                                                        per_seq(raw_beta), **prefill)
                     core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
                 else:
-                    core = _core_prefill(mixed_qkv.reshape(num_seqs, seq_len, mixed_qkv.shape[-1]), raw_g.reshape(num_seqs, seq_len, raw_g.shape[-1]),
-                                         raw_beta.reshape(num_seqs, seq_len, raw_beta.shape[-1]), **prefill)
+                    core = _core_prefill(per_seq(mixed_qkv), per_seq(raw_g), per_seq(raw_beta), **prefill)
                 # Keep post-processing out of the statement that calls the disabled core: ops chained on its last
                 # line end up in the dynamo resume frame without a source line, and the HPU compile backend then
                 # fails on the unparsable FX stack_trace ("'NoneType' object has no attribute 'file'").
