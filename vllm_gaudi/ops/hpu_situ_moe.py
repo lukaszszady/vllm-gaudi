@@ -254,6 +254,7 @@ def mxfp4_bits_moe(hidden_states: torch.Tensor,
                    activation: str,
                    experts_min: int,
                    group: int = 0,
+                   split_graphs: bool = False,
                    **kwargs) -> torch.Tensor:
     """MXFP4 MoE as a gather-free bf16 dequant of the local experts + the bf16 fused MoE op ``moe_fn``.
 
@@ -264,12 +265,21 @@ def mxfp4_bits_moe(hidden_states: torch.Tensor,
     ``group`` > 0 dequantizes and runs at most that many experts at a time (lower peak memory, one op call per
     group, outputs summed) like the moe_n_slice loop of the bf16 op; 0 = all local experts in one call. ``kwargs``
     (chunk_size / total_experts) are passed through. All shapes are static.
+
+    In one compiled graph the groups do not depend on each other's output, so the graph compiler may schedule the
+    dequant of several groups before their MoE calls and keep their int16 temporaries / bf16 weights alive together;
+    ``split_graphs`` puts a dynamo graph break into the group loop (torch.compile mode only, a no-op in eager mode):
+    the loop then runs eagerly and the dequant / MoE call of each group are compiled as their own graphs, which
+    bounds the transient memory to one group at the cost of a few graph launches per group (pick a group that
+    divides the local expert count, a smaller last group compiles extra graphs).
     """
     num_experts = w13.shape[0]
     step = num_experts if group <= 0 else min(group, num_experts)
     out = None
     for start in range(0, num_experts, step):
         end = min(start + step, num_experts)
+        if split_graphs and start > 0:
+            torch._dynamo.graph_break()
         w12 = dequant_mxfp4_bits(w13[start:end], w13_scale[start:end], clamp_scales=False)
         w3 = dequant_mxfp4_bits(w2[start:end], w2_scale[start:end], clamp_scales=False)
         part = moe_fn(hidden_states=hidden_states,

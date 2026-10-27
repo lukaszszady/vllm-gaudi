@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     HPU_KIMI_SITU_TIMING: int = 0
     HPU_KIMI_MXFP4_DEQUANT: str = "fused"
     HPU_KIMI_MXFP4_DEQUANT_GROUP: int = 14
+    HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS: bool = False
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -217,6 +218,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # experts; 0 = all local experts in one call, ~3.7 GB of transient bf16 weights per layer).
     "HPU_KIMI_MXFP4_DEQUANT_GROUP":
     lambda: _mxfp4_dequant_group(),
+    # "bits" only, torch.compile mode: a graph break in the expert-group loop, so that the dequant and the MoE call
+    # of every group are their own graphs and the transient memory is bounded by one group (a few more graph
+    # launches per group and layer).
+    "HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS":
+    lambda: os.environ.get("HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS", "0").strip().lower() in ("1", "true"),
 }
 
 # end-env-vars-definition

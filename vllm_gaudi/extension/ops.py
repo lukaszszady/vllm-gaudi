@@ -1693,6 +1693,7 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         # enable_bits_dequant; None = native mxfp4_fused_weights.
         self._bits_weights = None
         self._bits_group = 0
+        self._bits_split_graphs = False
         self._compiled_bits_forward = None
 
     def enable_bits_dequant(self, w13: torch.Tensor, w13_scale: torch.Tensor, w2: torch.Tensor,
@@ -1714,6 +1715,7 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
             return False
         self._bits_weights = (w13, w13_scale, w2, w2_scale)
         self._bits_group = group
+        self._bits_split_graphs = gaudi_envs.HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS
         return True
 
     def _get_compiled_bits_forward(self):
@@ -1722,11 +1724,11 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
 
             @torch.compile(backend="hpu_backend")
             def _mxfp4_bits_fwd(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2, w2_scale,
-                                activation, experts_min, group, chunk_size, total_experts):
+                                activation, experts_min, group, split_graphs, chunk_size, total_experts):
                 kwargs = {"chunk_size": chunk_size, "total_experts": total_experts} if chunk_size else {}
                 return mxfp4_bits_moe(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2,
                                       w2_scale, torch.ops.hpu.mixture_of_experts, activation, experts_min, group,
-                                      **kwargs)
+                                      split_graphs, **kwargs)
 
             self._compiled_bits_forward = _mxfp4_bits_fwd
         return self._compiled_bits_forward
@@ -1832,8 +1834,8 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
             # (see HPUUnquantizedFusedMoEMethod.apply_monolithic in ops/hpu_fused_moe.py)
             return self._get_compiled_bits_forward()(hidden_states, expert_routing_table.to(torch.int64),
                                                      router_weights.to(hidden_states.dtype), *self._bits_weights,
-                                                     activation, self.experts_min, self._bits_group, chunk_size,
-                                                     total_experts)
+                                                     activation, self.experts_min, self._bits_group,
+                                                     self._bits_split_graphs, chunk_size, total_experts)
 
         # expert_routing_table must be int32 for the mxfp4 op
         if expert_routing_table.dtype != torch.int32:

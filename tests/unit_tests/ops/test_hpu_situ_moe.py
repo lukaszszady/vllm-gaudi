@@ -793,3 +793,45 @@ def test_bits_moe_traces_as_one_graph():
         dynamo.reset()
     assert len(graphs) == 1
     torch.testing.assert_close(out, fn(x, ids, weights, w13, w13_s, w2, w2_s))
+
+
+@pytest.mark.parametrize("group", [4, 3, 0])
+def test_bits_moe_split_graphs_keeps_every_graph_within_one_group(group):
+    """split_graphs: the group loop runs eagerly, no graph sees the packed weights of more than one group."""
+    import torch._dynamo as dynamo
+    x, ids, weights, w13, w13_s, w2, w2_s, emin = _bits_moe_case(7)
+    moe = _stub_bf16_moe()
+
+    def fn(x, ids, weights, w13, w13_s, w2, w2_s):
+        return situ.mxfp4_bits_moe(x, ids, weights, w13, w13_s, w2, w2_s, moe, "silu", emin, group, True)
+
+    packed_experts = []  # leading dim of every uint8 (packed weight / scale) graph input, per graph
+
+    def backend(gm, example_inputs):
+        packed_experts.append([a.shape[0] for a in example_inputs if getattr(a, "dtype", None) == torch.uint8])
+        return gm.forward
+
+    dynamo.reset()
+    try:
+        out = torch.compile(fn, backend=backend)(x, ids, weights, w13, w13_s, w2, w2_s)
+    finally:
+        dynamo.reset()
+    if group == 0:
+        assert packed_experts == [[8, 8, 8, 8]]  # one group: no break, one graph as without split_graphs
+    else:
+        assert len(packed_experts) > 1 and all(n <= group for g in packed_experts for n in g)
+    eager = fn(x, ids, weights, w13, w13_s, w2, w2_s)  # graph_break is a no-op outside dynamo
+    assert torch.equal(out, eager)
+    no_split = situ.mxfp4_bits_moe(x, ids, weights, w13, w13_s, w2, w2_s, moe, "silu", emin, group)
+    assert torch.equal(eager, no_split)
+
+
+def test_bits_split_graphs_env(monkeypatch):
+    spec = importlib.util.spec_from_file_location("vllm_gaudi_envs_split_test", _PATH.parents[1] / "envs.py")
+    envs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(envs)
+    monkeypatch.delenv("HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS", raising=False)
+    assert envs.HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS is False
+    for value, expected in (("1", True), ("true", True), ("0", False), ("off", False)):
+        monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS", value)
+        assert envs.HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS is expected
