@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     HPU_KIMI_SITU_DEQUANT: str = "lut"
     HPU_KIMI_SITU_TIMING: int = 0
     HPU_KIMI_MXFP4_DEQUANT: str = "fused"
-    HPU_KIMI_MXFP4_DEQUANT_GROUP: int = 0
+    HPU_KIMI_MXFP4_DEQUANT_GROUP: int = 14
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -52,6 +52,22 @@ def _situ_timing_budget() -> int:
             "HPU_KIMI_SITU_TIMING must be a non-negative integer, got %r: timing is off", value)
         return 0
     return budget
+
+
+def _mxfp4_dequant_group() -> int:
+    """HPU_KIMI_MXFP4_DEQUANT_GROUP: a non-negative integer; an invalid value is reported and means 14."""
+    default = 14
+    value = os.environ.get("HPU_KIMI_MXFP4_DEQUANT_GROUP", str(default))
+    try:
+        group = int(value)
+    except ValueError:
+        group = -1
+    if group < 0:
+        import logging
+        logging.getLogger("vllm.gaudi.situ").warning(
+            "HPU_KIMI_MXFP4_DEQUANT_GROUP must be a non-negative integer, got %r: using %d", value, default)
+        return default
+    return group
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -197,9 +213,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # layer keeps "fused"). Costs transient bf16 weights of the experts of one group per layer.
     "HPU_KIMI_MXFP4_DEQUANT":
     lambda: os.environ.get("HPU_KIMI_MXFP4_DEQUANT", "fused").strip().lower(),
-    # "bits" only: experts dequantized and run per bf16 MoE call (0 = all local experts in one call).
+    # "bits" only: experts dequantized and run per bf16 MoE call (default 14 = 4 calls for Kimi-K3's 56 local
+    # experts; 0 = all local experts in one call, ~3.7 GB of transient bf16 weights per layer).
     "HPU_KIMI_MXFP4_DEQUANT_GROUP":
-    lambda: int(os.environ.get("HPU_KIMI_MXFP4_DEQUANT_GROUP", "0")),
+    lambda: _mxfp4_dequant_group(),
 }
 
 # end-env-vars-definition

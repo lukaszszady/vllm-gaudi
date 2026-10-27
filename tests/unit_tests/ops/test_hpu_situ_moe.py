@@ -602,10 +602,77 @@ def test_mxfp4_moe_dequant_flag_and_env_registry(monkeypatch):
     spec.loader.exec_module(envs)
     monkeypatch.delenv("HPU_KIMI_MXFP4_DEQUANT", raising=False)
     monkeypatch.delenv("HPU_KIMI_MXFP4_DEQUANT_GROUP", raising=False)
-    assert envs.HPU_KIMI_MXFP4_DEQUANT == "fused" and envs.HPU_KIMI_MXFP4_DEQUANT_GROUP == 0
+    assert envs.HPU_KIMI_MXFP4_DEQUANT == "fused" and envs.HPU_KIMI_MXFP4_DEQUANT_GROUP == 14
     monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT", "BITS")
     monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT_GROUP", "16")
     assert envs.HPU_KIMI_MXFP4_DEQUANT == "bits" and envs.HPU_KIMI_MXFP4_DEQUANT_GROUP == 16
+
+
+def test_env_registry_mxfp4_group_warns_and_defaults_to_14(monkeypatch, caplog):
+    import logging
+    spec = importlib.util.spec_from_file_location("vllm_gaudi_envs_group_test", _PATH.parents[1] / "envs.py")
+    envs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(envs)
+    monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT_GROUP", "0")
+    assert envs.HPU_KIMI_MXFP4_DEQUANT_GROUP == 0
+    for bad in ("many", "-3", ""):
+        caplog.clear()
+        monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT_GROUP", bad)
+        with caplog.at_level(logging.WARNING, logger="vllm.gaudi.situ"):
+            assert envs.HPU_KIMI_MXFP4_DEQUANT_GROUP == 14
+        assert "HPU_KIMI_MXFP4_DEQUANT_GROUP" in caplog.text
+
+
+def _layer_tensors(scale=127, zero_block_scale=None):
+    packed1 = torch.full((2, 4, 32), 0x11, dtype=torch.uint8)  # [E=2, rows=4, 2 blocks of 16 bytes]
+    scales1 = torch.full((2, 4, 2), scale, dtype=torch.uint8)
+    if zero_block_scale is not None:
+        packed1[0, 1, 16:] = 0  # an all-zero block
+        scales1[0, 1, 1] = zero_block_scale
+    return packed1, scales1
+
+
+def _decide(mode="bits", group=14, has_bias=False, block_size=32, w13=None, w2=None):
+    w13 = w13 or _layer_tensors()
+    w2 = w2 or _layer_tensors()
+    return situ.decide_mxfp4_bits_dequant(mode, group, has_bias, block_size, w13[0], w13[1], w2[0], w2[1], "test")
+
+
+def test_packed_scale_check_ignores_all_zero_blocks():
+    packed, scales = _layer_tensors(zero_block_scale=0)
+    assert not situ.mxfp4_scales_in_bits_range(scales)
+    assert situ.mxfp4_packed_scales_in_bits_range(packed, scales)
+    packed[0, 1, 16] = 1  # the block is no longer all zero
+    assert not situ.mxfp4_packed_scales_in_bits_range(packed, scales)
+
+
+def test_decide_bits_dequant_enabled_and_fallbacks(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="vllm.gaudi.situ"):
+        assert _decide(group=7) == (True, 7)
+        assert _decide(group=-5) == (True, 0)
+        assert _decide(w13=_layer_tensors(zero_block_scale=0)) == (True, 14)  # padding block, scale 0
+        assert caplog.text == ""
+        assert _decide(mode="fused") == (False, 0)
+        assert _decide(mode="lut") == (False, 0)  # invalid mode -> fused
+        assert "HPU_KIMI_MXFP4_DEQUANT" in caplog.text
+        for kwargs in ({"has_bias": True}, {"block_size": 16}, {"w2": _layer_tensors(scale=1)},
+                       {"w13": _layer_tensors(scale=253)}):
+            caplog.clear()
+            assert _decide(**kwargs) == (False, 0)
+            assert "keeping the fused MXFP4 op" in caplog.text
+
+
+def test_bits_layer_summary_counts(caplog):
+    import logging
+    before = dict(situ._bits_layer_counts)
+    _decide()
+    _decide(has_bias=True)
+    assert situ._bits_layer_counts["bits"] == before["bits"] + 1
+    assert situ._bits_layer_counts["fused"] == before["fused"] + 1
+    with caplog.at_level(logging.INFO, logger="vllm.gaudi.situ"):
+        situ._log_bits_summary()
+    assert "MXFP4 dequant: bits on" in caplog.text and "fused fallback on" in caplog.text
 
 
 def _stub_bf16_moe(calls=None):

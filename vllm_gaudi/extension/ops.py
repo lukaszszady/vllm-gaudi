@@ -1704,28 +1704,16 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         keeps the native op. Returns whether the path is on.
         """
         import vllm_gaudi.envs as gaudi_envs
-        from vllm_gaudi.ops.hpu_situ_moe import MXFP4_BLOCK, mxfp4_scales_in_bits_range, resolve_mxfp4_moe_dequant
-        situ_logger = logging.getLogger("vllm.gaudi.situ")
-        try:
-            mode = resolve_mxfp4_moe_dequant(gaudi_envs.HPU_KIMI_MXFP4_DEQUANT)
-        except ValueError as exc:
-            situ_logger.warning("%s: using 'fused'", exc)
-            mode = "fused"
+        from vllm_gaudi.ops.hpu_situ_moe import decide_mxfp4_bits_dequant
         self._bits_weights = None
-        if mode != "bits":
-            return False
-        if self.has_bias or self.block_size != MXFP4_BLOCK:
-            situ_logger.warning("HPU_KIMI_MXFP4_DEQUANT=bits needs a bias-free MoE with MXFP4 blocks of %d "
-                                "(has_bias=%s, block_size=%d): keeping the fused MXFP4 op", MXFP4_BLOCK,
-                                self.has_bias, self.block_size)
-            return False
-        if not mxfp4_scales_in_bits_range(w13_scale, w2_scale):
-            situ_logger.warning("HPU_KIMI_MXFP4_DEQUANT=bits: E8M0 scale bytes outside 2..252 in a MoE layer "
-                                "(experts %d..%d): keeping the fused MXFP4 op for it", self.experts_min,
-                                self.experts_max)
+        use_bits, group = decide_mxfp4_bits_dequant(gaudi_envs.HPU_KIMI_MXFP4_DEQUANT,
+                                                    gaudi_envs.HPU_KIMI_MXFP4_DEQUANT_GROUP, self.has_bias,
+                                                    self.block_size, w13, w13_scale, w2, w2_scale,
+                                                    f"(experts {self.experts_min}..{self.experts_max})")
+        if not use_bits:
             return False
         self._bits_weights = (w13, w13_scale, w2, w2_scale)
-        self._bits_group = max(0, gaudi_envs.HPU_KIMI_MXFP4_DEQUANT_GROUP)
+        self._bits_group = group
         return True
 
     def _get_compiled_bits_forward(self):

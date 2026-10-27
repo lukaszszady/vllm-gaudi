@@ -160,6 +160,21 @@ def mxfp4_scales_in_bits_range(*scales: torch.Tensor) -> bool:
         int(s.min()) >= BITS_MIN_SCALE and int(s.max()) <= BITS_MAX_SCALE for s in scales if s.numel() > 0)
 
 
+def mxfp4_packed_scales_in_bits_range(packed: torch.Tensor, scales: torch.Tensor) -> bool:
+    """Like ``mxfp4_scales_in_bits_range`` but ignores blocks whose 16 packed bytes are all zero.
+
+    An all-zero block (e.g. padding) dequantizes to exact zeros for any scale byte, so its scale does not matter.
+    ``packed`` [..., rows, groups * 16] and ``scales`` [..., rows, groups]. Synchronizes with the device (load time).
+    """
+    if scales.numel() == 0:
+        return True
+    out_of_range = (scales < BITS_MIN_SCALE) | (scales > BITS_MAX_SCALE)
+    if not bool(out_of_range.any()):
+        return True
+    nonzero = (packed != 0).reshape(*scales.shape, MXFP4_BLOCK // 2).any(dim=-1)
+    return not bool((out_of_range & nonzero).any())
+
+
 MXFP4_MOE_DEQUANT_MODES = ("fused", "bits")
 
 
@@ -169,6 +184,57 @@ def resolve_mxfp4_moe_dequant(value: str | None) -> str:
     if mode not in MXFP4_MOE_DEQUANT_MODES:
         raise ValueError(f"HPU_KIMI_MXFP4_DEQUANT must be one of {MXFP4_MOE_DEQUANT_MODES}, got {value!r}")
     return mode
+
+
+_bits_layer_counts = {"bits": 0, "fused": 0}
+_bits_summary_registered = False
+
+
+def _log_bits_summary() -> None:
+    logging.getLogger("vllm.gaudi.situ").info("MXFP4 dequant: bits on %d layers, fused fallback on %d layers",
+                                              _bits_layer_counts["bits"], _bits_layer_counts["fused"])
+
+
+def _record_bits_layer(use_bits: bool) -> None:
+    """Counts the layers per path; one INFO summary per process is logged at exit."""
+    global _bits_summary_registered
+    _bits_layer_counts["bits" if use_bits else "fused"] += 1
+    if not _bits_summary_registered:
+        import atexit
+        atexit.register(_log_bits_summary)
+        _bits_summary_registered = True
+
+
+def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int, has_bias: bool, block_size: int,
+                              w13: torch.Tensor, w13_scale: torch.Tensor, w2: torch.Tensor,
+                              w2_scale: torch.Tensor, label: str = "") -> tuple[bool, int]:
+    """Whether one MXFP4 MoE layer uses the bits path (HPU_KIMI_MXFP4_DEQUANT=bits) and with which expert group.
+
+    An invalid mode means "fused"; a layer with bias, blocks != 32 or E8M0 scales outside 2..252 (all-zero blocks
+    ignored) keeps the fused op and logs why. Syncs with the device once (call at weight loading).
+    """
+    situ_logger = logging.getLogger("vllm.gaudi.situ")
+    try:
+        mode = resolve_mxfp4_moe_dequant(mode_value)
+    except ValueError as exc:
+        situ_logger.warning("%s: using 'fused'", exc)
+        mode = "fused"
+    if mode != "bits":
+        return False, 0
+    group = max(0, int(group_value))
+    if has_bias or block_size != MXFP4_BLOCK:
+        situ_logger.warning(
+            "HPU_KIMI_MXFP4_DEQUANT=bits needs a bias-free MoE with MXFP4 blocks of %d "
+            "(has_bias=%s, block_size=%d): keeping the fused MXFP4 op", MXFP4_BLOCK, has_bias, block_size)
+        _record_bits_layer(False)
+        return False, 0
+    if not (mxfp4_packed_scales_in_bits_range(w13, w13_scale) and mxfp4_packed_scales_in_bits_range(w2, w2_scale)):
+        situ_logger.warning("HPU_KIMI_MXFP4_DEQUANT=bits: E8M0 scale bytes outside 2..252 in a MoE layer %s: "
+                            "keeping the fused MXFP4 op for it", label)
+        _record_bits_layer(False)
+        return False, 0
+    _record_bits_layer(True)
+    return True, group
 
 
 def mxfp4_bits_moe(hidden_states: torch.Tensor,
