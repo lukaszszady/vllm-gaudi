@@ -222,7 +222,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of every group are their own graphs and the transient memory is bounded by one group (a few more graph
     # launches per group and layer).
     "HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS":
-    lambda: os.environ.get("HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS", "0").strip().lower() in ("1", "true"),
+    lambda: os.environ.get("HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS", "0").strip().lower() in ("1", "true", "yes", "on"),
 }
 
 # end-env-vars-definition

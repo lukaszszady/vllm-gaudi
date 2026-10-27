@@ -293,6 +293,8 @@ def mxfp4_bits_moe(hidden_states: torch.Tensor,
                       experts_max=experts_min + end - 1,
                       **kwargs)
         out = part if out is None else out + part
+        # free this group's bf16 weights before the next group is dequantized (eager loop, e.g. split_graphs)
+        del w12, w3, part
     return out
 
 

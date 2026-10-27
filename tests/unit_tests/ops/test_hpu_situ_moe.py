@@ -832,6 +832,30 @@ def test_bits_split_graphs_env(monkeypatch):
     spec.loader.exec_module(envs)
     monkeypatch.delenv("HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS", raising=False)
     assert envs.HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS is False
-    for value, expected in (("1", True), ("true", True), ("0", False), ("off", False)):
+    for value, expected in (("1", True), ("true", True), ("YES", True), (" On ", True), ("0", False), ("off", False),
+                            ("", False), ("2", False)):
         monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS", value)
         assert envs.HPU_KIMI_MXFP4_DEQUANT_SPLIT_GRAPHS is expected
+
+
+def test_bits_moe_frees_the_previous_group_before_the_next_dequant(monkeypatch):
+    """Eager loop: at most one group of dequantized bf16 weights is alive when a group is dequantized."""
+    import gc
+    import weakref
+    x, ids, weights, w13, w13_s, w2, w2_s, emin = _bits_moe_case(11)
+    real = situ.dequant_mxfp4_bits
+    refs = []
+    alive_at_call = []
+
+    def spy(*args, **kwargs):
+        gc.collect()
+        alive_at_call.append(sum(r() is not None for r in refs))
+        out = real(*args, **kwargs)
+        refs.append(weakref.ref(out))
+        return out
+
+    monkeypatch.setattr(situ, "dequant_mxfp4_bits", spy)
+    situ.mxfp4_bits_moe(x, ids, weights, w13, w13_s, w2, w2_s, _stub_bf16_moe(), "silu", emin, 2)
+    assert len(alive_at_call) == 8  # 4 groups x (w12, w3)
+    # w3 is dequantized while the same group's w12 is alive; nothing of earlier groups is
+    assert alive_at_call == [0, 1, 0, 1, 0, 1, 0, 1]
