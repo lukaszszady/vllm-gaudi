@@ -161,9 +161,9 @@ def test_mode_1_binds_all_threads_to_opened_card_numa_node(sysfs, proc, cpus, mo
     aff.apply_affinity(rank=3, local_rank=3, sysfs=sysfs, proc=str(proc))
     assert {pid for pid, _ in cpus["calls"]} == {100, 101, 102}
     assert _pinned_masks(cpus) == {tuple(sorted(NODE1))}
-    assert cpus["threads"] == [8]  # physical cores of the mask
+    assert cpus["threads"] == []  # mode 1 shares the cores between ranks: torch's default is kept
     (line, ) = logs.of("INFO")
-    assert "numa_node=1 mode=1 cpus=8-15,24-31 (before: 32 cpus) threads_pinned=3/3 torch_threads=8" in line
+    assert "numa_node=1 mode=1 cpus=8-15,24-31 (before: 32 cpus) threads_pinned=3/3 torch_threads=99" in line
 
 
 def test_omp_num_threads_is_respected(sysfs, proc, cpus, monkeypatch):
@@ -273,31 +273,31 @@ def test_no_overlap_with_allowed_cpus_stays_unbound(sysfs, proc, cpus, monkeypat
     assert cpus["calls"] == [] and logs.of("WARNING") and "mode=0" in logs.of("INFO")[0]
 
 
-@pytest.mark.parametrize("local_rank,expected", [(0, "0000:b3:00.0"), (1, "0000:1a:00.0"), (2, "0000:19:00.0"),
-                                                 (3, "0000:b4:00.0")])
-def test_env_fallback_indexes_modules_by_local_rank(sysfs, local_rank, expected):
-    env = {"HABANA_VISIBLE_MODULES": "0,5,3,7"}
-    assert aff.find_env_card_pci(local_rank, sysfs, env) == expected
+@pytest.mark.parametrize("env", [
+    {
+        "HABANA_VISIBLE_MODULES": "3,5,0,7"
+    },
+    {
+        "HL_VISIBLE_PCI_ADDRESS": "0000:19:00.0,0000:b3:00.0"
+    },
+    {
+        "HABANA_VISIBLE_MODULES": "3,5",
+        "HL_VISIBLE_PCI_ADDRESS": "0000:19:00.0,0000:b3:00.0"
+    },
+    {},
+])
+def test_env_with_several_entries_identifies_nothing(sysfs, env):
+    assert aff.find_env_card_pci(sysfs, env) is None
 
 
-@pytest.mark.parametrize("local_rank", [4, 8, -1])
-def test_env_fallback_out_of_range_local_rank_is_none_with_warning(sysfs, logs, local_rank):
-    env = {"HABANA_VISIBLE_MODULES": "3,5,0,7"}
-    assert aff.find_env_card_pci(local_rank, sysfs, env) is None
-    assert any("outside HABANA_VISIBLE_MODULES" in m for m in logs.of("WARNING"))
+def test_env_with_a_single_entry(sysfs):
+    assert aff.find_env_card_pci(sysfs, {"HABANA_VISIBLE_MODULES": "7"}) == "0000:b4:00.0"
+    assert aff.find_env_card_pci(sysfs, {"HL_VISIBLE_PCI_ADDRESS": "0000:19:00.0"}) == "0000:19:00.0"
 
 
-def test_env_fallback_single_module_and_pci_list(sysfs, logs):
-    assert aff.find_env_card_pci(5, sysfs, {"HABANA_VISIBLE_MODULES": "7"}) == "0000:b4:00.0"
-    env = {"HL_VISIBLE_PCI_ADDRESS": "0000:19:00.0,0000:b3:00.0"}
-    assert aff.find_env_card_pci(1, sysfs, env) == "0000:b3:00.0"
-    assert aff.find_env_card_pci(2, sysfs, env) is None
-
-
-def test_unknown_module_id_logs_and_falls_back_to_pci_list(sysfs, logs):
+def test_unknown_single_module_id_falls_back_to_single_pci(sysfs):
     env = {"HABANA_VISIBLE_MODULES": "42", "HL_VISIBLE_PCI_ADDRESS": "0000:b4:00.0"}
-    assert aff.find_env_card_pci(0, sysfs, env) == "0000:b4:00.0"
-    assert any("not found in sysfs" in m for m in logs.of("WARNING"))
+    assert aff.find_env_card_pci(sysfs, env) == "0000:b4:00.0"
 
 
 def test_env_source_is_named_in_the_log(sysfs, proc, cpus, monkeypatch, logs):
@@ -311,7 +311,7 @@ def test_env_source_is_named_in_the_log(sysfs, proc, cpus, monkeypatch, logs):
 
 def test_opened_device_wins_over_disagreeing_env(sysfs, proc, cpus, monkeypatch, logs):
     monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "1")
-    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "3,5,0,7")  # local_rank 0 -> module 3 -> node 0
+    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "3")  # names the node-0 card
     open_device(proc, 3)  # but the process actually holds the node-1 card
     aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
     assert _pinned_masks(cpus) == {tuple(sorted(NODE1))}
@@ -348,3 +348,67 @@ def test_unknown_mode_is_treated_as_off(sysfs, proc, cpus, monkeypatch, logs):
     aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
     assert cpus["calls"] == []
     assert any("unknown VLLM_HPU_BIND_NUMA" in m for m in logs.of("WARNING"))
+
+
+def test_whole_node_env_list_does_not_pin_without_open_device(sysfs, proc, cpus, monkeypatch, logs):
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "core")
+    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "3,5,0,7")
+    monkeypatch.setenv("HL_VISIBLE_PCI_ADDRESS", ",".join(CARDS))
+    aff.apply_affinity(2, 2, sysfs=sysfs, proc=str(proc))
+    assert cpus["calls"] == [] and cpus["threads"] == []
+    assert any("not identified" in m for m in logs.of("WARNING"))
+    assert "(source: none)" in logs.of("INFO")[0]
+
+
+def test_mode_0_with_whole_node_env_list_emits_no_warning(sysfs, proc, cpus, monkeypatch, logs):
+    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "3,5,0,7")
+    monkeypatch.setenv("HL_VISIBLE_PCI_ADDRESS", ",".join(CARDS))
+    open_device(proc, 3)
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
+    assert logs.of("WARNING") == [] and len(logs.records) == 1
+    assert cpus["calls"] == []
+
+
+def test_mode_0_mismatch_is_not_a_warning(sysfs, proc, cpus, monkeypatch, logs):
+    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "3")  # single entry, node 0
+    open_device(proc, 3)  # opened card is on node 1
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
+    assert logs.of("WARNING") == [] and "(source: opened-device)" in logs.of("INFO")[0]
+
+
+@pytest.mark.parametrize("node", ["hl", "hl_controlD"])
+def test_legacy_hl_device_nodes(sysfs, proc, node):
+    link = os.path.join(sysfs, "class/habanalabs/hl2/device")
+    os.makedirs(os.path.dirname(link))
+    os.symlink(os.path.join(sysfs, "bus/pci/devices/0000:b3:00.0"), link)
+    open_device(proc, 2, f"{node}")
+    assert aff.find_opened_card_pci(sysfs, str(proc)) == "0000:b3:00.0"
+
+
+def test_mode_1_with_four_cards_per_node_keeps_torch_threads(tmp_path, proc, cpus, monkeypatch, logs):
+    cards = {f"0000:{0x19 + i:02x}:00.0": (0, i, i) for i in range(4)}
+    cards["0000:b3:00.0"] = (1, 4, 4)
+    _make_sysfs(tmp_path / "sys", cards)
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "1")
+    open_device(proc, 1)
+    aff.apply_affinity(0, 0, sysfs=str(tmp_path / "sys"), proc=str(proc))
+    assert cpus["threads"] == [] and "torch_threads=99" in logs.of("INFO")[0]
+
+
+def test_core_mode_never_raises_torch_threads(sysfs, proc, cpus, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "core")
+    monkeypatch.setattr(aff.torch, "get_num_threads", lambda: 2)  # fewer than the 4 cores of the slice
+    open_device(proc, 0)
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
+    assert cpus["threads"] == [2]
+
+
+def test_core_mode_counts_only_cards_visible_in_the_container(sysfs, proc, tmp_path, cpus, monkeypatch):
+    dev = tmp_path / "dev"
+    (dev / "accel").mkdir(parents=True)
+    for name in ("accel0", "accel_controlD0", "accel2", "accel3"):  # card on index 1 is not mapped into the pod
+        (dev / "accel" / name).write_text("")
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "core")
+    open_device(proc, 0)
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc), dev=str(dev))
+    assert _pinned_masks(cpus) == {tuple(sorted(NODE0))}  # alone on node 0, so it gets all its cores

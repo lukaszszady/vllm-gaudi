@@ -20,7 +20,8 @@ Call it AFTER the device is acquired: the card is the one whose ``/dev/accel``
 node the process holds open (``/proc/self/fd`` -> ``/sys/class/accel/accelN/device``
 -> PCI address). Ray workers all see the node-wide ``HABANA_VISIBLE_MODULES``
 (the platform sets RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES), so that env and
-``HL_VISIBLE_PCI_ADDRESS`` are only a fallback, and the log names the source used.
+``HL_VISIBLE_PCI_ADDRESS`` are only a fallback, used when they name exactly one card; the log names the source.
+Only mode ``core`` resizes the torch thread pool (to the physical cores of the rank's slice).
 The mask is applied to every thread of the process. Nothing here raises: on any
 failure the process stays unbound.
 """
@@ -39,6 +40,7 @@ logger = init_logger()
 _SYSFS = "/sys"
 _HABANA_VENDOR = "0x1da3"
 _PROC = "/proc"
+_DEV = "/dev"
 _ACCEL_NODE = re.compile(r"^/dev/(?:accel/)?(accel_controlD|accel|hl_controlD|hl)(\d+)$")
 
 
@@ -138,56 +140,45 @@ def find_opened_card_pci(sysfs: str = _SYSFS, proc: str = _PROC) -> str | None:
     return found[0] if found else None
 
 
-def find_env_card_pci(local_rank: int, sysfs: str = _SYSFS, environ=None) -> str | None:
-    """Best guess of the card from the environment only. Not reliable under Ray (node-wide lists)."""
+def find_env_card_pci(sysfs: str = _SYSFS, environ=None) -> str | None:
+    """The card named by the environment, only when it names exactly one.
+
+    Under Ray every worker sees the node-wide HABANA_VISIBLE_MODULES / HL_VISIBLE_PCI_ADDRESS list, from which the
+    card of a rank cannot be told, so a list with several entries identifies nothing.
+    """
     env = os.environ if environ is None else environ
     modules = [m.strip() for m in env.get("HABANA_VISIBLE_MODULES", "").split(",") if m.strip()]
-    if modules:
-        if len(modules) == 1:
-            idx = 0
-        elif 0 <= local_rank < len(modules):
-            idx = local_rank
-        else:
-            logger.warning("HPU affinity: local_rank=%s outside HABANA_VISIBLE_MODULES=%r", local_rank, modules)
-            idx = None
-        if idx is not None:
-            try:
-                module_id = int(modules[idx])
-            except ValueError:
-                module_id = None
+    if len(modules) == 1:
+        with contextlib.suppress(ValueError):
+            module_id = int(modules[0])
             for pci, mid in _habana_cards(sysfs).items():
-                if mid is not None and mid == module_id:
+                if mid == module_id:
                     return pci
-            logger.warning(
-                "HPU affinity: module id %r from HABANA_VISIBLE_MODULES not found in sysfs, "
-                "trying HL_VISIBLE_PCI_ADDRESS", modules[idx])
+        logger.debug("HPU affinity: module id %r from HABANA_VISIBLE_MODULES not found in sysfs", modules[0])
     pcis = [p.strip() for p in env.get("HL_VISIBLE_PCI_ADDRESS", "").split(",") if p.strip()]
-    if len(pcis) == 1:
-        return pcis[0]
-    if pcis:
-        if 0 <= local_rank < len(pcis):
-            return pcis[local_rank]
-        logger.warning("HPU affinity: local_rank=%s outside HL_VISIBLE_PCI_ADDRESS=%r", local_rank, pcis)
-    return None
+    return pcis[0] if len(pcis) == 1 else None
 
 
-def find_card_pci(local_rank: int, sysfs: str = _SYSFS, proc: str = _PROC, environ=None) -> tuple[str | None, str]:
-    """Returns (pci, source) where source is 'opened-device', 'env' or 'none'."""
+def find_card_pci(sysfs: str = _SYSFS, proc: str = _PROC, environ=None, quiet: bool = False) -> tuple[str | None, str]:
+    """Returns (pci, source) where source is 'opened-device', 'env' or 'none'.
+
+    ``quiet`` (binding disabled) turns the diagnostics into DEBUG: they are only interesting when we bind.
+    """
+    note = logger.debug if quiet else logger.warning
     opened = find_opened_card_pci(sysfs, proc)
     guess = None
     try:
-        guess = find_env_card_pci(local_rank, sysfs, environ)
+        guess = find_env_card_pci(sysfs, environ)
     except Exception as exc:
-        logger.warning("HPU affinity: env based card lookup failed (%s: %s)", type(exc).__name__, exc)
+        logger.debug("HPU affinity: env based card lookup failed (%s: %s)", type(exc).__name__, exc)
     if opened:
         if guess and guess != opened:
-            logger.warning("HPU affinity: env says card %s but the process holds %s open, using the opened device",
-                           guess, opened)
+            note("HPU affinity: env says card %s but the process holds %s open, using the opened device", guess, opened)
         return opened, "opened-device"
     if guess:
-        logger.warning(
+        note(
             "HPU affinity: no open Habana device node found, card %s taken from the environment "
-            "(HABANA_VISIBLE_MODULES / HL_VISIBLE_PCI_ADDRESS, unreliable under Ray)", guess)
+            "(HABANA_VISIBLE_MODULES / HL_VISIBLE_PCI_ADDRESS with a single entry)", guess)
         return guess, "env"
     return None, "none"
 
@@ -223,13 +214,32 @@ def _physical_cores(cpus: set[int], sysfs: str) -> list[list[int]]:
     return cores
 
 
-def _core_slice(pci: str, node: int | None, cpus: set[int], sysfs: str) -> set[int]:
+_DEVICE_NODE = re.compile(r"^(accel|hl)(\d+)$")
+
+
+def _visible_cards(sysfs: str, dev: str) -> list[str]:
+    """PCI addresses of the cards whose device nodes exist in this container; all host cards if none can be seen."""
+    found: list[str] = []
+    for directory in (os.path.join(dev, "accel"), dev):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            match = _DEVICE_NODE.match(name)
+            pci = _device_pci(match.group(2), match.group(1), sysfs) if match else None
+            if pci and pci not in found:
+                found.append(pci)
+    return found or list(_habana_cards(sysfs))
+
+
+def _core_slice(pci: str, node: int | None, cpus: set[int], sysfs: str, dev: str = _DEV) -> set[int]:
     """The share of the physical cores of ``cpus`` (node CPUs the pod may use) that belongs to this card.
 
-    The cards sharing the NUMA node split the cores evenly (in PCI order). With fewer cores than cards the
-    cores are shared round-robin, so no card ends up with an empty set.
+    The cards visible in the container that share the NUMA node split the cores evenly (in PCI order). With fewer
+    cores than cards the cores are shared round-robin, so no card ends up with an empty set.
     """
-    peers = [p for p in _habana_cards(sysfs) if _numa_node(p, sysfs) == node]
+    peers = [p for p in _visible_cards(sysfs, dev) if _numa_node(p, sysfs) == node]
     if pci not in peers:
         peers.append(pci)
     peers.sort()
@@ -257,7 +267,7 @@ def _pin_all_threads(mask: set[int], proc: str) -> tuple[int, int]:
     return pinned, len(tids)
 
 
-def apply_affinity(rank: int, local_rank: int, sysfs: str = _SYSFS, proc: str = _PROC) -> None:
+def apply_affinity(rank: int, local_rank: int, sysfs: str = _SYSFS, proc: str = _PROC, dev: str = _DEV) -> None:
     """Logs (and, if enabled, sets) the CPU affinity of this process. Never raises.
 
     Call after the HPU device is acquired, so the opened device node identifies the card.
@@ -272,7 +282,7 @@ def apply_affinity(rank: int, local_rank: int, sysfs: str = _SYSFS, proc: str = 
         mode = bind_mode()
         before = set(os.sched_getaffinity(0))
         target: set[int] | None = None
-        pci, source = find_card_pci(local_rank, sysfs, proc)
+        pci, source = find_card_pci(sysfs, proc, quiet=mode == "0")
         if pci is None:
             if mode != "0":
                 logger.warning("HPU affinity: card of local_rank=%s not identified, not binding", local_rank)
@@ -281,7 +291,7 @@ def apply_affinity(rank: int, local_rank: int, sysfs: str = _SYSFS, proc: str = 
             node = _numa_node(pci, sysfs)
             if mode != "0":
                 allowed = _node_cpus(pci, node, sysfs) & before
-                target = _core_slice(pci, node, allowed, sysfs) if mode == "core" and allowed else allowed
+                target = _core_slice(pci, node, allowed, sysfs, dev) if mode == "core" and allowed else allowed
                 if not target:
                     logger.warning("HPU affinity: no allowed CPU on the card's NUMA node (%s), not binding", node)
                     target = None
@@ -291,9 +301,11 @@ def apply_affinity(rank: int, local_rank: int, sysfs: str = _SYSFS, proc: str = 
             threads = f" threads_pinned={pinned}/{total}"
             if pinned == 0:
                 mode = "0"
-            elif "OMP_NUM_THREADS" not in os.environ:
+            elif mode == "core" and "OMP_NUM_THREADS" not in os.environ:
+                # only the per-card slice sizes the pool; with 'node' binding the ranks share the cores, so the
+                # torch default is kept. Never raise the thread count.
                 with contextlib.suppress(Exception):
-                    torch.set_num_threads(max(1, len(_physical_cores(target, sysfs))))
+                    torch.set_num_threads(max(1, min(len(_physical_cores(target, sysfs)), torch.get_num_threads())))
     except Exception as exc:
         logger.warning("HPU affinity: binding failed (%s: %s), continuing unbound", type(exc).__name__, exc)
         mode = "0"
