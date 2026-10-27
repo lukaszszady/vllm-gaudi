@@ -1476,6 +1476,76 @@ def test_attn_res_functional_matches_in_place_version_and_modifies_nothing(has_d
     assert torch.equal(new_prefix, prefix) and torch.equal(new_blocks, blocks)
 
 
+def _attn_res_fp32_mix(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks,
+                       block_write_idx, eps, output_norm_eps):
+    """The previous attn_res_functional mix: an fp32 copy of the blocks concatenated with the updated prefix."""
+    updated = prefix.float() if delta is None else (prefix.float() + delta.float()).to(prefix.dtype).float()
+    if block_write_idx >= 0:
+        blocks = blocks.clone()
+        blocks[:, block_write_idx] = updated.to(blocks.dtype)
+    values = torch.cat((blocks[:, :num_blocks].float(), updated.unsqueeze(1)), dim=1)
+    rstd = torch.rsqrt(values.pow(2).mean(dim=-1) + eps)
+    logits = (values * (norm_weight.float() * qk_weight.float())).sum(dim=-1) * rstd
+    mixed = (torch.softmax(logits, dim=-1).unsqueeze(-1) * values).sum(dim=1)
+    if output_norm_weight is not None:
+        mixed = mixed * torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps)
+        mixed = mixed * output_norm_weight.float()
+    return mixed
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(1, -1), (6, -1), (6, 3), (12, -1), (12, 12)])
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("output_norm", [True, False])
+def test_attn_res_functional_matches_the_fp32_mix_at_model_like_sizes(dtype, num_blocks, block_write_idx, has_delta,
+                                                                      output_norm):
+    """Bank read in its own dtype + bmm vs the old fp32 copy: equal in fp32, within bf16 rounding in bf16 (Kimi-K3:
+    up to 12 stored blocks + the prefix, logits large enough for a peaked softmax)."""
+    g = torch.Generator().manual_seed(300 + num_blocks)
+    tokens, hidden, bank = 64, 512, 13
+    prefix = (torch.randn(tokens, hidden, generator=g) * 3).to(dtype)
+    delta = torch.randn(tokens, hidden, generator=g).to(dtype) if has_delta else None
+    blocks = (torch.randn(tokens, bank, hidden, generator=g) * torch.rand(1, bank, 1, generator=g) * 4).to(dtype)
+    norm_w = torch.rand(hidden, generator=g) + 0.5
+    qk_w = torch.randn(hidden, generator=g) * 0.2
+    out_w = torch.rand(hidden, generator=g) + 0.5 if output_norm else None
+    args = (prefix, delta, blocks, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+    _, _, out = kda.attn_res_functional(*args)
+    ref = _attn_res_fp32_mix(*args)
+    if dtype == torch.float32:
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    else:
+        # the old version rounds the fp32 mix once; the new one also rounds weights and weighted sum to bf16
+        scale = ref.abs().amax(dim=-1, keepdim=True)
+        assert ((out.float() - ref).abs() <= 2e-2 * ref.abs() + 1e-2 * scale).all()
+        assert (out.float() - ref).abs().mean() <= 4e-3 * ref.abs().mean()
+
+
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(0, -1), (0, 0), (3, -1), (3, 2)])
+def test_attn_res_functional_compiles_to_one_graph(has_delta, num_blocks, block_write_idx):
+    """fullgraph: no graph break inside attn_res; a second call with new data reuses the graph (no recompile)."""
+    import torch._dynamo as dynamo
+    prefix, delta, blocks, norm_w, qk_w, out_w = _attn_res_case(180 + num_blocks, torch.bfloat16)
+    delta = delta if has_delta else None
+    dynamo.reset()
+    try:
+        compiled = torch.compile(lambda p, d, b: kda.attn_res_functional(p, d, b, norm_w, qk_w, out_w, num_blocks,
+                                                                         block_write_idx, 1e-6, 1e-6),
+                                 backend="aot_eager",
+                                 fullgraph=True,
+                                 dynamic=False)
+        with dynamo.config.patch(error_on_recompile=True):
+            for p, d, b in ((prefix, delta, blocks), (prefix * 2, None if delta is None else delta * 2, blocks + 1)):
+                got = compiled(p, d, b)
+                expected = kda.attn_res_functional(p, d, b, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6,
+                                                   1e-6)
+                for x, y in zip(got, expected):
+                    torch.testing.assert_close(x, y, rtol=1e-2, atol=1e-2)
+    finally:
+        dynamo.reset()
+
+
 class _ToyLayer(torch.nn.Module):
     """A KimiLinearDecoderLayer stand-in around the real ``forward_attn_residual_functional``."""
 
