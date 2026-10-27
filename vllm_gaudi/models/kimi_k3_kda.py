@@ -123,6 +123,9 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                                vec_chunks=vec_chunks,
                                **common)
                 if prefill_impl == "chunked_vec":  # out of place: traced with the layer, only the writes eager
+                    # gate_proj is a strided slice of ``projected`` and is used after the graph break below; the
+                    # resume graph would receive it as a view with storage offset (strided_view fails in Synapse)
+                    gate_proj = gate_proj.contiguous()
                     core, slots, conv_rows, ssm_rows = kda_prefill_step(mixed_qkv.reshape(num_seqs, seq_len, -1),
                                                                         raw_g.reshape(num_seqs, seq_len, -1),
                                                                         raw_beta.reshape(num_seqs, seq_len, -1),

@@ -387,7 +387,8 @@ def kda_chunked_steps_vec(state: torch.Tensor,
             step_hook()
     out = torch.matmul(q_eff, torch.stack(starts, dim=2)) + o_intra  # [B,H,N,C,V]
     out = out.permute(0, 2, 3, 1, 4).reshape(bsz, num_chunks * chunk, heads, vdim)
-    return out[:, :seq_len], s_t.transpose(-1, -2)
+    # exact shape and a dense layout: this output crosses a graph break (storage offset 0, no padded tail)
+    return out[:, :seq_len].contiguous(), s_t.transpose(-1, -2)
 
 
 def _prepare_qkv_gates(conv_out: torch.Tensor, raw_g: torch.Tensor, raw_beta: torch.Tensor, A_log: torch.Tensor,

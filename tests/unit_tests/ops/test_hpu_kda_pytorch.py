@@ -1155,6 +1155,89 @@ def test_unit_lower_inverse_dense_matches_original(size):
     torch.testing.assert_close(kda._unit_lower_inverse_dense(a), kda._unit_lower_inverse(a), rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("lengths,padded,chunk", [([70, 41], 96, 32), ([37], 37, 16), ([9], 12, 4), ([64], 64, 16)])
+def test_chunked_vec_prefill_outputs_are_dense_tensors(lengths, padded, chunk):
+    """Everything kda_prefill_step returns crosses a graph break (dynamo resume frame / eager cache write): plain
+    contiguous tensors with storage offset 0 and no padded tail, never views of a larger buffer."""
+    params = _make_params(180)
+    batch, mask = _pad_batch([_make_inputs(181 + i, n) for i, n in enumerate(lengths)], padded)
+    n = len(lengths)
+    caches = _new_caches(n + 1, False)
+    outs = kda.kda_prefill_step(batch["mixed_qkv"], batch["raw_g"], batch["raw_beta"], params["conv_weight"], None,
+                                params["A_log"], params["dt_bias"], params["lower_bound"], *caches, torch.arange(n),
+                                torch.tensor([1, 0, 1][:n]), mask, H, D, prefill_impl="chunked_vec", chunk_size=chunk,
+                                vec_chunks=2)
+    for t in outs:
+        assert t.is_contiguous() and t.storage_offset() == 0
+        assert t.numel() == t.untyped_storage().nbytes() // t.element_size()
+
+
+def _load_kimi_layer_module():
+    """models/kimi_k3_kda.py by file path (the models package imports vLLM) with a stub forward context."""
+    path = pathlib.Path(__file__).resolve().parents[3] / "vllm_gaudi" / "models" / "kimi_k3_kda.py"
+    spec = importlib.util.spec_from_file_location("kimi_k3_kda_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_chunked_vec_layer_forward_graph_inputs_after_the_break_are_dense(monkeypatch):
+    """Under torch.compile the tensors that cross the @compiler.disable'd cache write (core, gate_proj, ...) must
+    reach the resume graph as plain tensors: HPU compile fails with 'strided_view' on views with a storage
+    offset (gate_proj is a slice of the fused input projection)."""
+    layer_mod = _load_kimi_layer_module()
+    tokens, seq_len, hidden, f_dim = 40, 20, 24, D
+    monkeypatch.setattr(layer_mod, "_prefill_settings",
+                        torch.compiler.assume_constant_result(lambda: ("chunked_vec", 16, 1, 2)))
+    meta = types.SimpleNamespace(load_indices_tensor=torch.tensor([1, 2]),
+                                 blocks_caching_range=None,
+                                 is_prompt=True,
+                                 padding_mask_flat=torch.ones(tokens, dtype=torch.bool),
+                                 has_initial_states_p=torch.tensor([0, 1]))
+    fake_ctx = types.ModuleType("vllm.forward_context")
+    forward_ctx = types.SimpleNamespace(attn_metadata=meta)  # built here: dynamo cannot construct it
+    fake_ctx.get_forward_context = lambda: forward_ctx
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.forward_context", fake_ctx)
+    g = torch.Generator().manual_seed(190)
+    in_proj = torch.randn(hidden, 4 * P + D + H, generator=g) * 0.2  # 3P + P + head_dim + heads
+    f_b = torch.randn(f_dim, P, generator=g) * 0.2
+    o_proj = torch.randn(P, hidden, generator=g) * 0.2
+    params = _make_params(191)
+    layer = types.SimpleNamespace(
+        local_num_heads=H,
+        head_dim=D,
+        local_projection_size=P,
+        in_proj_qkvgfab=lambda x: (x @ in_proj, None),
+        f_b_proj=lambda x: (x @ f_b, None),
+        conv1d=types.SimpleNamespace(weight=params["conv_weight"].reshape(C, 1, W), bias=None),
+        A_log=params["A_log"],
+        dt_bias=params["dt_bias"],
+        gate_lower_bound=params["lower_bound"],
+        o_norm=types.SimpleNamespace(weight=torch.ones(D), eps=1e-6),
+        o_proj=lambda x: (x @ o_proj, None),
+        kv_cache=_new_caches(3, False),
+        cache_group_idx=None,
+    )
+    seen = []
+
+    def backend(gm, example_inputs):
+        seen.append([(tuple(t.shape), t.is_contiguous(), t.storage_offset()) for t in example_inputs
+                     if isinstance(t, torch.Tensor)])
+        return gm.forward
+
+    x = torch.randn(tokens, hidden, generator=g)
+    torch._dynamo.reset()
+    eager = layer_mod.hpu_kda_forward(layer, x.clone())
+    layer.kv_cache = _new_caches(3, False)
+    compiled = torch.compile(layer_mod.hpu_kda_forward, backend=backend)(layer, x.clone())
+    torch.testing.assert_close(compiled, eager)
+    assert len(seen) >= 2, "expected a graph break at the cache write"
+    for inputs in seen[1:]:  # graphs after the break (resume frame)
+        assert inputs and all(contig and offset == 0 for _, contig, offset in inputs), inputs
+    assert seq_len * 2 == tokens
+
+
 def test_prefill_step_rejects_unknown_impl():
     params = _make_params(138)
     batch, mask = _pad_batch([_make_inputs(139, 8)], 8)
