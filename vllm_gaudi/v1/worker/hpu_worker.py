@@ -32,6 +32,7 @@ from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerO
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
+from vllm_gaudi.v1.worker.hpu_affinity import apply_affinity
 from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -174,6 +175,8 @@ class HPUWorker(WorkerBase):
         self.profiler.stop()
 
     def init_device(self):
+        # Before the device is opened, so threads created later inherit the mask.
+        apply_affinity(self.rank, self.local_rank)
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
