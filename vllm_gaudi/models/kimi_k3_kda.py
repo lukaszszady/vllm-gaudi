@@ -15,8 +15,8 @@ import functools
 import torch
 
 from vllm_gaudi.extension.graph_state import lazy_step_hook
-from vllm_gaudi.ops.hpu_kda_pytorch import (gated_rmsnorm_sigmoid, kda_core_prefill, kda_decode_step, kda_prefill_step,
-                                            write_kda_decode_state)
+from vllm_gaudi.ops.hpu_kda_pytorch import (gated_rmsnorm_sigmoid, kda_core_decode, kda_core_prefill, kda_decode_step,
+                                            kda_prefill_step, write_kda_decode_state)
 
 _BLOCK = 64  # tokens per traced block of the prefill token loop
 
@@ -25,6 +25,7 @@ _BLOCK = 64  # tokens per traced block of the prefill token loop
 # Decode and the "chunked_vec" prefill keep only the two cache writes outside (the step itself is out of place
 # and traced with the layer). In lazy mode dynamo is disabled anyway, so this is a no-op there.
 _core_prefill = torch.compiler.disable(kda_core_prefill)
+_core_decode = torch.compiler.disable(kda_core_decode)  # HPU_KIMI_KDA_DECODE=eager
 
 
 @torch.compiler.disable
@@ -43,6 +44,14 @@ def _prefill_settings() -> tuple[str, int, int, int]:
     import vllm_gaudi.envs as gaudi_envs
     return (gaudi_envs.HPU_KIMI_KDA_PREFILL, gaudi_envs.HPU_KIMI_KDA_CHUNK_SIZE,
             max(1, gaudi_envs.HPU_KIMI_KDA_MARK_STEP_CHUNKS), gaudi_envs.HPU_KIMI_KDA_VEC_CHUNKS)
+
+
+@functools.cache
+@torch.compiler.assume_constant_result
+def _decode_mode() -> str:
+    """HPU_KIMI_KDA_DECODE (functional|eager); read once."""
+    import vllm_gaudi.envs as gaudi_envs
+    return gaudi_envs.HPU_KIMI_KDA_DECODE
 
 
 def _state_indices(self, attn_metadata) -> torch.Tensor:
@@ -138,6 +147,8 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                 # line end up in the dynamo resume frame without a source line, and the HPU compile backend then
                 # fails on the unparsable FX stack_trace ("'NoneType' object has no attribute 'file'").
                 core = core.reshape(num_tokens, heads, head_dim)
+            elif _decode_mode() == "eager":
+                core = _core_decode(mixed_qkv, raw_g, raw_beta, state_idx=state_idx[:num_tokens], **common)
             else:
                 core, slots, conv_rows, ssm_rows = kda_decode_step(mixed_qkv,
                                                                    raw_g,

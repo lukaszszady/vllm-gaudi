@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     HPU_KIMI_KDA_CHUNK_SIZE: int = 64
     HPU_KIMI_KDA_VEC_CHUNKS: int = 16
     HPU_KIMI_KDA_MARK_STEP_CHUNKS: int = 1
+    HPU_KIMI_KDA_DECODE: str = "functional"
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_SITU_MARK_STEP: bool = True
     HPU_KIMI_SITU_DEQUANT: str = "lut"
@@ -53,6 +54,17 @@ def _situ_timing_budget() -> int:
             "HPU_KIMI_SITU_TIMING must be a non-negative integer, got %r: timing is off", value)
         return 0
     return budget
+
+
+def _kda_decode_mode() -> str:
+    """HPU_KIMI_KDA_DECODE: functional|eager; an invalid value is reported and means functional."""
+    value = os.environ.get("HPU_KIMI_KDA_DECODE", "functional").strip().lower()
+    if value not in ("functional", "eager"):
+        import logging
+        logging.getLogger("vllm.gaudi.kda").warning(
+            "HPU_KIMI_KDA_DECODE must be 'functional' or 'eager', got %r: using 'functional'", value)
+        return "functional"
+    return value
 
 
 def _mxfp4_dequant_group() -> int:
@@ -187,6 +199,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Lazy mode: number of KDA prefill chunks between two mark_steps (1 = every chunk is its own graph).
     "HPU_KIMI_KDA_MARK_STEP_CHUNKS":
     lambda: int(os.environ.get("HPU_KIMI_KDA_MARK_STEP_CHUNKS", "1")),
+    # Real Kimi-K3 KDA decode in torch.compile mode: "functional" (new conv/ssm state and output computed in the
+    # compiled region, only the two cache index_copy_ writes eager) or "eager" (the whole decode core, state update
+    # included, runs outside of the compiled graph). An invalid value is reported and means "functional".
+    "HPU_KIMI_KDA_DECODE":
+    lambda: _kda_decode_mode(),
 
     # Kimi-K3 routed experts use the SiTU activation (beta*tanh(gate/beta)*sigmoid(gate)*up, soft-clipped up), which
     # the Habana fused MoE op does not have. "exact" computes the experts unfused with the real activation (MXFP4

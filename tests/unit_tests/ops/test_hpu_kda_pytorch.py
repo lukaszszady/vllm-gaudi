@@ -341,6 +341,49 @@ def test_eager_part_of_a_decode_step_is_two_cache_writes():
     assert len(old_ops) > 30, old_ops  # the previously eager (compiler.disable'd) decode core
 
 
+def test_functional_decode_step_graph_has_no_mutation_of_its_inputs():
+    """The traced decode step (what torch.compile sees) has no copy_/index_copy_ on graph inputs."""
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+
+    graphs = []
+
+    def capture(gm, example_inputs):
+        graphs.append(gm)
+        return make_boxed_func(gm.forward)
+
+    backend = aot_autograd(fw_compiler=capture, keep_inference_input_mutations=True)
+    params = _make_params(65)
+    tok = _make_inputs(66, 2)
+    caches = _new_caches(4, False)
+    state_idx = torch.tensor([1, 2])
+
+    def step(mixed_qkv, raw_g, raw_beta, conv_cache, ssm_cache):
+        return kda.kda_decode_step(mixed_qkv, raw_g, raw_beta, params["conv_weight"], params["conv_bias"],
+                                   params["A_log"], params["dt_bias"], params["lower_bound"], conv_cache, ssm_cache,
+                                   state_idx, H, D)
+
+    compiled = torch.compile(step, backend=backend, dynamic=False, fullgraph=True)
+    out, slots, conv_rows, ssm_rows = compiled(tok["mixed_qkv"], tok["raw_g"], tok["raw_beta"], *caches)
+    assert graphs
+    targets = {str(n.target) for gm in graphs for n in gm.graph.nodes if n.op == "call_function"}
+    assert not {t for t in targets if "copy_" in t or "index_copy" in t}, targets
+    expected = kda.kda_decode_step(tok["mixed_qkv"], tok["raw_g"], tok["raw_beta"], params["conv_weight"],
+                                   params["conv_bias"], params["A_log"], params["dt_bias"], params["lower_bound"],
+                                   *caches, state_idx, H, D)
+    assert all(torch.equal(a, b) for a, b in zip((out, slots, conv_rows, ssm_rows), expected))
+
+
+def test_kda_decode_env_flag(monkeypatch):
+    import vllm_gaudi.envs as gaudi_envs
+    monkeypatch.delenv("HPU_KIMI_KDA_DECODE", raising=False)
+    assert gaudi_envs.HPU_KIMI_KDA_DECODE == "functional"
+    monkeypatch.setenv("HPU_KIMI_KDA_DECODE", " Eager ")
+    assert gaudi_envs.HPU_KIMI_KDA_DECODE == "eager"
+    monkeypatch.setenv("HPU_KIMI_KDA_DECODE", "bogus")
+    assert gaudi_envs.HPU_KIMI_KDA_DECODE == "functional"
+
+
 def test_bf16_caches_and_inputs_stay_close_to_fp32_reference():
     params = _make_params(19)
     x = _make_inputs(20, 10)
