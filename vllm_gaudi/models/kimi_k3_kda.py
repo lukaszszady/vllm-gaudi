@@ -46,11 +46,12 @@ def _prefill_settings() -> tuple[str, int, int, int]:
             max(1, gaudi_envs.HPU_KIMI_KDA_MARK_STEP_CHUNKS), gaudi_envs.HPU_KIMI_KDA_VEC_CHUNKS)
 
 
-# HPU_KIMI_KDA_STATE_WRITE=deferred: decode layers append their new state rows here instead of writing them, and
-# run_with_deferred_kda_state() writes all of them eagerly once the decoder layers of the step are done. The lists
-# are module-level objects so that dynamo records the append as a side effect of the compiled layer (no graph
-# break); _DEFER_ACTIVE keeps layers that run outside of a wrapped model forward on the inline write.
-_PENDING_STATE: list = []
+# HPU_KIMI_KDA_STATE_WRITE=deferred: a decode layer stores its new state rows in its own ``_kda_pending`` attribute
+# instead of writing them, and run_with_deferred_kda_state() writes the rows of all KDA layers eagerly once the
+# decoder layers of the step are done. The rows live on the layer module (not in a shared container): all decoder
+# layers share one dynamo code object under regional compilation, and a shared list would make dynamo guard on its
+# length, i.e. one cache entry per layer index. _DEFER_ACTIVE keeps layers that run outside of a wrapped model
+# forward on the inline write.
 _DEFER_ACTIVE: list = [False]
 
 
@@ -62,32 +63,56 @@ def _state_write_mode() -> str:
     return gaudi_envs.HPU_KIMI_KDA_STATE_WRITE
 
 
+def _is_kda_layer(module) -> bool:
+    return all(hasattr(module, name) for name in ("conv1d", "A_log", "dt_bias", "o_norm", "local_num_heads"))
+
+
+def _kda_layers(model) -> list:
+    """The KDA layer modules of ``model`` (found once); each gets ``_kda_pending = None``."""
+    layers = getattr(model, "_kda_layers_for_deferred_write", None)
+    if layers is None:
+        layers = [m for m in model.modules() if _is_kda_layer(m)]
+        for layer in layers:
+            layer._kda_pending = None
+        object.__setattr__(model, "_kda_layers_for_deferred_write", layers)
+    return layers
+
+
 @torch.compiler.disable
-def _flush_pending_state() -> None:
-    pending = list(_PENDING_STATE)
-    _PENDING_STATE.clear()
-    for conv_cache, ssm_cache, slots, conv_rows, ssm_rows in pending:
-        write_kda_decode_state(conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
+def _flush_pending_state(layers) -> None:
+    """Writes the stashed rows of every layer and resets the stash (also when a write fails)."""
+    try:
+        for layer in layers:
+            pending = layer._kda_pending
+            if pending is not None:
+                layer._kda_pending = None
+                write_kda_decode_state(*pending)
+    finally:
+        _drop_pending_state(layers)
 
 
-def run_with_deferred_kda_state(forward, *args, **kwargs):
-    """Runs a model forward; with HPU_KIMI_KDA_STATE_WRITE=deferred the decode state rows stashed by the KDA layers
-    are written after it returns. If the forward raises, the stash is dropped without writing."""
+def _drop_pending_state(layers) -> None:
+    for layer in layers:
+        layer._kda_pending = None
+
+
+def run_with_deferred_kda_state(model, forward, *args, **kwargs):
+    """Runs ``forward(*args, **kwargs)`` of ``model``; with HPU_KIMI_KDA_STATE_WRITE=deferred the decode state rows
+    stashed by the KDA layers are written after it returns. If the forward raises, the stash is dropped without
+    writing."""
     if _state_write_mode() != "deferred":
         return forward(*args, **kwargs)
-    _PENDING_STATE.clear()
+    layers = _kda_layers(model)
+    _drop_pending_state(layers)
     _DEFER_ACTIVE[0] = True
     try:
         out = forward(*args, **kwargs)
     except BaseException:
-        _PENDING_STATE.clear()
+        _drop_pending_state(layers)
         raise
     finally:
         _DEFER_ACTIVE[0] = False
-    try:
-        _flush_pending_state()
-    finally:
-        _PENDING_STATE.clear()
+    _flush_pending_state(layers)
     return out
 
 
@@ -201,7 +226,7 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                                                                    state_idx=state_idx[:num_tokens],
                                                                    **common)
                 if _state_write_mode() == "deferred" and _DEFER_ACTIVE[0]:
-                    _PENDING_STATE.append((conv_cache, ssm_cache, slots, conv_rows, ssm_rows))
+                    self._kda_pending = (conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
                 else:
                     # the statement ends with the disabled call (see the prefill comment above)
                     core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)

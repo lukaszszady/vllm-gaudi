@@ -387,26 +387,52 @@ def test_kda_decode_env_flag(monkeypatch):
 # ---------------------------------------------------------------------------------------------------------------
 # HPU_KIMI_KDA_STATE_WRITE=deferred: decode state rows are written once after the decoder layers
 # ---------------------------------------------------------------------------------------------------------------
+class _Linear(torch.nn.Module):
+    """Like vLLM's parallel linears: returns (output, bias)."""
+
+    def __init__(self, weight):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+
+    def forward(self, x):
+        return x @ self.weight, None
+
+
+class _DeferredKdaLayer(torch.nn.Module):
+    """A KDA layer as an nn.Module (what regional compilation sees), usable by hpu_kda_forward."""
+
+    def __init__(self, params, hidden, seed, caches, group=None):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.local_num_heads, self.head_dim, self.local_projection_size = H, D, P
+        self.in_proj_qkvgfab = _Linear(torch.randn(hidden, 4 * P + D + H, generator=g) * 0.2)
+        self.f_b_proj = _Linear(torch.randn(D, P, generator=g) * 0.2)
+        self.o_proj = _Linear(torch.randn(P, hidden, generator=g) * 0.2)
+        self.conv1d = torch.nn.Module()
+        self.conv1d.weight = torch.nn.Parameter(params["conv_weight"].reshape(C, 1, W).clone(), requires_grad=False)
+        self.conv1d.bias = None
+        self.A_log = torch.nn.Parameter(params["A_log"].clone(), requires_grad=False)
+        self.dt_bias = torch.nn.Parameter(params["dt_bias"].clone(), requires_grad=False)
+        self.gate_lower_bound = params["lower_bound"]
+        self.o_norm = torch.nn.Module()
+        self.o_norm.weight = torch.nn.Parameter(torch.ones(D), requires_grad=False)
+        self.o_norm.eps = 1e-6
+        self.kv_cache = caches
+        self.cache_group_idx = group
+
+
 def _deferred_layer(params, hidden, seed, caches, group=None):
-    g = torch.Generator().manual_seed(seed)
-    in_proj = torch.randn(hidden, 4 * P + D + H, generator=g) * 0.2
-    f_b = torch.randn(D, P, generator=g) * 0.2
-    o_proj = torch.randn(P, hidden, generator=g) * 0.2
-    return types.SimpleNamespace(
-        local_num_heads=H,
-        head_dim=D,
-        local_projection_size=P,
-        in_proj_qkvgfab=lambda x: (x @ in_proj, None),
-        f_b_proj=lambda x: (x @ f_b, None),
-        conv1d=types.SimpleNamespace(weight=params["conv_weight"].reshape(C, 1, W), bias=None),
-        A_log=params["A_log"],
-        dt_bias=params["dt_bias"],
-        gate_lower_bound=params["lower_bound"],
-        o_norm=types.SimpleNamespace(weight=torch.ones(D), eps=1e-6),
-        o_proj=lambda x: (x @ o_proj, None),
-        kv_cache=caches,
-        cache_group_idx=group,
-    )
+    return _DeferredKdaLayer(params, hidden, seed, caches, group)
+
+
+class _FakeModel:
+    """Stands in for KimiLinearModel: exposes its modules like nn.Module.modules()."""
+
+    def __init__(self, layers):
+        self.layers = layers
+
+    def modules(self):
+        return iter(self.layers)
 
 
 def _step_metadata(is_prompt, indices, tokens=0):
@@ -429,6 +455,7 @@ def _run_steps(monkeypatch, mode):
     params = _make_params(200)
     hidden = 24
     layers = [_deferred_layer(params, hidden, 201 + i, _new_caches(6, False)) for i in range(2)]
+    model = _FakeModel(layers)
     g = torch.Generator().manual_seed(210)
     outs = []
 
@@ -439,7 +466,7 @@ def _run_steps(monkeypatch, mode):
 
     def step(meta, x):
         metadata["value"] = meta
-        outs.append(module.run_with_deferred_kda_state(model_forward, x))
+        outs.append(module.run_with_deferred_kda_state(model, model_forward, x))
 
     step(_step_metadata(True, [1, 2], 40), torch.randn(40, hidden, generator=g))
     for _ in range(4):
@@ -453,8 +480,9 @@ def _run_steps(monkeypatch, mode):
         metadata["value"] = _step_metadata(False, [1, 2])
         return out, module.hpu_kda_forward(layers[1], x[:2])
 
-    outs.extend(module.run_with_deferred_kda_state(mixed_forward, x))
-    assert module._PENDING_STATE == [] and module._DEFER_ACTIVE == [False]
+    outs.extend(module.run_with_deferred_kda_state(model, mixed_forward, x))
+    assert all(getattr(layer, "_kda_pending", None) is None for layer in layers)
+    assert module._DEFER_ACTIVE == [False]
     return outs, [c.clone() for layer in layers for c in layer.kv_cache]
 
 
@@ -474,19 +502,19 @@ def test_deferred_state_is_not_written_outside_a_wrapped_forward_or_after_an_err
     layer = _deferred_layer(params, 24, 221, _new_caches(6, False))
     x = torch.randn(2, 24, generator=torch.Generator().manual_seed(222))
     module.hpu_kda_forward(layer, x)  # not inside run_with_deferred_kda_state: inline write
-    assert module._PENDING_STATE == []
+    assert getattr(layer, "_kda_pending", None) is None
     assert any(c.abs().sum() > 0 for c in layer.kv_cache)
 
     layer.kv_cache = _new_caches(6, False)
 
     def failing_forward(x):
         module.hpu_kda_forward(layer, x)
-        assert len(module._PENDING_STATE) == 1
+        assert layer._kda_pending is not None
         raise RuntimeError("boom")
 
     with pytest.raises(RuntimeError, match="boom"):
-        module.run_with_deferred_kda_state(failing_forward, x)
-    assert module._PENDING_STATE == [] and module._DEFER_ACTIVE == [False]
+        module.run_with_deferred_kda_state(_FakeModel([layer]), failing_forward, x)
+    assert layer._kda_pending is None and module._DEFER_ACTIVE == [False]
     assert all(c.abs().sum() == 0 for c in layer.kv_cache)  # nothing leaked into the caches
 
 
@@ -510,15 +538,9 @@ def test_deferred_decode_layer_compiles_without_graph_break_or_cache_mutation(mo
     backend = aot_autograd(fw_compiler=capture, keep_inference_input_mutations=True)
     torch._dynamo.reset()
 
-    def _forget_stub_modules():  # dynamo caches module imports (functools.cache): the stubbed vllm.forward_context
-        torch._dynamo.reset()
-        clear = getattr(getattr(torch._dynamo.symbolic_convert, "_import_module", None), "cache_clear", None)
-        if clear is not None:
-            clear()
-
     _forget_stub_modules()
-    request.addfinalizer(_forget_stub_modules)
-    module.run_with_deferred_kda_state(lambda t: module.hpu_kda_forward(ref_layer, t), x.clone())
+    module.run_with_deferred_kda_state(_FakeModel([ref_layer]), lambda t: module.hpu_kda_forward(ref_layer, t),
+                                       x.clone())
     expected = module.hpu_kda_forward(ref_layer, x.clone())  # second step reads the stored state
     # fullgraph=True raises on any graph break (the inline write is a compiler.disable'd call)
     compiled = torch.compile(module.hpu_kda_forward, backend=backend, dynamic=False, fullgraph=True)
@@ -528,14 +550,88 @@ def test_deferred_decode_layer_compiles_without_graph_break_or_cache_mutation(mo
         outs.append(compiled(layer, t))
         return outs[-1]
 
-    module.run_with_deferred_kda_state(model_forward, x.clone())
-    module.run_with_deferred_kda_state(model_forward, x.clone())
+    model = _FakeModel([layer])
+    module.run_with_deferred_kda_state(model, model_forward, x.clone())
+    module.run_with_deferred_kda_state(model, model_forward, x.clone())
     assert len(graphs) >= 1
     targets = {str(n.target) for gm in graphs for n in gm.graph.nodes if n.op == "call_function"}
     assert not {t for t in targets if "copy_" in t or "index_copy" in t}, targets
     torch.testing.assert_close(outs[-1], expected)
     assert all(torch.equal(a, b) for a, b in zip(layer.kv_cache, ref_layer.kv_cache))
-    assert module._PENDING_STATE == []
+    assert layer._kda_pending is None
+
+
+class _DecoderLayer(torch.nn.Module):
+    """A decoder layer around a KDA layer; every instance shares this forward's code object (regional compilation)."""
+
+    def __init__(self, module, kda_layer):
+        super().__init__()
+        self.kda = kda_layer
+        self._module = module
+
+    def forward(self, x):
+        return x + self._module.hpu_kda_forward(self.kda, x)
+
+
+class _DecoderStack(torch.nn.Module):
+
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(layers)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("compile_layers", [False, True])
+def test_deferred_state_write_compiles_shared_layer_code_once(monkeypatch, request, dynamic, compile_layers):
+    """Four decoder layers share one compiled forward (like regional compilation) inside one deferred step: a single
+    compilation, no graph break, and the same outputs / caches as the inline write."""
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+
+    def run(mode):
+        _forget_stub_modules()
+        monkeypatch.setenv("HPU_KIMI_KDA_STATE_WRITE", mode)
+        metadata = {"value": _step_metadata(False, [1, 2, 3])}
+        module = _load_layer_module(monkeypatch, metadata)
+        params = _make_params(240)
+        decoders = [_DecoderLayer(module, _deferred_layer(params, 24, 241 + i, _new_caches(6, False)))
+                    for i in range(4)]
+        stack = _DecoderStack(decoders)
+        compiles, graphs = [], []
+        if compile_layers and mode == "deferred":
+
+            def capture(gm, example_inputs):
+                graphs.append(gm)
+                return make_boxed_func(gm.forward)
+
+            backend = aot_autograd(fw_compiler=capture, keep_inference_input_mutations=True)
+
+            def counting_backend(gm, example_inputs):
+                compiles.append(1)
+                return backend(gm, example_inputs)
+
+            for layer in decoders:
+                layer.compile(backend=counting_backend, dynamic=dynamic, fullgraph=True)
+        g = torch.Generator().manual_seed(250)
+        outs = [module.run_with_deferred_kda_state(stack, stack.forward, torch.randn(3, 24, generator=g))
+                for _ in range(3)]
+        assert all(getattr(layer.kda, "_kda_pending", None) is None for layer in decoders)
+        return outs, [c.clone() for layer in decoders for c in layer.kda.kv_cache], compiles, graphs
+
+    request.addfinalizer(_forget_stub_modules)
+    inline_out, inline_caches, _, _ = run("inline")
+    deferred_out, deferred_caches, compiles, graphs = run("deferred")
+    assert all(torch.equal(a, b) for a, b in zip(inline_out, deferred_out))
+    assert all(torch.equal(a, b) for a, b in zip(inline_caches, deferred_caches))
+    if compile_layers:
+        assert len(compiles) == 1, f"{len(compiles)} compilations for 4 layers sharing one code object"
+        targets = {str(n.target) for gm in graphs for n in gm.graph.nodes if n.op == "call_function"}
+        assert not {t for t in targets if "copy_" in t or "index_copy" in t}, targets
 
 
 def test_kda_state_write_env_flag(monkeypatch):
@@ -616,6 +712,23 @@ def _load_graph_state_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+
+def _forget_stub_modules():
+    """Dynamo caches module imports (functools.cache): drop a stubbed vllm.forward_context and compiled frames."""
+    torch._dynamo.reset()
+    clear = getattr(getattr(torch._dynamo.symbolic_convert, "_import_module", None), "cache_clear", None)
+    if clear is not None:
+        clear()
+    for name in [n for n in globals() if n.startswith("__import_")]:  # aliases dynamo added to this module
+        del globals()[name]
+
+
+@pytest.fixture(autouse=True)
+def _clean_dynamo_after_test():
+    yield
+    _forget_stub_modules()
 
 
 def _load_layer_module(monkeypatch, metadata):
