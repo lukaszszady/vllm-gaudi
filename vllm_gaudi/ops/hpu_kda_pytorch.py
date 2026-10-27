@@ -302,7 +302,7 @@ def _intra_chunk_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor, vc
     lead = cum.shape[:3]
 
     def fold(x):  # [B,H,G,C,D] -> [B*H*G,C,D]; reshape copies the non-contiguous slices of a chunk group
-        return x.reshape(-1, *x.shape[3:])
+        return x.reshape(lead[0] * lead[1] * lead[2], *x.shape[3:])
 
     cum, kc, qc, vc, bc, k_gamma, q_gamma = (fold(x) for x in (cum, kc, qc, vc, bc, k_gamma, q_gamma))
     # exp(G_i - G_j) for j <= i; the clamp keeps the masked-out upper triangle finite (0 * inf would be NaN)
@@ -347,14 +347,16 @@ def kda_chunked_steps_vec(state: torch.Tensor,
     bsz, seq_len, heads, kdim = q.shape
     vdim = v.shape[-1]
     chunk = chunk_size
-    pad = -seq_len % chunk
-    if pad:
-        zeros = lambda x: x.new_zeros(bsz, pad, *x.shape[2:])  # noqa: E731
-        q, k, v = (torch.cat([x, zeros(x)], dim=1) for x in (q, k, v))
-        g = torch.cat([g, zeros(g)], dim=1)
-        beta = torch.cat([beta, zeros(beta)], dim=1)
-    num_chunks = (seq_len + pad) // chunk
-    group = num_chunks if vec_chunks <= 0 else min(vec_chunks, num_chunks)
+    # num_chunks is one floor division of the (dynamic) sequence length by a constant, and the padded length is
+    # written as num_chunks * chunk (not seq_len + (-seq_len % chunk)): the traced shapes then stay products of
+    # plain dynamic dims and ints, with no Mod and no division by a symbolic size, which the HPU compiler's
+    # symbolic-size evaluation does not handle
+    num_chunks = (seq_len + chunk - 1) // chunk
+    pad = num_chunks * chunk - seq_len
+    # always padded (also by 0): the padded length must be the product num_chunks * chunk, not seq_len
+    q, k, v, g = (torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad)) for x in (q, k, v, g))
+    beta = torch.nn.functional.pad(beta, (0, 0, 0, pad))
+    group = vec_chunks if 0 < vec_chunks < num_chunks else num_chunks  # not min(): no Min in the traced shapes
 
     def to_chunks(x):  # [B, N*C, H, D] -> [B, H, N, C, D]
         return x.reshape(bsz, num_chunks, chunk, heads, -1).permute(0, 3, 1, 2, 4).contiguous()

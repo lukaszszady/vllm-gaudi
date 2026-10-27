@@ -1808,3 +1808,65 @@ def test_attn_res_layer_variants_of_kimi_k3():
     ]
     assert kda.attn_res_layer_variants(layers + [torch.nn.Linear(2, 2)]) == 16
     assert kda.attn_res_layer_variants([torch.nn.Linear(2, 2)]) == 1
+
+
+def _unsupported_size_exprs(fn, args, dynamic_dim):
+    """Tensor-shape expressions of the traced forward graph of ``fn(*args)`` (``args[0]`` dim ``dynamic_dim``
+    dynamic) that the HPU compiler's symbolic-size evaluation cannot handle: Mod / Min / Max / ceiling, and a
+    floor division by anything but a number."""
+    import sympy
+    import torch._dynamo as dynamo
+    from torch._dynamo.backends.common import aot_autograd
+
+    found = set()
+
+    def fw_compiler(gm, example_inputs):
+        for node in gm.graph.nodes:
+            val = node.meta.get("val")
+            for t in val if isinstance(val, (list, tuple)) else [val]:
+                for size in t.shape if isinstance(t, torch.Tensor) else ():
+                    if not isinstance(size, torch.SymInt):
+                        continue
+                    for e in sympy.preorder_traversal(size.node.expr):
+                        name = type(e).__name__
+                        if name in ("PythonMod", "Mod", "Min", "Max", "CeilToInt", "ceiling") or \
+                                (name == "FloorDiv" and not e.args[1].is_number):
+                            found.add(f"{size.node.expr} ({name}, {node.target})")
+        return gm.forward
+
+    dynamo.reset()
+    try:
+        dynamo.mark_dynamic(args[0], dynamic_dim)
+        with torch.no_grad():
+            torch.compile(fn, backend=aot_autograd(fw_compiler=fw_compiler))(*args)
+    finally:
+        dynamo.reset()
+    return sorted(found)
+
+
+@pytest.mark.parametrize("seq_len,vec_chunks", [(150, 2), (160, 2), (150, 0), (37, 16)])
+def test_chunked_vec_traced_sizes_are_plain_dynamic_dims(seq_len, vec_chunks):
+    """With a dynamic sequence length the traced graph (as the Habana backend sees it) must contain only sizes
+    like ``16 * ((s0 + 15) // 16)``: Mod/Min/Max/ceiling or a division by a symbolic size make its symbolic size
+    evaluation fail with 'RuntimeError: Not Implemented' in warmup."""
+    heads, dim, chunk = 2, 16, 16
+
+    def fn(x, state):
+        q, k, v, g, b = (x.reshape(1, x.shape[1], 5, heads, dim)[:, :, i] for i in range(5))
+        return kda.kda_chunked_steps_vec(state, q, k, v, -g.abs() * 0.1, b[..., 0].sigmoid(), chunk, 1, None,
+                                         vec_chunks)
+
+    x = torch.randn(1, seq_len, 5 * heads * dim)
+    state = torch.zeros(1, heads, dim, dim)
+    assert _unsupported_size_exprs(fn, (x, state), 1) == []
+
+
+def test_size_probe_detects_mod_and_symbolic_division():
+    """Positive control for the probe: a pad written with ``-n % c`` and a split of the result is flagged."""
+
+    def fn(x):
+        pad = -x.shape[1] % 16
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad))
+        return x.reshape(1, (x.shape[1]) // 16, 16, -1).sum()
+
+    assert _unsupported_size_exprs(fn, (torch.randn(1, 150, 4),), 1)
