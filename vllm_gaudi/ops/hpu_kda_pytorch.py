@@ -241,16 +241,14 @@ def kda_chunked_steps(state: torch.Tensor,
     bsz, seq_len, heads, kdim = q.shape
     vdim = v.shape[-1]
     chunk = chunk_size
-    pad = -seq_len % chunk
-    if pad:
-        zeros = lambda x: x.new_zeros(bsz, pad, *x.shape[2:])  # noqa: E731
-        q, k, v = (torch.cat([x, zeros(x)], dim=1) for x in (q, k, v))
-        g = torch.cat([g, zeros(g)], dim=1)
-        beta = torch.cat([beta, zeros(beta)], dim=1)
-    num_chunks = (seq_len + pad) // chunk
+    # same size arithmetic as ``kda_chunked_steps_vec`` (no Mod, no division by a symbolic size in the traced shapes)
+    num_chunks = (seq_len + chunk - 1) // chunk
+    pad = num_chunks * chunk - seq_len
+    q, k, v, g = (torch.nn.functional.pad(x, (0, 0, 0, 0, 0, pad)) for x in (q, k, v, g))
+    beta = torch.nn.functional.pad(beta, (0, 0, 0, pad))
 
     def to_chunks(x):  # [B, N*C, H, D] -> [B, H, N, C, D]
-        return x.reshape(bsz, num_chunks, chunk, heads, -1).permute(0, 3, 1, 2, 4)
+        return x.reshape(bsz, num_chunks, chunk, heads, x.shape[-1]).permute(0, 3, 1, 2, 4)
 
     qc, kc, vc, gc = to_chunks(q), to_chunks(k), to_chunks(v), to_chunks(g)
     bc = beta.reshape(bsz, num_chunks, chunk, heads).permute(0, 3, 1, 2).unsqueeze(-1)  # [B,H,N,C,1]
@@ -359,7 +357,7 @@ def kda_chunked_steps_vec(state: torch.Tensor,
     group = vec_chunks if 0 < vec_chunks < num_chunks else num_chunks  # not min(): no Min in the traced shapes
 
     def to_chunks(x):  # [B, N*C, H, D] -> [B, H, N, C, D]
-        return x.reshape(bsz, num_chunks, chunk, heads, -1).permute(0, 3, 1, 2, 4).contiguous()
+        return x.reshape(bsz, num_chunks, chunk, heads, x.shape[-1]).permute(0, 3, 1, 2, 4).contiguous()
 
     qc, kc, vc, gc = to_chunks(q), to_chunks(k), to_chunks(v), to_chunks(g)
     bc = beta.reshape(bsz, num_chunks, chunk, heads).permute(0, 3, 1, 2).contiguous().unsqueeze(-1)  # [B,H,N,C,1]

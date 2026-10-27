@@ -66,7 +66,7 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
     if hidden_states.dim() == 3:
         orig_3d = True
         bsz_o, seq_o, hidden = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden)
+        hidden_states = hidden_states.reshape(bsz_o * seq_o, hidden)
     num_tokens = hidden_states.size(0)
     heads, head_dim = self.local_num_heads, self.head_dim
     proj = self.local_projection_size
@@ -126,14 +126,14 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                     # gate_proj is a strided slice of ``projected`` and is used after the graph break below; the
                     # resume graph would receive it as a view with storage offset (strided_view fails in Synapse)
                     gate_proj = gate_proj.contiguous()
-                    core, slots, conv_rows, ssm_rows = kda_prefill_step(mixed_qkv.reshape(num_seqs, seq_len, -1),
-                                                                        raw_g.reshape(num_seqs, seq_len, -1),
-                                                                        raw_beta.reshape(num_seqs, seq_len, -1),
+                    core, slots, conv_rows, ssm_rows = kda_prefill_step(mixed_qkv.reshape(num_seqs, seq_len, mixed_qkv.shape[-1]),
+                                                                        raw_g.reshape(num_seqs, seq_len, raw_g.shape[-1]),
+                                                                        raw_beta.reshape(num_seqs, seq_len, raw_beta.shape[-1]),
                                                                         **prefill)
                     core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
                 else:
-                    core = _core_prefill(mixed_qkv.reshape(num_seqs, seq_len, -1), raw_g.reshape(num_seqs, seq_len, -1),
-                                         raw_beta.reshape(num_seqs, seq_len, -1), **prefill)
+                    core = _core_prefill(mixed_qkv.reshape(num_seqs, seq_len, mixed_qkv.shape[-1]), raw_g.reshape(num_seqs, seq_len, raw_g.shape[-1]),
+                                         raw_beta.reshape(num_seqs, seq_len, raw_beta.shape[-1]), **prefill)
                 # Keep post-processing out of the statement that calls the disabled core: ops chained on its last
                 # line end up in the dynamo resume frame without a source line, and the HPU compile backend then
                 # fails on the unparsable FX stack_trace ("'NoneType' object has no attribute 'file'").
@@ -152,7 +152,7 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
 
     gate = gate_proj.reshape(num_tokens, heads, head_dim)
     normed = gated_rmsnorm_sigmoid(core.to(hidden_states.dtype), gate, self.o_norm.weight, self.o_norm.eps)
-    res = self.o_proj(normed.reshape(num_tokens, -1))[0]
+    res = self.o_proj(normed.reshape(num_tokens, heads * head_dim))[0]
     if orig_3d:
-        res = res.view(bsz_o, seq_o, -1)
+        res = res.view(bsz_o, seq_o, res.shape[-1])
     return res

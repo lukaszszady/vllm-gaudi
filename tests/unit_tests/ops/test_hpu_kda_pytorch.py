@@ -1810,28 +1810,38 @@ def test_attn_res_layer_variants_of_kimi_k3():
     assert kda.attn_res_layer_variants([torch.nn.Linear(2, 2)]) == 1
 
 
+_UNSUPPORTED_SYMBOLS = ("PythonMod", "Mod", "Min", "Max", "CeilToInt", "ceiling", "ModularIndexing", "CleanDiv",
+                        "IntTrueDiv", "TrueDiv", "FloorToInt", "RoundToInt")
+
+
 def _unsupported_size_exprs(fn, args, dynamic_dim):
-    """Tensor-shape expressions of the traced forward graph of ``fn(*args)`` (``args[0]`` dim ``dynamic_dim``
-    dynamic) that the HPU compiler's symbolic-size evaluation cannot handle: Mod / Min / Max / ceiling, and a
-    floor division by anything but a number."""
+    """Size expressions of the traced forward graph of ``fn(*args)`` (``args[0]`` dim ``dynamic_dim`` dynamic)
+    that the HPU compiler's symbolic-size evaluation cannot handle: Mod / Min / Max / ceiling / true division
+    and a floor division by anything but a number. Checks the shapes of every tensor in the graph and every
+    SymInt value (sym_size, floordiv, ... nodes) in it."""
     import sympy
     import torch._dynamo as dynamo
     from torch._dynamo.backends.common import aot_autograd
 
     found = set()
 
+    def check(size, node):
+        if not isinstance(size, torch.SymInt):
+            return
+        for e in sympy.preorder_traversal(size.node.expr):
+            name = type(e).__name__
+            if name in _UNSUPPORTED_SYMBOLS or (name == "FloorDiv" and not e.args[1].is_number):
+                found.add(f"{size.node.expr} ({name}, {node.target})")
+
     def fw_compiler(gm, example_inputs):
         for node in gm.graph.nodes:
             val = node.meta.get("val")
             for t in val if isinstance(val, (list, tuple)) else [val]:
-                for size in t.shape if isinstance(t, torch.Tensor) else ():
-                    if not isinstance(size, torch.SymInt):
-                        continue
-                    for e in sympy.preorder_traversal(size.node.expr):
-                        name = type(e).__name__
-                        if name in ("PythonMod", "Mod", "Min", "Max", "CeilToInt", "ceiling") or \
-                                (name == "FloorDiv" and not e.args[1].is_number):
-                            found.add(f"{size.node.expr} ({name}, {node.target})")
+                if isinstance(t, torch.Tensor):
+                    for size in t.shape:
+                        check(size, node)
+                else:
+                    check(t, node)
         return gm.forward
 
     dynamo.reset()
@@ -1870,3 +1880,41 @@ def test_size_probe_detects_mod_and_symbolic_division():
         return x.reshape(1, (x.shape[1]) // 16, 16, -1).sum()
 
     assert _unsupported_size_exprs(fn, (torch.randn(1, 150, 4),), 1)
+
+
+@pytest.mark.parametrize("prefill_impl", ["chunked", "chunked_vec"])
+@pytest.mark.parametrize("num_seqs,seq_len,vec_chunks", [(1, 150, 2), (3, 150, 2), (3, 150, 4), (3, 64, 0), (2, 37, 16)])
+def test_prefill_step_traced_sizes_are_plain_dynamic_dims(prefill_impl, num_seqs, seq_len, vec_chunks):
+    """The whole prefill step as hpu_kda_forward calls it: a flat dynamic token dimension is split into
+    [num_seqs, tokens // num_seqs] and every reshape names its channel size, so only the token dimension is
+    symbolic (an incomplete last chunk group and B > 1 included)."""
+    params = _make_params(140)
+    caches = _new_caches(num_seqs + 1, False)
+    state_idx = torch.arange(num_seqs)
+    chunk = 16
+
+    def fn(x):
+        tokens = x.shape[0]
+        length = tokens // num_seqs
+        mixed, raw_g, raw_beta = x[:, :C], x[:, C:C + P], x[:, C + P:]
+        out, *_ = kda.kda_prefill_step(mixed.reshape(num_seqs, length, mixed.shape[-1]),
+                                       raw_g.reshape(num_seqs, length, raw_g.shape[-1]),
+                                       raw_beta.reshape(num_seqs, length, raw_beta.shape[-1]),
+                                       params["conv_weight"],
+                                       None,
+                                       params["A_log"],
+                                       params["dt_bias"],
+                                       params["lower_bound"],
+                                       *caches,
+                                       state_idx,
+                                       None,
+                                       None,
+                                       H,
+                                       D,
+                                       prefill_impl=prefill_impl,
+                                       chunk_size=chunk,
+                                       vec_chunks=vec_chunks)
+        return out.reshape(tokens, H, D)
+
+    x = torch.randn(num_seqs * seq_len, C + P + H)
+    assert _unsupported_size_exprs(fn, (x, ), 0) == []
