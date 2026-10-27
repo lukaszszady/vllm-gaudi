@@ -855,10 +855,9 @@ def maybe_tag_kda_cache_groups(model, kv_cache_config: KVCacheConfig):
     """
     if isinstance(model, HpuModelAdapter):
         model = model.model
-    tagged, untagged, unmatched = tag_kda_cache_groups(
-        model.named_modules(), kv_cache_config.kv_cache_groups,
-        lambda group: isinstance(group.kv_cache_spec, MambaSpec),
-        lambda gid: torch.tensor(gid, dtype=torch.long, device="hpu"))
+    tagged, untagged, unmatched = tag_kda_cache_groups(model.named_modules(), kv_cache_config.kv_cache_groups,
+                                                       lambda group: isinstance(group.kv_cache_spec, MambaSpec),
+                                                       lambda gid: torch.tensor(gid, dtype=torch.long, device="hpu"))
     if not (tagged or untagged):
         return
     logger.info("KDA cache groups: tagged %d layers (per group: %s)", sum(tagged.values()),

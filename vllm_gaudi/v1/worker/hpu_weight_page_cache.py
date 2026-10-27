@@ -8,8 +8,13 @@ PT_HPU_HOST_MEMORY_THRESHOLD_PERCENT (90 by default) as host memory pressure and
 graph is recompiled afterwards. The weights live on the HPU after loading and the shards are not read again, so
 their cached pages are dropped with posix_fadvise(POSIX_FADV_DONTNEED) as soon as the loader is done with them.
 
+Only vLLM's DefaultModelLoader safetensors path is covered (not the torchao / prefetch load strategies,
+enable_multithread_load, fastsafetensors, instanttensor or .pt checkpoints).
+
 Environment:
-  VLLM_HPU_DROP_WEIGHT_PAGE_CACHE      1 (default) drops the cache of consumed shards, 0 keeps the upstream loader
+  VLLM_HPU_DROP_WEIGHT_PAGE_CACHE      unset/auto: active only when the safetensors shards together are larger
+                                       than 25% of MemTotal (small checkpoints keep the upstream iterator,
+                                       including its auto-prefetch); 1 forces it on, 0 keeps the upstream loader
   VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_LAG  shards kept cached behind the current one (default 4). The ranks of a node
                                        read the same shards at about the same time; the lag lets slower ranks still
                                        hit the cache instead of re-reading a shard that a faster rank dropped.
@@ -20,7 +25,6 @@ import os
 from collections.abc import Callable, Generator, Iterator
 
 import torch
-from tqdm.auto import tqdm
 
 from vllm_gaudi.extension.logger import logger as init_logger
 
@@ -29,15 +33,44 @@ logger = init_logger()
 _ENV_DROP = "VLLM_HPU_DROP_WEIGHT_PAGE_CACHE"
 _ENV_LAG = "VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_LAG"
 _DEFAULT_LAG = 4
+_AUTO_MIN_FRACTION = 0.25  # auto mode: active when the shards are larger than this fraction of MemTotal
 _LOG_EVERY_SHARDS = 16
 # Strategies whose iteration state does not cross shard boundaries, so the iterator can be called once per shard.
-# "torchao" carries leftover tensors from one shard to the next and keeps the upstream iterator.
-_PER_SHARD_STRATEGIES = (None, "lazy", "eager", "prefetch")
+# Kept on the upstream iterator: "torchao" (carries leftover tensors from one shard to the next) and "prefetch"
+# (its background thread warms the cache of all shards at once, which is the opposite of this module).
+_PER_SHARD_STRATEGIES = (None, "lazy", "eager")
 _MEMINFO_KEYS = ("MemTotal", "MemFree", "MemAvailable", "Cached", "Shmem", "Active(file)", "Inactive(file)")
 
 
-def drop_enabled() -> bool:
-    return os.getenv(_ENV_DROP, "1").strip().lower() not in ("0", "false", "no", "off")
+def drop_mode() -> str:
+    """'on' (forced), 'off' or 'auto' (decided from the checkpoint size) from VLLM_HPU_DROP_WEIGHT_PAGE_CACHE."""
+    value = os.getenv(_ENV_DROP, "").strip().lower()
+    if value in ("0", "false", "no", "off"):
+        return "off"
+    if value in ("1", "true", "yes", "on"):
+        return "on"
+    if value not in ("", "auto"):
+        logger.warning("%s=%r is not 0/1/auto, using auto", _ENV_DROP, value)
+    return "auto"
+
+
+def _mem_total_bytes() -> int:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def _files_size_bytes(files: list[str]) -> int:
+    total = 0
+    for path in files:
+        with contextlib.suppress(OSError):
+            total += os.path.getsize(path)
+    return total
 
 
 def _lag() -> int:
@@ -86,8 +119,13 @@ def drop_file_page_cache(path: str) -> bool:
         os.close(fd)
 
 
-def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.Tensor]]]):
-    """Return a drop-in replacement of safetensors_weights_iterator that drops the cache of consumed shards."""
+def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.Tensor]]],
+                              seen: list[str] | None = None,
+                              force: bool = True):
+    """Return a drop-in replacement of safetensors_weights_iterator that drops the cache of consumed shards.
+
+    Shards handled by the replacement are appended to ``seen``. Unless ``force`` is set, checkpoints not larger than
+    _AUTO_MIN_FRACTION of MemTotal are passed to the upstream iterator untouched."""
     from vllm.model_executor.model_loader import weight_utils
 
     sort_key = getattr(weight_utils, "_natural_sort_key", None)
@@ -103,10 +141,29 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
         if safetensors_load_strategy not in _PER_SHARD_STRATEGIES:
             yield from original(hf_weights_files, use_tqdm_on_load, safetensors_load_strategy, *args, **kwargs)
             return
+        if not force:
+            total, mem_total = _files_size_bytes(hf_weights_files), _mem_total_bytes()
+            if mem_total and total <= _AUTO_MIN_FRACTION * mem_total:
+                logger.info(
+                    "Weight page cache: checkpoint shards %.1f GiB <= %d%% of MemTotal (%.1f GiB), "
+                    "upstream loader kept", total / 2**30, 100 * _AUTO_MIN_FRACTION, mem_total / 2**30)
+                yield from original(hf_weights_files, use_tqdm_on_load, safetensors_load_strategy, *args, **kwargs)
+                return
+            if not mem_total:
+                logger.info("Weight page cache: MemTotal unknown, dropping shards (%.1f GiB)", total / 2**30)
+        from tqdm.auto import tqdm
+
+        # None lets the upstream iterator size the whole checkpoint and may start a prefetch (plus an info_once log)
+        # per call; "lazy" is the plain safe_open path it takes otherwise, without that per-shard side effect.
+        if safetensors_load_strategy is None:
+            safetensors_load_strategy = "lazy"
         files = sorted(hf_weights_files, key=sort_key) if sort_key else sorted(hf_weights_files)
+        if seen is not None:
+            seen.extend(files)
         lag = _lag()
-        logger.info("Weight page cache: dropping shards after use (lag %d of %d shards); before: %s", lag, len(files),
-                    host_memory_line())
+        logger.info("Weight page cache: dropping shards after use (lag %d of %d shards, %.1f GiB); before: %s", lag,
+                    len(files),
+                    _files_size_bytes(files) / 2**30, host_memory_line())
         dropped = failed = 0
         started = 0  # shards opened so far
         next_drop = 0  # first shard whose cache is not dropped yet
@@ -129,16 +186,20 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
             for st_file in files[next_drop:started]:
                 ok = drop_file_page_cache(st_file)
                 dropped, failed = dropped + ok, failed + (not ok)
-            logger.info("Weight page cache: dropped %d shards (%d failed); after: %s", dropped, failed,
-                        host_memory_line())
+            logger.info("Weight page cache: loader finished, fadvise(DONTNEED) called for %d shards (%d failed)",
+                        dropped, failed)
 
     return iterator
 
 
 @contextlib.contextmanager
 def drop_weight_page_cache_during_load():
-    """Use the page-cache-dropping iterator in vLLM's default loader for the duration of the block."""
-    if not drop_enabled():
+    """Use the page-cache-dropping iterator in vLLM's default loader for the duration of the block.
+
+    DONTNEED skips pages that are still mapped, so the shards seen are advised once more when the block ends, i.e.
+    after the loader's post-processing released its mappings and CPU tensors."""
+    mode = drop_mode()
+    if mode == "off":
         yield
         return
     try:
@@ -148,8 +209,16 @@ def drop_weight_page_cache_during_load():
         logger.warning("Weight page cache drop disabled, default loader not patchable: %s", exc)
         yield
         return
-    default_loader.safetensors_weights_iterator = wrap_safetensors_iterator(original)
+    seen: list[str] = []
+    default_loader.safetensors_weights_iterator = wrap_safetensors_iterator(original, seen, force=mode == "on")
     try:
         yield
     finally:
         default_loader.safetensors_weights_iterator = original
+        if seen:
+            try:  # must never replace an exception raised by get_model
+                calls = sum(drop_file_page_cache(path) for path in seen)
+                logger.info("Weight page cache: final fadvise(DONTNEED) called for %d/%d shards; after: %s", calls,
+                            len(seen), host_memory_line())
+            except Exception as exc:
+                logger.warning("Weight page cache: final drop failed: %s", exc)
