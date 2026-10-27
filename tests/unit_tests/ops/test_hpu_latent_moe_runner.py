@@ -168,3 +168,19 @@ def test_install_inline_forward_entry_is_skipped_when_inline_entry_disabled(monk
 
     assert hpu_fused_moe.install_inline_moe_forward_entry(model) == 0
     assert model.runner._forward_entry == "opaque"
+
+
+def test_prime_moe_runners_for_compile_runs_one_time_first_forward_work():
+    model = torch.nn.Module()
+    latent = _make_fake_runner_instance()
+    latent.routed_experts = MagicMock()
+    latent._logged_sharded_tail = False
+    plain = _make_fake_runner_instance()
+    model.latent, model.plain = latent, plain
+
+    assert hpu_fused_moe.prime_moe_runners_for_compile(model) == 2
+
+    # moe_quant_config init and the one-time log of the sharded tail must not happen inside the first trace
+    latent.routed_experts._ensure_moe_quant_config_init.assert_called_once_with()
+    assert latent._logged_sharded_tail is True
+    assert not hasattr(plain, "_logged_sharded_tail")

@@ -877,6 +877,33 @@ def install_inline_moe_forward_entry(model: torch.nn.Module) -> int:
     return replaced
 
 
+def prime_moe_runners_for_compile(model: torch.nn.Module) -> int:
+    """Run the one-time first-forward work of the MoE runners of ``model`` before it is compiled.
+
+    The first traced call of a decoder layer must see the steady state. Otherwise Dynamo breaks the graph at the
+    one-time branch (the lazy ``moe_quant_config`` init of ``_hpu_apply_moe_dp1``, the ``info_once`` of the Kimi-K3
+    latent runner's ``_shard_up_proj_tail``) and keeps the layer split into nested frames at that call stack
+    even after the branch is no longer taken: one extra cache lookup and graph launch per frame and layer.
+    Call after the weights are processed. Returns the number of runners primed.
+    """
+    primed = 0
+    logged_tail = False
+    for module in model.modules():
+        if not isinstance(module, MoERunnerBase):
+            continue
+        routed_experts = getattr(module, "routed_experts", None)
+        if routed_experts is not None and hasattr(routed_experts, "_ensure_moe_quant_config_init"):
+            routed_experts._ensure_moe_quant_config_init()
+        if getattr(module, "_logged_sharded_tail", True) is False:
+            module._logged_sharded_tail = True
+            logged_tail = True
+        primed += 1
+    if logged_tail:
+        logger.info("Kimi-K3 latent-MoE tail: up-projecting only this rank's hidden shard into the shared output.")
+    logger.info("Primed %d MoE runners for torch.compile, pid %d", primed, os.getpid())
+    return primed
+
+
 def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
     """
     Compresses the expert map by removing any -1 entries.

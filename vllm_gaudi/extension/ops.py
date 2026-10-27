@@ -1629,6 +1629,62 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
         return final_hidden_states
 
 
+# MXFP4 MoE op calls of VllmMixtureOfExpertsOpMXFP4. The ops only run in graph mode: an eager caller wraps them in
+# torch.compile, a caller inside a compiled region traces them into its graph (see _get_compiled_forward).
+def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list, w12_bias, w3_bias,
+                          d_scale_w12, d_scale_w3, block_size, experts_min, experts_max, chunk_size, total_experts,
+                          alpha, limit):
+    return torch.ops.hpu.mixture_of_experts.bias_mxfp4_fused_weights(
+        hidden_states,
+        expert_routing_table,
+        router_weights,
+        w12_list,
+        w3_list,
+        w12_bias,
+        w3_bias,
+        d_scale_w12,
+        d_scale_w3,
+        block_size=block_size,
+        permuted_weights=True,
+        experts_min=experts_min,
+        experts_max=experts_max,
+        is_fp4=True,
+        chunk_size=chunk_size,
+        total_experts=total_experts,
+        alpha=alpha,
+        limit=limit,
+    )
+
+
+def _mxfp4_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list, d_scale_w12, d_scale_w3,
+                     block_size, activation, experts_min, experts_max, chunk_size, total_experts):
+    return torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights(
+        hidden_states,
+        expert_routing_table,
+        router_weights,
+        w12_list,
+        w3_list,
+        d_scale_w12,
+        d_scale_w3,
+        block_size=block_size,
+        permuted_weights=True,
+        activation=activation,
+        experts_min=experts_min,
+        experts_max=experts_max,
+        is_fp4=True,
+        chunk_size=chunk_size,
+        total_experts=total_experts,
+    )
+
+
+def _mxfp4_bits_fwd(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2, w2_scale, activation,
+                    experts_min, group, chunk_size, total_experts):
+    from vllm_gaudi.ops.hpu_situ_moe import mxfp4_bits_moe
+    kwargs = {"chunk_size": chunk_size, "total_experts": total_experts} if chunk_size else {}
+    return mxfp4_bits_moe(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2, w2_scale,
+                          torch.ops.hpu.mixture_of_experts, activation, experts_min, group, **kwargs)
+
+
 class MoeMXFP4Matmul(torch.nn.Module):
     """Weight holder for packed MXFP4 weights + E8M0 scales (+ optional bias)."""
 
@@ -1720,18 +1776,11 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         return True
 
     def _get_compiled_bits_forward(self):
+        # Same as _get_compiled_forward: no nested torch.compile wrapper inside a compiled region
+        if torch.compiler.is_compiling():
+            return _mxfp4_bits_fwd
         if self._compiled_bits_forward is None:
-            from vllm_gaudi.ops.hpu_situ_moe import mxfp4_bits_moe
-
-            @torch.compile(backend="hpu_backend")
-            def _mxfp4_bits_fwd(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2, w2_scale,
-                                activation, experts_min, group, chunk_size, total_experts):
-                kwargs = {"chunk_size": chunk_size, "total_experts": total_experts} if chunk_size else {}
-                return mxfp4_bits_moe(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2,
-                                      w2_scale, torch.ops.hpu.mixture_of_experts, activation, experts_min, group,
-                                      **kwargs)
-
-            self._compiled_bits_forward = _mxfp4_bits_fwd
+            self._compiled_bits_forward = torch.compile(_mxfp4_bits_fwd, backend="hpu_backend")
         return self._compiled_bits_forward
 
     def _get_compiled_bits_group(self):
@@ -1741,8 +1790,8 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
             # dynamic=False: the w13 / w2 shapes differ, automatic dynamic shapes would recompile the dequant with
             # symbolic sizes (synStatus 26 'Invalid Tensor Size'); one static graph per group shape and token bucket
             @torch.compile(backend="hpu_backend", dynamic=False)
-            def _mxfp4_bits_group_fwd(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2,
-                                      w2_scale, activation, experts_min, experts_max, **kwargs):
+            def _mxfp4_bits_group_fwd(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2, w2_scale,
+                                      activation, experts_min, experts_max, **kwargs):
                 return mxfp4_bits_group(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2,
                                         w2_scale, torch.ops.hpu.mixture_of_experts, activation, experts_min,
                                         experts_max, **kwargs)
@@ -1756,8 +1805,8 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         from vllm_gaudi.ops.hpu_situ_moe import mxfp4_bits_moe_split
         kwargs = {"chunk_size": chunk_size, "total_experts": total_experts} if chunk_size else {}
         return mxfp4_bits_moe_split(self._get_compiled_bits_group(), hidden_states, expert_routing_table,
-                                    router_weights, *self._bits_weights, activation, self.experts_min,
-                                    self._bits_group, **kwargs)
+                                    router_weights, *self._bits_weights, activation, self.experts_min, self._bits_group,
+                                    **kwargs)
 
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)
@@ -1784,60 +1833,14 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         return ret
 
     def _get_compiled_forward(self):
+        # Inside a compiled region call the op directly: building the nested torch.compile wrapper there is a
+        # graph break ('torch.compile call with > 1 args'), and Dynamo keeps the frames split at that break for
+        # every layer traced before the wrapper existed, even after it is cached.
+        if torch.compiler.is_compiling():
+            return _mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd
         if self._compiled_forward is None:
-            if self.has_bias:
-
-                @torch.compile(backend="hpu_backend")
-                def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list,
-                                          w12_bias, w3_bias, d_scale_w12, d_scale_w3, block_size, experts_min,
-                                          experts_max, chunk_size, total_experts, alpha, limit):
-                    return torch.ops.hpu.mixture_of_experts.bias_mxfp4_fused_weights(
-                        hidden_states,
-                        expert_routing_table,
-                        router_weights,
-                        w12_list,
-                        w3_list,
-                        w12_bias,
-                        w3_bias,
-                        d_scale_w12,
-                        d_scale_w3,
-                        block_size=block_size,
-                        permuted_weights=True,
-                        experts_min=experts_min,
-                        experts_max=experts_max,
-                        is_fp4=True,
-                        chunk_size=chunk_size,
-                        total_experts=total_experts,
-                        alpha=alpha,
-                        limit=limit,
-                    )
-
-                self._compiled_forward = _mxfp4_bias_fused_fwd
-            else:
-
-                @torch.compile(backend="hpu_backend")
-                def _mxfp4_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list,
-                                     d_scale_w12, d_scale_w3, block_size, activation, experts_min, experts_max,
-                                     chunk_size, total_experts):
-                    return torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights(
-                        hidden_states,
-                        expert_routing_table,
-                        router_weights,
-                        w12_list,
-                        w3_list,
-                        d_scale_w12,
-                        d_scale_w3,
-                        block_size=block_size,
-                        permuted_weights=True,
-                        activation=activation,
-                        experts_min=experts_min,
-                        experts_max=experts_max,
-                        is_fp4=True,
-                        chunk_size=chunk_size,
-                        total_experts=total_experts,
-                    )
-
-                self._compiled_forward = _mxfp4_fused_fwd
+            fwd = _mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd
+            self._compiled_forward = torch.compile(fwd, backend="hpu_backend")
         return self._compiled_forward
 
     def forward(self, hidden_states, expert_routing_table, router_weights, permuted_weights=True, activation="silu"):

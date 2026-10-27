@@ -919,8 +919,9 @@ def apply_model_specific_patches(model_runner):
         apply_hpu_qwen3_residual_fix(model_runner.model)
     if is_kimi_k3:
         # Runs in every worker that owns the model, unlike the plugin hooks in patches.py.
-        from vllm_gaudi.ops.hpu_fused_moe import install_inline_moe_forward_entry
+        from vllm_gaudi.ops.hpu_fused_moe import install_inline_moe_forward_entry, prime_moe_runners_for_compile
         install_inline_moe_forward_entry(model_runner.model)
+        prime_moe_runners_for_compile(model_runner.model)
 
 
 def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,
