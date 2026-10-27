@@ -92,6 +92,15 @@ def clean_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def empty_dev(tmp_path, monkeypatch):
+    """The container's /dev must not leak into the tests: an empty one makes the sysfs cards the visible ones."""
+    path = tmp_path / "empty_dev"
+    path.mkdir()
+    monkeypatch.setattr(aff, "_DEV", str(path))
+    return path
+
+
 @pytest.fixture
 def logs(monkeypatch):
     """vllm's logger does not propagate, so caplog cannot see it: replace the module logger."""
@@ -367,6 +376,65 @@ def test_mode_0_with_whole_node_env_list_emits_no_warning(sysfs, proc, cpus, mon
     aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
     assert logs.of("WARNING") == [] and len(logs.records) == 1
     assert cpus["calls"] == []
+
+
+def test_mode_0_mismatch_is_logged_at_debug(sysfs, proc, cpus, monkeypatch, logs):
+    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "3")
+    open_device(proc, 3)
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
+    assert any("env says card" in m for m in logs.of("DEBUG")) and logs.of("WARNING") == []
+
+
+def test_pin_mode_mismatch_is_a_warning(sysfs, proc, cpus, monkeypatch, logs):
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "1")
+    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "3")
+    open_device(proc, 3)
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
+    assert any("env says card" in m for m in logs.of("WARNING"))
+
+
+@pytest.mark.parametrize("mode,level", [("0", "DEBUG"), ("1", "WARNING")])
+def test_several_open_devices_log_level(sysfs, proc, cpus, monkeypatch, logs, mode, level):
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", mode)
+    open_device(proc, 0)
+    open_device(proc, 1)
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
+    assert any("several Habana devices" in m for m in logs.of(level))
+    assert not any("several Habana devices" in m for m in logs.of("DEBUG" if level == "WARNING" else "WARNING"))
+
+
+@pytest.mark.parametrize("mode,level", [("0", "DEBUG"), ("core", "WARNING")])
+def test_unknown_module_id_log_level(sysfs, proc, cpus, monkeypatch, logs, mode, level):
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", mode)
+    monkeypatch.setenv("HABANA_VISIBLE_MODULES", "42")
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))
+    assert any("not found in sysfs" in m for m in logs.of(level))
+    assert not any("not found in sysfs" in m for m in logs.of("DEBUG" if level == "WARNING" else "WARNING"))
+
+
+def test_core_mode_with_empty_dev_falls_back_to_all_sysfs_cards(sysfs, proc, cpus, monkeypatch):
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "core")
+    open_device(proc, 0)
+    aff.apply_affinity(0, 0, sysfs=sysfs, proc=str(proc))  # _DEV is empty here
+    assert len(_pinned_masks(cpus)) == 1 and len(next(iter(_pinned_masks(cpus)))) == len(NODE0) // 2
+
+
+def test_partial_dev_gives_disjoint_slices_to_two_visible_cards(sysfs, proc, tmp_path, cpus, monkeypatch):
+    dev = tmp_path / "dev"
+    (dev / "accel").mkdir(parents=True)
+    for name in ("accel0", "accel1", "accel_controlD0", "accel_controlD1"):  # same-node cards 0 and 1 only
+        (dev / "accel" / name).write_text("")
+    monkeypatch.setenv("VLLM_HPU_BIND_NUMA", "core")
+    masks = []
+    for index in (0, 1):
+        close_devices(proc)
+        open_device(proc, index)
+        cpus["calls"].clear()
+        cpus["mask"] = set(range(32))  # every rank is a fresh process
+        aff.apply_affinity(index, index, sysfs=sysfs, proc=str(proc), dev=str(dev))
+        masks.append(_pinned_masks(cpus))
+    first, second = (set(next(iter(m))) for m in masks)
+    assert first and second and not first & second and first | second == set(NODE0)
 
 
 def test_mode_0_mismatch_is_not_a_warning(sysfs, proc, cpus, monkeypatch, logs):

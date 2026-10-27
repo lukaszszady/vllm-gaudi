@@ -117,7 +117,7 @@ def _device_pci(index: str, prefix: str, sysfs: str) -> str | None:
     return os.path.basename(os.path.realpath(link))
 
 
-def find_opened_card_pci(sysfs: str = _SYSFS, proc: str = _PROC) -> str | None:
+def find_opened_card_pci(sysfs: str = _SYSFS, proc: str = _PROC, quiet: bool = False) -> str | None:
     """PCI address of the card whose device node this process holds open, or None."""
     found: list[str] = []
     try:
@@ -135,12 +135,13 @@ def find_opened_card_pci(sysfs: str = _SYSFS, proc: str = _PROC) -> str | None:
             if pci and pci not in found:
                 found.append(pci)
     if len(found) > 1:
-        logger.warning("HPU affinity: process holds several Habana devices open (%s), not using them", ",".join(found))
+        note = logger.debug if quiet else logger.warning
+        note("HPU affinity: process holds several Habana devices open (%s), not using them", ",".join(found))
         return None
     return found[0] if found else None
 
 
-def find_env_card_pci(sysfs: str = _SYSFS, environ=None) -> str | None:
+def find_env_card_pci(sysfs: str = _SYSFS, environ=None, quiet: bool = False) -> str | None:
     """The card named by the environment, only when it names exactly one.
 
     Under Ray every worker sees the node-wide HABANA_VISIBLE_MODULES / HL_VISIBLE_PCI_ADDRESS list, from which the
@@ -154,7 +155,8 @@ def find_env_card_pci(sysfs: str = _SYSFS, environ=None) -> str | None:
             for pci, mid in _habana_cards(sysfs).items():
                 if mid == module_id:
                     return pci
-        logger.debug("HPU affinity: module id %r from HABANA_VISIBLE_MODULES not found in sysfs", modules[0])
+        note = logger.debug if quiet else logger.warning
+        note("HPU affinity: module id %r from HABANA_VISIBLE_MODULES not found in sysfs", modules[0])
     pcis = [p.strip() for p in env.get("HL_VISIBLE_PCI_ADDRESS", "").split(",") if p.strip()]
     return pcis[0] if len(pcis) == 1 else None
 
@@ -165,10 +167,10 @@ def find_card_pci(sysfs: str = _SYSFS, proc: str = _PROC, environ=None, quiet: b
     ``quiet`` (binding disabled) turns the diagnostics into DEBUG: they are only interesting when we bind.
     """
     note = logger.debug if quiet else logger.warning
-    opened = find_opened_card_pci(sysfs, proc)
+    opened = find_opened_card_pci(sysfs, proc, quiet)
     guess = None
     try:
-        guess = find_env_card_pci(sysfs, environ)
+        guess = find_env_card_pci(sysfs, environ, quiet)
     except Exception as exc:
         logger.debug("HPU affinity: env based card lookup failed (%s: %s)", type(exc).__name__, exc)
     if opened:
@@ -217,8 +219,9 @@ def _physical_cores(cpus: set[int], sysfs: str) -> list[list[int]]:
 _DEVICE_NODE = re.compile(r"^(accel|hl)(\d+)$")
 
 
-def _visible_cards(sysfs: str, dev: str) -> list[str]:
+def _visible_cards(sysfs: str, dev: str | None = None) -> list[str]:
     """PCI addresses of the cards whose device nodes exist in this container; all host cards if none can be seen."""
+    dev = _DEV if dev is None else dev
     found: list[str] = []
     for directory in (os.path.join(dev, "accel"), dev):
         try:
@@ -233,7 +236,7 @@ def _visible_cards(sysfs: str, dev: str) -> list[str]:
     return found or list(_habana_cards(sysfs))
 
 
-def _core_slice(pci: str, node: int | None, cpus: set[int], sysfs: str, dev: str = _DEV) -> set[int]:
+def _core_slice(pci: str, node: int | None, cpus: set[int], sysfs: str, dev: str | None = None) -> set[int]:
     """The share of the physical cores of ``cpus`` (node CPUs the pod may use) that belongs to this card.
 
     The cards visible in the container that share the NUMA node split the cores evenly (in PCI order). With fewer
@@ -267,7 +270,7 @@ def _pin_all_threads(mask: set[int], proc: str) -> tuple[int, int]:
     return pinned, len(tids)
 
 
-def apply_affinity(rank: int, local_rank: int, sysfs: str = _SYSFS, proc: str = _PROC, dev: str = _DEV) -> None:
+def apply_affinity(rank: int, local_rank: int, sysfs: str = _SYSFS, proc: str = _PROC, dev: str | None = None) -> None:
     """Logs (and, if enabled, sets) the CPU affinity of this process. Never raises.
 
     Call after the HPU device is acquired, so the opened device node identifies the card.
