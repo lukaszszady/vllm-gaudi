@@ -1155,6 +1155,46 @@ def test_unit_lower_inverse_dense_matches_original(size):
     torch.testing.assert_close(kda._unit_lower_inverse_dense(a), kda._unit_lower_inverse(a), rtol=1e-6, atol=1e-6)
 
 
+@pytest.mark.parametrize("size", [8, 16, 48, 64])
+def test_unit_lower_inverse_dense_matches_exact_inverse_even_when_ill_conditioned(size):
+    g = torch.Generator().manual_seed(200 + size)
+    for scale in (0.3, 0.99):
+        a = torch.tril(torch.rand(7, size, size, generator=g, dtype=torch.float64) * scale, -1)
+        ref = torch.linalg.inv(torch.eye(size, dtype=torch.float64) + a)
+        got = kda._unit_lower_inverse_dense(a.float()).double()
+        assert torch.isfinite(got).all()
+        tol = 1e-3 * ref.abs().amax(dim=(-1, -2), keepdim=True)
+        assert ((got - ref).abs() <= 1e-3 * ref.abs() + tol).all()
+
+
+@pytest.mark.parametrize("size", [1, 2, 5, 16, 64])
+def test_unit_lower_inverse_dense_is_gather_free_and_hpu_view_safe(size):
+    """No index_select / gather (thousands of small TPC gather kernels per layer on HPU), no diagonal / as_strided,
+    no select or stepped slice on a non-leading dim and no tensor above rank 5."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    bad, ranks = [], []
+
+    class _Ops(TorchDispatchMode):
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            name = func.overloadpacket.__name__
+            if name in ("index_select", "gather", "index", "diagonal", "as_strided") or (
+                    name == "select" and args[1] != 0) or (name == "slice" and args[1] != 0 and len(args) > 4
+                                                          and args[4] != 1):
+                bad.append((str(func), args[1:]))
+            out = func(*args, **(kwargs or {}))
+            ranks.extend(t.dim() for t in tree_leaves((args, out)) if isinstance(t, torch.Tensor))
+            return out
+
+    a = torch.tril(torch.randn(3, size, size), -1)
+    with _Ops():
+        kda._unit_lower_inverse_dense(a)
+    assert not bad, bad[:5]
+    assert max(ranks) <= 5
+
+
 @pytest.mark.parametrize("lengths,padded,chunk", [([70, 41], 96, 32), ([37], 37, 16), ([9], 12, 4), ([64], 64, 16)])
 def test_chunked_vec_prefill_outputs_are_dense_tensors(lengths, padded, chunk):
     """Everything kda_prefill_step returns crosses a graph break (dynamo resume frame / eager cache write): plain
