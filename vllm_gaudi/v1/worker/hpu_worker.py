@@ -175,13 +175,14 @@ class HPUWorker(WorkerBase):
         self.profiler.stop()
 
     def init_device(self):
-        # Before the device is opened, so threads created later inherit the mask.
-        apply_affinity(self.rank, self.local_rank)
         self.device = torch.device("hpu")
         # Initialize the distributed environment.
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
+        # The device is open now (the opened /dev/accel node identifies the card); threads created from here on
+        # inherit the mask and the ones that already exist are pinned explicitly.
+        apply_affinity(self.rank, self.local_rank)
         with set_current_vllm_config(self.vllm_config):
             self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
         self.init_profiler()
