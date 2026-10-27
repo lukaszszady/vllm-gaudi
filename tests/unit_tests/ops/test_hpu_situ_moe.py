@@ -663,16 +663,62 @@ def test_decide_bits_dequant_enabled_and_fallbacks(caplog):
             assert "keeping the fused MXFP4 op" in caplog.text
 
 
-def test_bits_layer_summary_counts(caplog):
+def test_packed_scale_check_shape_mismatch_falls_back(caplog):
     import logging
-    before = dict(situ._bits_layer_counts)
-    _decide()
-    _decide(has_bias=True)
-    assert situ._bits_layer_counts["bits"] == before["bits"] + 1
-    assert situ._bits_layer_counts["fused"] == before["fused"] + 1
+    packed, scales = _layer_tensors()
+    with caplog.at_level(logging.WARNING, logger="vllm.gaudi.situ"):
+        assert situ.mxfp4_packed_scales_in_bits_range(packed, scales)
+        assert not situ.mxfp4_packed_scales_in_bits_range(packed[..., :16], scales)  # wrong block width
+        assert not situ.mxfp4_packed_scales_in_bits_range(packed[:1], scales)  # wrong lead dim
+    assert caplog.text.count("do not match") == 2
+    # a mismatch makes the whole layer keep the fused op instead of raising
+    assert _decide(w13=(packed[..., :16], scales)) == (False, 0)
+
+
+def test_zero_block_mask_with_different_shapes_for_w13_and_w2():
+    w13 = (torch.full((3, 8, 64), 0x11, dtype=torch.uint8), torch.full((3, 8, 4), 127, dtype=torch.uint8))
+    w2 = (torch.full((3, 4, 32), 0x11, dtype=torch.uint8), torch.full((3, 4, 2), 127, dtype=torch.uint8))
+    w13[1][2, 7, 3] = 0
+    w13[0][2, 7, 48:] = 0  # all-zero block with an invalid scale
+    w2[1][1, 0, 0] = 255  # non-zero block with an invalid scale
+    assert situ.mxfp4_packed_scales_in_bits_range(*w13)
+    assert not situ.mxfp4_packed_scales_in_bits_range(*w2)
+    assert _decide(w13=w13, w2=w2) == (False, 0)
+    w2[1][1, 0, 0] = 127
+    assert _decide(w13=w13, w2=w2) == (True, 14)
+
+
+def test_group_is_read_only_for_the_bits_mode():
+    reads = []
+
+    def group():
+        reads.append(1)
+        return 9
+
+    w = _layer_tensors()
+    assert situ.decide_mxfp4_bits_dequant("fused", group, False, 32, w[0], w[1], w[0], w[1]) == (False, 0)
+    assert situ.decide_mxfp4_bits_dequant("bits", group, True, 32, w[0], w[1], w[0], w[1]) == (False, 0)
+    assert not reads
+    assert situ.decide_mxfp4_bits_dequant("bits", group, False, 32, w[0], w[1], w[0], w[1]) == (True, 9)
+    assert len(reads) == 1
+
+
+def test_bits_layer_summary_logs_once_and_resets(caplog):
+    import logging
+    situ.log_mxfp4_dequant_summary()  # reset whatever other tests recorded
     with caplog.at_level(logging.INFO, logger="vllm.gaudi.situ"):
-        situ._log_bits_summary()
-    assert "MXFP4 dequant: bits on" in caplog.text and "fused fallback on" in caplog.text
+        situ.log_mxfp4_dequant_summary()
+        assert caplog.text == ""  # nothing recorded: no-op
+        _decide()
+        _decide()
+        _decide(has_bias=True)
+        caplog.clear()
+        situ.log_mxfp4_dequant_summary()
+        assert "MXFP4 dequant: bits on 2 layers, fused fallback on 1 layers" in caplog.text
+        caplog.clear()
+        situ.log_mxfp4_dequant_summary()
+        assert caplog.text == ""
+    assert not hasattr(situ, "_log_bits_summary") and "atexit" not in _PATH.read_text()
 
 
 def _stub_bf16_moe(calls=None):

@@ -4943,6 +4943,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_device_memory
         logger.info("Loading model weights took %.4f GB", self.model_memory_usage / float(2**30))
+        try:
+            from vllm_gaudi.ops.hpu_situ_moe import log_mxfp4_dequant_summary
+            log_mxfp4_dequant_summary()
+        except Exception as exc:  # the summary is informational and must never affect other models
+            logger.debug("MXFP4 dequant summary not logged: %s", exc)
 
         if self._is_quant_with_inc():
             logger.info("Preparing model with INC..")

@@ -168,6 +168,11 @@ def mxfp4_packed_scales_in_bits_range(packed: torch.Tensor, scales: torch.Tensor
     """
     if scales.numel() == 0:
         return True
+    if packed.shape[:-1] != scales.shape[:-1] or packed.shape[-1] != scales.shape[-1] * (MXFP4_BLOCK // 2):
+        logging.getLogger("vllm.gaudi.situ").warning(
+            "MXFP4 packed %s and scales %s shapes do not match (%d packed bytes per scale expected)",
+            tuple(packed.shape), tuple(scales.shape), MXFP4_BLOCK // 2)
+        return False
     out_of_range = (scales < BITS_MIN_SCALE) | (scales > BITS_MAX_SCALE)
     if not bool(out_of_range.any()):
         return True
@@ -187,25 +192,25 @@ def resolve_mxfp4_moe_dequant(value: str | None) -> str:
 
 
 _bits_layer_counts = {"bits": 0, "fused": 0}
-_bits_summary_registered = False
 
 
-def _log_bits_summary() -> None:
-    logging.getLogger("vllm.gaudi.situ").info("MXFP4 dequant: bits on %d layers, fused fallback on %d layers",
-                                              _bits_layer_counts["bits"], _bits_layer_counts["fused"])
+def log_mxfp4_dequant_summary() -> None:
+    """Logs how many MXFP4 MoE layers use the bits path vs the fused op and resets the counters.
+
+    Call once per process after the weights are loaded (hpu_model_runner.load_model); no-op when no layer was seen.
+    """
+    bits, fused = _bits_layer_counts["bits"], _bits_layer_counts["fused"]
+    _bits_layer_counts.update(bits=0, fused=0)
+    if bits or fused:
+        logging.getLogger("vllm.gaudi.situ").info("MXFP4 dequant: bits on %d layers, fused fallback on %d layers",
+                                                  bits, fused)
 
 
 def _record_bits_layer(use_bits: bool) -> None:
-    """Counts the layers per path; one INFO summary per process is logged at exit."""
-    global _bits_summary_registered
     _bits_layer_counts["bits" if use_bits else "fused"] += 1
-    if not _bits_summary_registered:
-        import atexit
-        atexit.register(_log_bits_summary)
-        _bits_summary_registered = True
 
 
-def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int, has_bias: bool, block_size: int,
+def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int | Callable[[], int], has_bias: bool, block_size: int,
                               w13: torch.Tensor, w13_scale: torch.Tensor, w2: torch.Tensor,
                               w2_scale: torch.Tensor, label: str = "") -> tuple[bool, int]:
     """Whether one MXFP4 MoE layer uses the bits path (HPU_KIMI_MXFP4_DEQUANT=bits) and with which expert group.
@@ -221,7 +226,6 @@ def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int, has_bias
         mode = "fused"
     if mode != "bits":
         return False, 0
-    group = max(0, int(group_value))
     if has_bias or block_size != MXFP4_BLOCK:
         situ_logger.warning(
             "HPU_KIMI_MXFP4_DEQUANT=bits needs a bias-free MoE with MXFP4 blocks of %d "
@@ -234,7 +238,9 @@ def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int, has_bias
         _record_bits_layer(False)
         return False, 0
     _record_bits_layer(True)
-    return True, group
+    # read only for the bits path (an invalid value warns in the env reader)
+    group = group_value() if callable(group_value) else group_value
+    return True, max(0, int(group))
 
 
 def mxfp4_bits_moe(hidden_states: torch.Tensor,

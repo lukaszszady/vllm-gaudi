@@ -1707,7 +1707,7 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         from vllm_gaudi.ops.hpu_situ_moe import decide_mxfp4_bits_dequant
         self._bits_weights = None
         use_bits, group = decide_mxfp4_bits_dequant(gaudi_envs.HPU_KIMI_MXFP4_DEQUANT,
-                                                    gaudi_envs.HPU_KIMI_MXFP4_DEQUANT_GROUP, self.has_bias,
+                                                    lambda: gaudi_envs.HPU_KIMI_MXFP4_DEQUANT_GROUP, self.has_bias,
                                                     self.block_size, w13, w13_scale, w2, w2_scale,
                                                     f"(experts {self.experts_min}..{self.experts_max})")
         if not use_bits:
