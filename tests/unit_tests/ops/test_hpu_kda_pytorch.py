@@ -1103,7 +1103,7 @@ def _max_tensor_rank(fn):
 
 
 @pytest.mark.parametrize("lengths,padded,chunk,vec_chunks", [([70, 41], 96, 32, 2), ([37], 37, 16, 0),
-                                                              ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
+                                                             ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
 def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, chunk, vec_chunks):
     """The HPU compiler fails with 'strided_view ... Invalid argument' on the rank 6/7 views of the batched
     intra-chunk terms, so no op of the chunked_vec prefill may see a tensor with more than 5 dims."""
@@ -1120,7 +1120,7 @@ def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, ch
 
 
 @pytest.mark.parametrize("lengths,padded,chunk,vec_chunks", [([70, 41], 96, 32, 2), ([37], 37, 16, 0),
-                                                              ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
+                                                             ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
 def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chunk, vec_chunks):
     """Fallback for the HPU 'strided_view' failure: no diagonal / as_strided, and no select or stepped slice on a
     non-leading dim (the views the Synapse graph compiler cannot lower) in the chunked_vec prefill."""
@@ -1132,8 +1132,9 @@ def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chun
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             name = func.overloadpacket.__name__
-            if name in ("diagonal", "as_strided") or (name == "select" and args[1] != 0) or (
-                    name == "slice" and args[1] != 0 and len(args) > 4 and args[4] != 1):
+            if name in ("diagonal", "as_strided") or (name == "select"
+                                                      and args[1] != 0) or (name == "slice" and args[1] != 0
+                                                                            and len(args) > 4 and args[4] != 1):
                 bad.append((str(func), args[1:]))
             return func(*args, **(kwargs or {}))
 
@@ -1180,9 +1181,9 @@ def test_unit_lower_inverse_dense_is_gather_free_and_hpu_view_safe(size):
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             name = func.overloadpacket.__name__
-            if name in ("index_select", "gather", "index", "diagonal", "as_strided") or (
-                    name == "select" and args[1] != 0) or (name == "slice" and args[1] != 0 and len(args) > 4
-                                                          and args[4] != 1):
+            if name in ("index_select", "gather", "index", "diagonal",
+                        "as_strided") or (name == "select" and args[1] != 0) or (name == "slice" and args[1] != 0
+                                                                                 and len(args) > 4 and args[4] != 1):
                 bad.append((str(func), args[1:]))
             out = func(*args, **(kwargs or {}))
             ranks.extend(t.dim() for t in tree_leaves((args, out)) if isinstance(t, torch.Tensor))
@@ -1203,9 +1204,22 @@ def test_chunked_vec_prefill_outputs_are_dense_tensors(lengths, padded, chunk):
     batch, mask = _pad_batch([_make_inputs(181 + i, n) for i, n in enumerate(lengths)], padded)
     n = len(lengths)
     caches = _new_caches(n + 1, False)
-    outs = kda.kda_prefill_step(batch["mixed_qkv"], batch["raw_g"], batch["raw_beta"], params["conv_weight"], None,
-                                params["A_log"], params["dt_bias"], params["lower_bound"], *caches, torch.arange(n),
-                                torch.tensor([1, 0, 1][:n]), mask, H, D, prefill_impl="chunked_vec", chunk_size=chunk,
+    outs = kda.kda_prefill_step(batch["mixed_qkv"],
+                                batch["raw_g"],
+                                batch["raw_beta"],
+                                params["conv_weight"],
+                                None,
+                                params["A_log"],
+                                params["dt_bias"],
+                                params["lower_bound"],
+                                *caches,
+                                torch.arange(n),
+                                torch.tensor([1, 0, 1][:n]),
+                                mask,
+                                H,
+                                D,
+                                prefill_impl="chunked_vec",
+                                chunk_size=chunk,
                                 vec_chunks=2)
     for t in outs:
         assert t.is_contiguous() and t.storage_offset() == 0
@@ -1516,8 +1530,8 @@ def test_attn_res_functional_matches_in_place_version_and_modifies_nothing(has_d
     assert torch.equal(new_prefix, prefix) and torch.equal(new_blocks, blocks)
 
 
-def _attn_res_fp32_mix(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks,
-                       block_write_idx, eps, output_norm_eps):
+def _attn_res_fp32_mix(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks, block_write_idx,
+                       eps, output_norm_eps):
     """The previous attn_res_functional mix: an fp32 copy of the blocks concatenated with the updated prefix."""
     updated = prefix.float() if delta is None else (prefix.float() + delta.float()).to(prefix.dtype).float()
     if block_write_idx >= 0:
