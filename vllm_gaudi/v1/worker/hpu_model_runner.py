@@ -42,6 +42,7 @@ from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_conf
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
+from vllm_gaudi.v1.worker.hpu_weight_page_cache import drop_weight_page_cache_during_load
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.model_executor.layers.attention import Attention
@@ -4937,7 +4938,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             ctx = _override_platform_device_type(load_device) \
                 if load_device and load_device != current_platform.device_type \
                 else contextlib.nullcontext()
-            with ctx:
+            # The shards' page cache would otherwise fill host memory and trip the bridge's host memory
+            # threshold (recipe cache eviction), see hpu_weight_page_cache.
+            with ctx, drop_weight_page_cache_during_load():
                 self.model = get_model(vllm_config=self.vllm_config)
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
