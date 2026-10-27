@@ -1689,6 +1689,59 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         self._cached_w13_bias_views = None
         self._cached_w2_bias_views = None
         self._compiled_forward = None
+        # HPU_KIMI_MXFP4_DEQUANT=bits: stacked packed weights/scales (w13, w13_scale, w2, w2_scale), see
+        # enable_bits_dequant; None = native mxfp4_fused_weights.
+        self._bits_weights = None
+        self._bits_group = 0
+        self._compiled_bits_forward = None
+
+    def enable_bits_dequant(self, w13: torch.Tensor, w13_scale: torch.Tensor, w2: torch.Tensor,
+                            w2_scale: torch.Tensor) -> bool:
+        """Opt-in (HPU_KIMI_MXFP4_DEQUANT=bits) gather-free dequant + bf16 MoE op instead of mxfp4_fused_weights.
+
+        Takes the stacked per-rank tensors the per-expert views were set from. Reads the env and checks the scale
+        range once here (host sync at load, nothing in the forward); a layer that cannot use the path logs why and
+        keeps the native op. Returns whether the path is on.
+        """
+        import vllm_gaudi.envs as gaudi_envs
+        from vllm_gaudi.ops.hpu_situ_moe import MXFP4_BLOCK, mxfp4_scales_in_bits_range, resolve_mxfp4_moe_dequant
+        situ_logger = logging.getLogger("vllm.gaudi.situ")
+        try:
+            mode = resolve_mxfp4_moe_dequant(gaudi_envs.HPU_KIMI_MXFP4_DEQUANT)
+        except ValueError as exc:
+            situ_logger.warning("%s: using 'fused'", exc)
+            mode = "fused"
+        self._bits_weights = None
+        if mode != "bits":
+            return False
+        if self.has_bias or self.block_size != MXFP4_BLOCK:
+            situ_logger.warning("HPU_KIMI_MXFP4_DEQUANT=bits needs a bias-free MoE with MXFP4 blocks of %d "
+                                "(has_bias=%s, block_size=%d): keeping the fused MXFP4 op", MXFP4_BLOCK,
+                                self.has_bias, self.block_size)
+            return False
+        if not mxfp4_scales_in_bits_range(w13_scale, w2_scale):
+            situ_logger.warning("HPU_KIMI_MXFP4_DEQUANT=bits: E8M0 scale bytes outside 2..252 in a MoE layer "
+                                "(experts %d..%d): keeping the fused MXFP4 op for it", self.experts_min,
+                                self.experts_max)
+            return False
+        self._bits_weights = (w13, w13_scale, w2, w2_scale)
+        self._bits_group = max(0, gaudi_envs.HPU_KIMI_MXFP4_DEQUANT_GROUP)
+        return True
+
+    def _get_compiled_bits_forward(self):
+        if self._compiled_bits_forward is None:
+            from vllm_gaudi.ops.hpu_situ_moe import mxfp4_bits_moe
+
+            @torch.compile(backend="hpu_backend")
+            def _mxfp4_bits_fwd(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2, w2_scale,
+                                activation, experts_min, group, chunk_size, total_experts):
+                kwargs = {"chunk_size": chunk_size, "total_experts": total_experts} if chunk_size else {}
+                return mxfp4_bits_moe(hidden_states, expert_routing_table, router_weights, w13, w13_scale, w2,
+                                      w2_scale, torch.ops.hpu.mixture_of_experts, activation, experts_min, group,
+                                      **kwargs)
+
+            self._compiled_bits_forward = _mxfp4_bits_fwd
+        return self._compiled_bits_forward
 
     def _cache_weight_lists(self):
         experts_range = range(self.num_experts)
@@ -1785,6 +1838,14 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         w2_list = self._cached_w2_views
         w13_scale = self._cached_w13_scale_views
         w2_scale = self._cached_w2_scale_views
+
+        if self._bits_weights is not None:
+            # the bf16 MoE op needs an int64 routing table and router weights in the activation dtype
+            # (see HPUUnquantizedFusedMoEMethod.apply_monolithic in ops/hpu_fused_moe.py)
+            return self._get_compiled_bits_forward()(hidden_states, expert_routing_table.to(torch.int64),
+                                                     router_weights.to(hidden_states.dtype), *self._bits_weights,
+                                                     activation, self.experts_min, self._bits_group, chunk_size,
+                                                     total_experts)
 
         # expert_routing_table must be int32 for the mxfp4 op
         if expert_routing_table.dtype != torch.int32:

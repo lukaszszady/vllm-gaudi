@@ -120,15 +120,18 @@ def dequant_mxfp4_reference(packed: torch.Tensor,
 BITS_MIN_SCALE, BITS_MAX_SCALE = 2, 252  # E8M0 bytes for which the bit assembly is exact
 
 
-def dequant_mxfp4_bits(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+def dequant_mxfp4_bits(packed: torch.Tensor, scales: torch.Tensor, clamp_scales: bool = True) -> torch.Tensor:
     """Gather-free bf16 dequant: the bf16 bit pattern of every value is assembled with int16 elementwise ops.
 
     E2M1 nibble ``s e1 e0 m``: for ``e > 0`` the value is ``(1 + m / 2) * 2^(e - 1)``, so with the E8M0 scale byte
     ``S`` the bf16 exponent field is ``e - 1 + S`` and the mantissa ``m << 6``; for ``e == 0`` it is ``0.5 * m``,
-    i.e. exponent field ``S - 1`` when ``m == 1`` and a (signed) zero otherwise. No table lookups (TPC gathers) and
-    no int32 temporaries; equal to ``dequant_mxfp4_reference`` bit for bit for scale bytes 2 .. 252. Scale bytes
-    outside that range would leave the normal bf16 range (wrong subnormals, NaN, int16 overflow into the sign bit),
-    so they are clamped to [2, 252] (no host sync); real checkpoints use scales around 2^-20 .. 2^8.
+    i.e. exponent field ``S - 1`` when ``m == 1`` and a (signed) zero otherwise. No table lookups (TPC gathers), no
+    int32 temporaries and no comparisons / ``torch.where`` (int16 comparisons have no HPU kernel and fall back to
+    the CPU): the case split uses 0/1 flags, ``normal = e != 0`` as ``(e | e >> 1) & 1``. Equal to
+    ``dequant_mxfp4_reference`` bit for bit for scale bytes 2 .. 252. Scale bytes outside that range would leave
+    the normal bf16 range (wrong subnormals, NaN, int16 overflow into the sign bit); ``clamp_scales`` clamps them
+    to [2, 252] (no host sync). Callers that checked the range once (``mxfp4_scales_in_bits_range``) pass False to
+    keep the clamp out of the graph. Real checkpoints use scales around 2^-20 .. 2^8.
     """
     *lead, rows, half = packed.shape
     groups = scales.shape[-1]
@@ -136,14 +139,79 @@ def dequant_mxfp4_bits(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tens
         raise ValueError(f"packed {tuple(packed.shape)} and scales {tuple(scales.shape)} do not match")
     p = packed.to(torch.int16)
     nib = torch.stack((p & 0x0F, p >> 4), dim=-1).reshape(*lead, rows, groups, MXFP4_BLOCK)
-    s = scales.to(torch.int16).clamp(BITS_MIN_SCALE, BITS_MAX_SCALE).unsqueeze(-1)  # [..., rows, groups, 1]
+    s = scales.to(torch.int16)
+    if clamp_scales:
+        s = s.clamp(BITS_MIN_SCALE, BITS_MAX_SCALE)
+    s = s.unsqueeze(-1)  # [..., rows, groups, 1]
     e = (nib >> 1) & 3
     m = nib & 1
-    normal = e > 0
-    exponent = torch.where(normal, e + s - 1, m * (s - 1))
-    bits = (exponent << 7) | ((m * normal) << 6)
-    bits = torch.where(nib >= 8, bits | -0x8000, bits)  # sign bit (0x8000 as int16)
+    normal = (e | (e >> 1)) & 1
+    exponent = (e + s - 1) * (normal | m)  # e == 0: S - 1 for 0.5, 0 for a (signed) zero
+    bits = (exponent << 7) | ((m & normal) << 6) | ((nib >> 3) * -0x8000)  # sign bit (0x8000 as int16)
     return bits.view(torch.bfloat16).reshape(*lead, rows, groups * MXFP4_BLOCK)
+
+
+def mxfp4_scales_in_bits_range(*scales: torch.Tensor) -> bool:
+    """True when every E8M0 scale byte is in [2, 252], i.e. ``dequant_mxfp4_bits`` is exact without the clamp.
+
+    Synchronizes with the device: call it once at weight loading, never in the forward.
+    """
+    return all(
+        int(s.min()) >= BITS_MIN_SCALE and int(s.max()) <= BITS_MAX_SCALE for s in scales if s.numel() > 0)
+
+
+MXFP4_MOE_DEQUANT_MODES = ("fused", "bits")
+
+
+def resolve_mxfp4_moe_dequant(value: str | None) -> str:
+    """HPU_KIMI_MXFP4_DEQUANT: "fused" (default) or "bits". Raises on anything else."""
+    mode = (value or "fused").strip().lower()
+    if mode not in MXFP4_MOE_DEQUANT_MODES:
+        raise ValueError(f"HPU_KIMI_MXFP4_DEQUANT must be one of {MXFP4_MOE_DEQUANT_MODES}, got {value!r}")
+    return mode
+
+
+def mxfp4_bits_moe(hidden_states: torch.Tensor,
+                   expert_routing_table: torch.Tensor,
+                   router_weights: torch.Tensor,
+                   w13: torch.Tensor,
+                   w13_scale: torch.Tensor,
+                   w2: torch.Tensor,
+                   w2_scale: torch.Tensor,
+                   moe_fn: Callable[..., torch.Tensor],
+                   activation: str,
+                   experts_min: int,
+                   group: int = 0,
+                   **kwargs) -> torch.Tensor:
+    """MXFP4 MoE as a gather-free bf16 dequant of the local experts + the bf16 fused MoE op ``moe_fn``.
+
+    Replacement for ``mixture_of_experts.mxfp4_fused_weights``, whose internal per-expert cast runs serially before
+    each expert's GEMMs. Here the dequant is plain elementwise int16 work (fusable by the graph compiler) over the
+    stacked per-rank tensors w13 [E, 2I, H/2] / w2 [E, H, I/2] (+ E8M0 scales, range checked at load: no clamp),
+    and ``moe_fn`` (``torch.ops.hpu.mixture_of_experts``) gets per-expert bf16 views with ``permuted_weights=True``.
+    ``group`` > 0 dequantizes and runs at most that many experts at a time (lower peak memory, one op call per
+    group, outputs summed) like the moe_n_slice loop of the bf16 op; 0 = all local experts in one call. ``kwargs``
+    (chunk_size / total_experts) are passed through. All shapes are static.
+    """
+    num_experts = w13.shape[0]
+    step = num_experts if group <= 0 else min(group, num_experts)
+    out = None
+    for start in range(0, num_experts, step):
+        end = min(start + step, num_experts)
+        w12 = dequant_mxfp4_bits(w13[start:end], w13_scale[start:end], clamp_scales=False)
+        w3 = dequant_mxfp4_bits(w2[start:end], w2_scale[start:end], clamp_scales=False)
+        part = moe_fn(hidden_states=hidden_states,
+                      expert_routing_table=expert_routing_table,
+                      router_weights=router_weights,
+                      w12=w12.unbind(0),
+                      w3=w3.unbind(0),
+                      permuted_weights=True,
+                      activation=activation,
+                      experts_min=experts_min + start,
+                      experts_max=experts_min + end - 1,
+                      **kwargs)
+        out = part if out is None else out + part
+    return out
 
 
 def situ_moe_experts(x: torch.Tensor,

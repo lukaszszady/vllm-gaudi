@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     HPU_KIMI_SITU_MARK_STEP: bool = True
     HPU_KIMI_SITU_DEQUANT: str = "lut"
     HPU_KIMI_SITU_TIMING: int = 0
+    HPU_KIMI_MXFP4_DEQUANT: str = "fused"
+    HPU_KIMI_MXFP4_DEQUANT_GROUP: int = 0
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -188,6 +190,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # normal path again. 0 = off.
     "HPU_KIMI_SITU_TIMING":
     lambda: _situ_timing_budget(),
+    # Fused (non-bias) MXFP4 MoE op (VllmMixtureOfExpertsOpMXFP4, e.g. Kimi-K3 with HPU_KIMI_SITU_IMPL=silu):
+    # "fused" (default) runs mixture_of_experts.mxfp4_fused_weights, which dequantizes every local expert inside the
+    # kernel; "bits" dequantizes the local experts with gather-free int16 bit assembly in the graph and runs the bf16
+    # fused MoE op (bit-exact weights; needs E8M0 scale bytes 2..252, checked per layer at load, otherwise that
+    # layer keeps "fused"). Costs transient bf16 weights of the experts of one group per layer.
+    "HPU_KIMI_MXFP4_DEQUANT":
+    lambda: os.environ.get("HPU_KIMI_MXFP4_DEQUANT", "fused").strip().lower(),
+    # "bits" only: experts dequantized and run per bf16 MoE call (0 = all local experts in one call).
+    "HPU_KIMI_MXFP4_DEQUANT_GROUP":
+    lambda: int(os.environ.get("HPU_KIMI_MXFP4_DEQUANT_GROUP", "0")),
 }
 
 # end-env-vars-definition

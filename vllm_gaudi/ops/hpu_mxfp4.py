@@ -105,6 +105,8 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
                 layer.moe_op.w2_list[expert_id].set_bias(layer.w2_bias.data[expert_id])
 
         layer.moe_op._cache_weight_lists()
+        layer.moe_op.enable_bits_dequant(layer.w13_weight.data, layer.w13_weight_scale.data, layer.w2_weight.data,
+                                         layer.w2_weight_scale.data)
 
     def apply_monolithic(
         self,

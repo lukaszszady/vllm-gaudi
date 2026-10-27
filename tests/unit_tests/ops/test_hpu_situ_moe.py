@@ -522,3 +522,161 @@ def test_maybe_situ_moe_on_a_layer_traces_as_one_graph_in_compile_mode(monkeypat
         dynamo.reset()
     assert len(graphs) == 1
     torch.testing.assert_close(out, expected)
+
+
+# ---- HPU_KIMI_MXFP4_DEQUANT=bits: gather-free dequant in front of the bf16 fused MoE op ----
+
+# ops without an HPU kernel for int16 (CPU fallback) or TPC gathers: none may run in the clamp-free bit dequant
+_FORBIDDEN_IN_BITS = ("gt", "ge", "lt", "le", "eq", "ne", "where", "clamp", "clip", "maximum", "minimum", "embedding",
+                      "index_select", "gather", "take")
+
+
+class _RecordTorchFunctions(torch.overrides.TorchFunctionMode):
+
+    def __init__(self):
+        super().__init__()
+        self.names = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        self.names.append(getattr(func, "__name__", str(func)).strip("_"))
+        return func(*args, **(kwargs or {}))
+
+
+@pytest.mark.parametrize("clamp", [False, True])
+def test_bit_dequant_is_bit_exact_for_every_byte_and_valid_scale_with_and_without_clamp(clamp):
+    all_bytes = torch.arange(256, dtype=torch.uint8).reshape(1, 1, 256).repeat(251, 1, 1)
+    scales = torch.arange(2, 253, dtype=torch.uint8).reshape(251, 1, 1).repeat(1, 1, 16)
+    out = situ.dequant_mxfp4_bits(all_bytes, scales, clamp_scales=clamp)
+    ref = situ.dequant_mxfp4_reference(all_bytes, scales, torch.bfloat16)
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    g = torch.Generator().manual_seed(41)
+    packed = torch.randint(0, 256, (5, 64, 96), generator=g, dtype=torch.uint8)
+    sc = torch.randint(2, 253, (5, 64, 6), generator=g, dtype=torch.uint8)
+    got = situ.dequant_mxfp4_bits(packed, sc, clamp_scales=clamp).view(torch.int16)
+    assert torch.equal(got, situ.dequant_mxfp4_reference(packed, sc, torch.bfloat16).view(torch.int16))
+    assert torch.equal(got, situ.dequant_mxfp4(packed, sc, torch.bfloat16).view(torch.int16))
+
+
+def test_bit_dequant_edge_values():
+    # bytes: +0|-0, smallest (0.5 at scale 2 -> 2^-126, smallest normal bf16), largest (6 at scale 252 -> 6 * 2^125)
+    packed = torch.tensor([[0x80] * 16, [0x91] * 16, [0x7F] * 16], dtype=torch.uint8)  # [3 rows, 16 bytes]
+    scales = torch.tensor([[127], [2], [252]], dtype=torch.uint8)
+    out = situ.dequant_mxfp4_bits(packed, scales, clamp_scales=False)
+    bits = out.view(torch.int16)
+    assert int(bits[0, 0]) == 0 and int(bits[0, 1]) == -0x8000  # +0, then -0 (sign bit only)
+    assert out[1, 0].item() == 2.0**-126 and out[1, 1].item() == -(2.0**-126)
+    assert out[2, 0].item() == -(6.0 * 2.0**125) and out[2, 1].item() == 6.0 * 2.0**125  # 0x7F: low -6, high +6
+    assert torch.isfinite(out.float()).all()
+    lo = torch.tensor([[0x07] * 16], dtype=torch.uint8)  # low nibble 6.0, high nibble +0
+    assert situ.dequant_mxfp4_bits(lo, torch.tensor([[252]], dtype=torch.uint8))[0, 0].item() == 6.0 * 2.0**125
+
+
+def test_bit_dequant_without_clamp_uses_no_comparison_select_or_gather_ops():
+    g = torch.Generator().manual_seed(43)
+    packed = torch.randint(0, 256, (2, 8, 32), generator=g, dtype=torch.uint8)
+    sc = torch.randint(2, 253, (2, 8, 2), generator=g, dtype=torch.uint8)
+    with _RecordTorchFunctions() as rec:
+        situ.dequant_mxfp4_bits(packed, sc, clamp_scales=False)
+    assert rec.names  # the mode saw the ops
+    assert not [n for n in rec.names if n in _FORBIDDEN_IN_BITS], rec.names
+    with _RecordTorchFunctions() as rec:
+        situ.dequant_mxfp4_bits(packed, sc)  # the default keeps the clamp of the exact SiTU path
+    assert [n for n in rec.names if n in _FORBIDDEN_IN_BITS] == ["clamp"]
+
+
+def test_scale_range_check():
+    ok = torch.tensor([[2, 100, 252]], dtype=torch.uint8)
+    assert situ.mxfp4_scales_in_bits_range(ok, ok.clone())
+    assert situ.mxfp4_scales_in_bits_range(ok, torch.empty(0, dtype=torch.uint8))
+    for bad in (0, 1, 253, 255):
+        assert not situ.mxfp4_scales_in_bits_range(ok, torch.tensor([[100, bad]], dtype=torch.uint8))
+
+
+def test_mxfp4_moe_dequant_flag_and_env_registry(monkeypatch):
+    assert situ.resolve_mxfp4_moe_dequant(None) == "fused"
+    assert situ.resolve_mxfp4_moe_dequant(" Bits ") == "bits"
+    with pytest.raises(ValueError, match="HPU_KIMI_MXFP4_DEQUANT"):
+        situ.resolve_mxfp4_moe_dequant("lut")
+    spec = importlib.util.spec_from_file_location("vllm_gaudi_envs_mxfp4_test", _PATH.parents[1] / "envs.py")
+    envs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(envs)
+    monkeypatch.delenv("HPU_KIMI_MXFP4_DEQUANT", raising=False)
+    monkeypatch.delenv("HPU_KIMI_MXFP4_DEQUANT_GROUP", raising=False)
+    assert envs.HPU_KIMI_MXFP4_DEQUANT == "fused" and envs.HPU_KIMI_MXFP4_DEQUANT_GROUP == 0
+    monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT", "BITS")
+    monkeypatch.setenv("HPU_KIMI_MXFP4_DEQUANT_GROUP", "16")
+    assert envs.HPU_KIMI_MXFP4_DEQUANT == "bits" and envs.HPU_KIMI_MXFP4_DEQUANT_GROUP == 16
+
+
+def _stub_bf16_moe(calls=None):
+    """CPU stand-in for torch.ops.hpu.mixture_of_experts (silu, permuted_weights=True: w12 [2I, H], w3 [H, I])."""
+
+    def moe(hidden_states, expert_routing_table, router_weights, w12, w3, permuted_weights, activation, experts_min,
+            experts_max, **kwargs):
+        assert permuted_weights and activation == "silu" and len(w12) == len(w3) == experts_max - experts_min + 1
+        if calls is not None:
+            calls.append((experts_min, experts_max, tuple(w.shape for w in w12), tuple(w.shape for w in w3), kwargs))
+        out = torch.zeros(hidden_states.shape, dtype=torch.float32)
+        for j, (a, b) in enumerate(zip(w12, w3)):
+            wt = (router_weights.float() * (expert_routing_table == experts_min + j)).sum(-1, keepdim=True)
+            gate_up = hidden_states.float() @ a.float().t()
+            inter = gate_up.shape[-1] // 2
+            out = out + wt * ((torch.nn.functional.silu(gate_up[:, :inter]) * gate_up[:, inter:]) @ b.float().t())
+        return out.to(hidden_states.dtype)
+
+    return moe
+
+
+def _bits_moe_case(seed, experts=8, hidden=64, inter=32, tokens=12, topk=2, experts_min=8):
+    g = torch.Generator().manual_seed(seed)
+    w13 = torch.randint(0, 256, (experts, 2 * inter, hidden // 2), generator=g, dtype=torch.uint8)
+    w13_s = torch.randint(118, 128, (experts, 2 * inter, hidden // 32), generator=g, dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (experts, hidden, inter // 2), generator=g, dtype=torch.uint8)
+    w2_s = torch.randint(118, 128, (experts, hidden, inter // 32), generator=g, dtype=torch.uint8)
+    x = torch.randn(tokens, hidden, generator=g).to(torch.bfloat16)
+    ids = torch.randint(0, 3 * experts, (tokens, topk), generator=g)  # global ids, some on other ranks
+    weights = torch.rand(tokens, topk, generator=g).to(torch.bfloat16)
+    return x, ids, weights, w13, w13_s, w2, w2_s, experts_min
+
+
+@pytest.mark.parametrize("group", [0, 3, 8, 100])
+def test_bits_moe_equals_the_bf16_op_on_reference_dequantized_weights(group):
+    x, ids, weights, w13, w13_s, w2, w2_s, emin = _bits_moe_case(5)
+    calls = []
+    out = situ.mxfp4_bits_moe(x, ids, weights, w13, w13_s, w2, w2_s, _stub_bf16_moe(calls), "silu", emin, group,
+                              chunk_size=64, total_experts=24)
+    ref_w13 = situ.dequant_mxfp4_reference(w13, w13_s, torch.bfloat16)
+    ref_w2 = situ.dequant_mxfp4_reference(w2, w2_s, torch.bfloat16)
+    expected = _stub_bf16_moe()(x, ids, weights, tuple(ref_w13), tuple(ref_w2), True, "silu", emin, emin + 7)
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)  # groups sum bf16 partial outputs
+    sizes = [8] if group in (0, 8, 100) else [3, 3, 2]
+    assert [hi - lo + 1 for lo, hi, *_ in calls] == sizes
+    assert calls[0][0] == emin and calls[-1][1] == emin + 7  # inclusive experts_max, contiguous groups
+    assert all(s == (64, 64) for c in calls for s in c[2]) and all(s == (64, 32) for c in calls for s in c[3])
+    assert all(c[4] == {"chunk_size": 64, "total_experts": 24} for c in calls)
+    if group in (0, 8, 100):
+        assert torch.equal(out, expected)  # one call on bit-identical weights
+
+
+def test_bits_moe_traces_as_one_graph():
+    """torch.compile mode: the dequant, the per-expert unbind and the grouped op calls trace into one graph."""
+    import torch._dynamo as dynamo
+    x, ids, weights, w13, w13_s, w2, w2_s, emin = _bits_moe_case(7)
+    moe = _stub_bf16_moe()
+
+    def fn(x, ids, weights, w13, w13_s, w2, w2_s):
+        return situ.mxfp4_bits_moe(x, ids, weights, w13, w13_s, w2, w2_s, moe, "silu", emin, 4)
+
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    dynamo.reset()
+    try:
+        out = torch.compile(fn, backend=backend)(x, ids, weights, w13, w13_s, w2, w2_s)
+    finally:
+        dynamo.reset()
+    assert len(graphs) == 1
+    torch.testing.assert_close(out, fn(x, ids, weights, w13, w13_s, w2, w2_s))
