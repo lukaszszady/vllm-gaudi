@@ -46,6 +46,51 @@ def _prefill_settings() -> tuple[str, int, int, int]:
             max(1, gaudi_envs.HPU_KIMI_KDA_MARK_STEP_CHUNKS), gaudi_envs.HPU_KIMI_KDA_VEC_CHUNKS)
 
 
+# HPU_KIMI_KDA_STATE_WRITE=deferred: decode layers append their new state rows here instead of writing them, and
+# run_with_deferred_kda_state() writes all of them eagerly once the decoder layers of the step are done. The lists
+# are module-level objects so that dynamo records the append as a side effect of the compiled layer (no graph
+# break); _DEFER_ACTIVE keeps layers that run outside of a wrapped model forward on the inline write.
+_PENDING_STATE: list = []
+_DEFER_ACTIVE: list = [False]
+
+
+@functools.cache
+@torch.compiler.assume_constant_result
+def _state_write_mode() -> str:
+    """HPU_KIMI_KDA_STATE_WRITE (inline|deferred); read once."""
+    import vllm_gaudi.envs as gaudi_envs
+    return gaudi_envs.HPU_KIMI_KDA_STATE_WRITE
+
+
+@torch.compiler.disable
+def _flush_pending_state() -> None:
+    pending = list(_PENDING_STATE)
+    _PENDING_STATE.clear()
+    for conv_cache, ssm_cache, slots, conv_rows, ssm_rows in pending:
+        write_kda_decode_state(conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
+
+
+def run_with_deferred_kda_state(forward, *args, **kwargs):
+    """Runs a model forward; with HPU_KIMI_KDA_STATE_WRITE=deferred the decode state rows stashed by the KDA layers
+    are written after it returns. If the forward raises, the stash is dropped without writing."""
+    if _state_write_mode() != "deferred":
+        return forward(*args, **kwargs)
+    _PENDING_STATE.clear()
+    _DEFER_ACTIVE[0] = True
+    try:
+        out = forward(*args, **kwargs)
+    except BaseException:
+        _PENDING_STATE.clear()
+        raise
+    finally:
+        _DEFER_ACTIVE[0] = False
+    try:
+        _flush_pending_state()
+    finally:
+        _PENDING_STATE.clear()
+    return out
+
+
 @functools.cache
 @torch.compiler.assume_constant_result
 def _decode_mode() -> str:
@@ -155,8 +200,11 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                                                                    raw_beta,
                                                                    state_idx=state_idx[:num_tokens],
                                                                    **common)
-                # the statement ends with the disabled call (see the prefill comment above)
-                core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
+                if _state_write_mode() == "deferred" and _DEFER_ACTIVE[0]:
+                    _PENDING_STATE.append((conv_cache, ssm_cache, slots, conv_rows, ssm_rows))
+                else:
+                    # the statement ends with the disabled call (see the prefill comment above)
+                    core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
 
     if core is None:  # profile run without metadata: keep shapes, no state
         core = torch.zeros(num_tokens, heads, head_dim, dtype=torch.float32, device=hidden_states.device)

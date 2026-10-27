@@ -1354,7 +1354,10 @@ def _patch_kimi_k3_arch() -> None:
                 if positions is not None and positions.dim() == 2:
                     positions = positions.view(-1)
 
-                return orig_linear_model_forward(
+                # imported on first use (circular import with vllm.distributed at plugin-apply time)
+                from vllm_gaudi.models.kimi_k3_kda import run_with_deferred_kda_state
+                return run_with_deferred_kda_state(
+                    orig_linear_model_forward,
                     self,
                     input_ids=input_ids,
                     positions=positions,

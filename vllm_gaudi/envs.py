@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     HPU_KIMI_KDA_VEC_CHUNKS: int = 16
     HPU_KIMI_KDA_MARK_STEP_CHUNKS: int = 1
     HPU_KIMI_KDA_DECODE: str = "functional"
+    HPU_KIMI_KDA_STATE_WRITE: str = "inline"
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_SITU_MARK_STEP: bool = True
     HPU_KIMI_SITU_DEQUANT: str = "lut"
@@ -64,6 +65,17 @@ def _kda_decode_mode() -> str:
         logging.getLogger("vllm.gaudi.kda").warning(
             "HPU_KIMI_KDA_DECODE must be 'functional' or 'eager', got %r: using 'functional'", value)
         return "functional"
+    return value
+
+
+def _kda_state_write_mode() -> str:
+    """HPU_KIMI_KDA_STATE_WRITE: inline|deferred; an invalid value is reported and means inline."""
+    value = os.environ.get("HPU_KIMI_KDA_STATE_WRITE", "inline").strip().lower()
+    if value not in ("inline", "deferred"):
+        import logging
+        logging.getLogger("vllm.gaudi.kda").warning(
+            "HPU_KIMI_KDA_STATE_WRITE must be 'inline' or 'deferred', got %r: using 'inline'", value)
+        return "inline"
     return value
 
 
@@ -204,6 +216,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # included, runs outside of the compiled graph). An invalid value is reported and means "functional".
     "HPU_KIMI_KDA_DECODE":
     lambda: _kda_decode_mode(),
+    # Kimi-K3 KDA decode state writes (conv / ssm cache rows): "inline" writes them in every layer (a graph break per
+    # layer in torch.compile mode), "deferred" keeps the new rows of all decode layers and writes them in one eager
+    # place after the decoder layers of the step. An invalid value is reported and means "inline".
+    "HPU_KIMI_KDA_STATE_WRITE":
+    lambda: _kda_state_write_mode(),
 
     # Kimi-K3 routed experts use the SiTU activation (beta*tanh(gate/beta)*sigmoid(gate)*up, soft-clipped up), which
     # the Habana fused MoE op does not have. "exact" computes the experts unfused with the real activation (MXFP4

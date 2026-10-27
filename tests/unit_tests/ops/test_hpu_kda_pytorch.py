@@ -384,6 +384,170 @@ def test_kda_decode_env_flag(monkeypatch):
     assert gaudi_envs.HPU_KIMI_KDA_DECODE == "functional"
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# HPU_KIMI_KDA_STATE_WRITE=deferred: decode state rows are written once after the decoder layers
+# ---------------------------------------------------------------------------------------------------------------
+def _deferred_layer(params, hidden, seed, caches, group=None):
+    g = torch.Generator().manual_seed(seed)
+    in_proj = torch.randn(hidden, 4 * P + D + H, generator=g) * 0.2
+    f_b = torch.randn(D, P, generator=g) * 0.2
+    o_proj = torch.randn(P, hidden, generator=g) * 0.2
+    return types.SimpleNamespace(
+        local_num_heads=H,
+        head_dim=D,
+        local_projection_size=P,
+        in_proj_qkvgfab=lambda x: (x @ in_proj, None),
+        f_b_proj=lambda x: (x @ f_b, None),
+        conv1d=types.SimpleNamespace(weight=params["conv_weight"].reshape(C, 1, W), bias=None),
+        A_log=params["A_log"],
+        dt_bias=params["dt_bias"],
+        gate_lower_bound=params["lower_bound"],
+        o_norm=types.SimpleNamespace(weight=torch.ones(D), eps=1e-6),
+        o_proj=lambda x: (x @ o_proj, None),
+        kv_cache=caches,
+        cache_group_idx=group,
+    )
+
+
+def _step_metadata(is_prompt, indices, tokens=0):
+    meta = types.SimpleNamespace(load_indices_tensor=torch.tensor(indices), blocks_caching_range=None,
+                                 is_prompt=is_prompt,
+                                 padding_mask_flat=None,
+                                 has_initial_states_p=None)
+    if is_prompt:
+        meta.padding_mask_flat = torch.ones(tokens, dtype=torch.bool)
+        meta.has_initial_states_p = torch.zeros(len(indices), dtype=torch.int32)
+    return meta
+
+
+def _run_steps(monkeypatch, mode):
+    """Prefill, then decode-only steps, then a mixed step (layer 0 prefills a new request while layer 1 decodes)
+    through two layers with their own caches; returns all outputs and the final caches."""
+    monkeypatch.setenv("HPU_KIMI_KDA_STATE_WRITE", mode)
+    metadata = {"value": None}
+    module = _load_layer_module(monkeypatch, metadata)
+    params = _make_params(200)
+    hidden = 24
+    layers = [_deferred_layer(params, hidden, 201 + i, _new_caches(6, False)) for i in range(2)]
+    g = torch.Generator().manual_seed(210)
+    outs = []
+
+    def model_forward(x):
+        for layer in layers:
+            x = x + module.hpu_kda_forward(layer, x)
+        return x
+
+    def step(meta, x):
+        metadata["value"] = meta
+        outs.append(module.run_with_deferred_kda_state(model_forward, x))
+
+    step(_step_metadata(True, [1, 2], 40), torch.randn(40, hidden, generator=g))
+    for _ in range(4):
+        step(_step_metadata(False, [1, 2]), torch.randn(2, hidden, generator=g))
+    # mixed: layer 0 gets a prompt, layer 1 a decode batch (the runner never mixes them in one layer call)
+    metadata["value"] = _step_metadata(True, [3, 4], 40)
+    x = torch.randn(40, hidden, generator=g)
+
+    def mixed_forward(x):
+        out = module.hpu_kda_forward(layers[0], x)
+        metadata["value"] = _step_metadata(False, [1, 2])
+        return out, module.hpu_kda_forward(layers[1], x[:2])
+
+    outs.extend(module.run_with_deferred_kda_state(mixed_forward, x))
+    assert module._PENDING_STATE == [] and module._DEFER_ACTIVE == [False]
+    return outs, [c.clone() for layer in layers for c in layer.kv_cache]
+
+
+def test_deferred_state_write_is_bit_identical_to_inline(monkeypatch):
+    inline_out, inline_caches = _run_steps(monkeypatch, "inline")
+    deferred_out, deferred_caches = _run_steps(monkeypatch, "deferred")
+    assert all(torch.equal(a, b) for a, b in zip(inline_out, deferred_out))
+    assert all(torch.equal(a, b) for a, b in zip(inline_caches, deferred_caches))
+    assert any(c.abs().sum() > 0 for c in deferred_caches)
+
+
+def test_deferred_state_is_not_written_outside_a_wrapped_forward_or_after_an_error(monkeypatch):
+    monkeypatch.setenv("HPU_KIMI_KDA_STATE_WRITE", "deferred")
+    metadata = {"value": _step_metadata(False, [1, 2])}
+    module = _load_layer_module(monkeypatch, metadata)
+    params = _make_params(220)
+    layer = _deferred_layer(params, 24, 221, _new_caches(6, False))
+    x = torch.randn(2, 24, generator=torch.Generator().manual_seed(222))
+    module.hpu_kda_forward(layer, x)  # not inside run_with_deferred_kda_state: inline write
+    assert module._PENDING_STATE == []
+    assert any(c.abs().sum() > 0 for c in layer.kv_cache)
+
+    layer.kv_cache = _new_caches(6, False)
+
+    def failing_forward(x):
+        module.hpu_kda_forward(layer, x)
+        assert len(module._PENDING_STATE) == 1
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        module.run_with_deferred_kda_state(failing_forward, x)
+    assert module._PENDING_STATE == [] and module._DEFER_ACTIVE == [False]
+    assert all(c.abs().sum() == 0 for c in layer.kv_cache)  # nothing leaked into the caches
+
+
+def test_deferred_decode_layer_compiles_without_graph_break_or_cache_mutation(monkeypatch, request):
+    from functorch.compile import make_boxed_func
+    from torch._dynamo.backends.common import aot_autograd
+
+    monkeypatch.setenv("HPU_KIMI_KDA_STATE_WRITE", "deferred")
+    meta = _step_metadata(False, [1, 2])
+    module = _load_layer_module(monkeypatch, {"value": meta})
+    params = _make_params(230)
+    x = torch.randn(2, 24, generator=torch.Generator().manual_seed(231))
+    ref_layer = _deferred_layer(params, 24, 232, _new_caches(6, False))
+    layer = _deferred_layer(params, 24, 232, _new_caches(6, False))
+    graphs = []
+
+    def capture(gm, example_inputs):
+        graphs.append(gm)
+        return make_boxed_func(gm.forward)
+
+    backend = aot_autograd(fw_compiler=capture, keep_inference_input_mutations=True)
+    torch._dynamo.reset()
+
+    def _forget_stub_modules():  # dynamo caches module imports (functools.cache): the stubbed vllm.forward_context
+        torch._dynamo.reset()
+        clear = getattr(getattr(torch._dynamo.symbolic_convert, "_import_module", None), "cache_clear", None)
+        if clear is not None:
+            clear()
+
+    _forget_stub_modules()
+    request.addfinalizer(_forget_stub_modules)
+    module.run_with_deferred_kda_state(lambda t: module.hpu_kda_forward(ref_layer, t), x.clone())
+    expected = module.hpu_kda_forward(ref_layer, x.clone())  # second step reads the stored state
+    # fullgraph=True raises on any graph break (the inline write is a compiler.disable'd call)
+    compiled = torch.compile(module.hpu_kda_forward, backend=backend, dynamic=False, fullgraph=True)
+    outs = []
+
+    def model_forward(t):
+        outs.append(compiled(layer, t))
+        return outs[-1]
+
+    module.run_with_deferred_kda_state(model_forward, x.clone())
+    module.run_with_deferred_kda_state(model_forward, x.clone())
+    assert len(graphs) >= 1
+    targets = {str(n.target) for gm in graphs for n in gm.graph.nodes if n.op == "call_function"}
+    assert not {t for t in targets if "copy_" in t or "index_copy" in t}, targets
+    torch.testing.assert_close(outs[-1], expected)
+    assert all(torch.equal(a, b) for a, b in zip(layer.kv_cache, ref_layer.kv_cache))
+    assert module._PENDING_STATE == []
+
+
+def test_kda_state_write_env_flag(monkeypatch):
+    import vllm_gaudi.envs as gaudi_envs
+    monkeypatch.delenv("HPU_KIMI_KDA_STATE_WRITE", raising=False)
+    assert gaudi_envs.HPU_KIMI_KDA_STATE_WRITE == "inline"
+    monkeypatch.setenv("HPU_KIMI_KDA_STATE_WRITE", " Deferred ")
+    assert gaudi_envs.HPU_KIMI_KDA_STATE_WRITE == "deferred"
+    monkeypatch.setenv("HPU_KIMI_KDA_STATE_WRITE", "bogus")
+    assert gaudi_envs.HPU_KIMI_KDA_STATE_WRITE == "inline"
+
+
 def test_bf16_caches_and_inputs_stay_close_to_fp32_reference():
     params = _make_params(19)
     x = _make_inputs(20, 10)
@@ -481,7 +645,7 @@ def _load_layer_module(monkeypatch, metadata):
                                                                                          _load_envs_module())):
         monkeypatch.setitem(sys.modules, name, mod)
     path = _MODULE_PATH.parents[1] / "models" / "kimi_k3_kda.py"
-    spec = importlib.util.spec_from_file_location("kimi_k3_kda_under_test", path)
+    spec = importlib.util.spec_from_file_location("kimi_k3_kda_layer_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
