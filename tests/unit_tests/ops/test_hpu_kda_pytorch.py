@@ -1119,6 +1119,42 @@ def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, ch
     assert rank <= 5, (rank, op)
 
 
+@pytest.mark.parametrize("lengths,padded,chunk,vec_chunks", [([70, 41], 96, 32, 2), ([37], 37, 16, 0),
+                                                              ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
+def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chunk, vec_chunks):
+    """Fallback for the HPU 'strided_view' failure: no diagonal / as_strided, and no select or stepped slice on a
+    non-leading dim (the views the Synapse graph compiler cannot lower) in the chunked_vec prefill."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    bad = []
+
+    class _Views(TorchDispatchMode):
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            name = func.overloadpacket.__name__
+            if name in ("diagonal", "as_strided") or (name == "select" and args[1] != 0) or (
+                    name == "slice" and args[1] != 0 and len(args) > 4 and args[4] != 1):
+                bad.append((str(func), args[1:]))
+            return func(*args, **(kwargs or {}))
+
+    params = _make_params(160)
+    batch, mask = _pad_batch([_make_inputs(161 + i, n) for i, n in enumerate(lengths)], padded)
+    g = torch.Generator().manual_seed(170)
+    caches = tuple(c.copy_(torch.randn(c.shape, generator=g)) for c in _new_caches(len(lengths) + 1, False))
+    n = len(lengths)
+    args = (batch["mixed_qkv"], batch["raw_g"], batch["raw_beta"], params["conv_weight"], None, params["A_log"],
+            params["dt_bias"], params["lower_bound"], *caches, torch.arange(n), torch.tensor([1, 0, 1][:n]), mask, H, D)
+    with _Views():
+        kda.kda_prefill_step(*args, block=16, prefill_impl="chunked_vec", chunk_size=chunk, vec_chunks=vec_chunks)
+    assert not bad, bad[:5]
+
+
+@pytest.mark.parametrize("size", [1, 5, 16, 17, 64])
+def test_unit_lower_inverse_dense_matches_original(size):
+    a = torch.tril(torch.randn(6, size, size) * 0.5, -1)
+    torch.testing.assert_close(kda._unit_lower_inverse_dense(a), kda._unit_lower_inverse(a), rtol=1e-6, atol=1e-6)
+
+
 def test_prefill_step_rejects_unknown_impl():
     params = _make_params(138)
     batch, mask = _pad_batch([_make_inputs(139, 8)], 8)

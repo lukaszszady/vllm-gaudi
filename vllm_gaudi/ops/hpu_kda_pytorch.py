@@ -167,6 +167,44 @@ def _unit_lower_inverse(a: torch.Tensor) -> torch.Tensor:
     return inv.reshape(*lead, padded, padded)[..., :size, :size]
 
 
+def _unit_lower_inverse_dense(a: torch.Tensor) -> torch.Tensor:
+    """``_unit_lower_inverse`` for a [N, C, C] batch using only dense ops (same arithmetic, same values).
+
+    The HPU compiler rejects the strided view chains of the original (``torch.diagonal`` of a stepped slice,
+    ``inv[..., 0::2]``); here the coupling blocks are gathered with ``index_select`` from the flattened matrix
+    and the even / odd blocks are picked with ``index_select`` on the pair axis, so every tensor is contiguous
+    and no tensor has rank above 5.
+    """
+    size = a.shape[-1]
+    padded = 1
+    while padded < size:
+        padded *= 2
+    if padded != size:
+        a = torch.nn.functional.pad(a, (0, padded - size, 0, padded - size))
+    batch = a.shape[0]
+    flat = a.reshape(batch, padded * padded)
+    arange = lambda n: torch.arange(n, device=a.device)  # noqa: E731
+    first, second = arange(1), arange(1) + 1
+    inv = a.new_ones(batch, padded, 1, 1)  # inverses of the 1 x 1 diagonal blocks
+    block, count = 1, padded
+    while count > 1:
+        pairs = count // 2
+        # coupling between block 2p+1 (rows) and block 2p (columns): flat index (row * padded + col)
+        pair = arange(pairs).reshape(pairs, 1, 1)
+        row = arange(block).reshape(1, block, 1)
+        col = arange(block).reshape(1, 1, block)
+        index = (((2 * pair + 1) * block + row) * padded + 2 * pair * block + col).reshape(-1)
+        coupling = flat.index_select(1, index).reshape(batch, pairs, block, block)
+        halves = inv.reshape(batch, pairs, 2, block * block)
+        top = halves.index_select(2, first).reshape(batch, pairs, block, block)
+        bottom = halves.index_select(2, second).reshape(batch, pairs, block, block)
+        lower_left = -torch.matmul(bottom, torch.matmul(coupling, top))
+        inv = torch.cat((torch.cat((top, torch.zeros_like(top)), dim=-1), torch.cat((lower_left, bottom), dim=-1)),
+                        dim=-2)  # [N, count/2, 2 * block, 2 * block]
+        block, count = 2 * block, pairs
+    return inv.reshape(batch, padded, padded)[:, :size, :size]
+
+
 def kda_chunked_steps(state: torch.Tensor,
                       q: torch.Tensor,
                       k: torch.Tensor,
@@ -263,11 +301,12 @@ def _intra_chunk_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor, vc
     # exp(G_i - G_j) for j <= i; the clamp keeps the masked-out upper triangle finite (0 * inf would be NaN)
     decay = torch.exp(torch.clamp(cum.unsqueeze(-2) - cum.unsqueeze(-3), max=0.0))  # [N,C(i),C(j),K]
     k_decayed = decay * kc.unsqueeze(-3)  # k_j * exp(G_i - G_j)
-    # contract with k_i (A) and q_i (Aqk) in one batched matmul over the rows i
-    both = torch.matmul(k_decayed, torch.stack((kc, qc), dim=-1))  # [N,C(i),C(j),2]
-    a_mat = both[..., 0] * strict * bc  # beta_i on the row
-    aqk = both[..., 1] * lower
-    inv = _unit_lower_inverse(a_mat)
+    # contract with k_i (A) and q_i (Aqk) over K; two matmuls instead of a stride-2 last-dim select of one
+    a_raw = torch.matmul(k_decayed, kc.unsqueeze(-1)).squeeze(-1)  # [N,C(i),C(j)]
+    aqk_raw = torch.matmul(k_decayed, qc.unsqueeze(-1)).squeeze(-1)
+    a_mat = a_raw * strict * bc  # beta_i on the row
+    aqk = aqk_raw * lower
+    inv = _unit_lower_inverse_dense(a_mat)
     uv = torch.matmul(inv, bc * vc)
     wk = torch.matmul(inv, bc * k_gamma)
     q_eff = q_gamma - torch.matmul(aqk, wk)
@@ -311,10 +350,10 @@ def kda_chunked_steps_vec(state: torch.Tensor,
     group = num_chunks if vec_chunks <= 0 else min(vec_chunks, num_chunks)
 
     def to_chunks(x):  # [B, N*C, H, D] -> [B, H, N, C, D]
-        return x.reshape(bsz, num_chunks, chunk, heads, -1).permute(0, 3, 1, 2, 4)
+        return x.reshape(bsz, num_chunks, chunk, heads, -1).permute(0, 3, 1, 2, 4).contiguous()
 
     qc, kc, vc, gc = to_chunks(q), to_chunks(k), to_chunks(v), to_chunks(g)
-    bc = beta.reshape(bsz, num_chunks, chunk, heads).permute(0, 3, 1, 2).unsqueeze(-1)  # [B,H,N,C,1]
+    bc = beta.reshape(bsz, num_chunks, chunk, heads).permute(0, 3, 1, 2).contiguous().unsqueeze(-1)  # [B,H,N,C,1]
     cum = torch.cumsum(gc, dim=3)  # G, [B,H,N,C,K]
     last = cum[:, :, :, -1:, :]  # G_C
     q_gamma = qc * torch.exp(cum)
@@ -431,10 +470,10 @@ def kda_prefill_step(mixed_qkv: torch.Tensor,
     # --- causal depthwise conv + silu ---
     init = read_conv_state(conv_cache, slots, channels, width_m1) * use_init  # [B, W-1, C]
     seq = torch.cat([init, mixed_qkv.float()], dim=1)  # [B, W-1+L, C]
-    w = conv_weight.reshape(channels, width).float()
+    w = conv_weight.reshape(channels, width).float().t().contiguous()  # [W, C]: taps are leading-dim selects
     conv_out = torch.zeros(bsz, seq_len, channels, dtype=torch.float32, device=device)
     for i in range(width):
-        conv_out = conv_out + seq[:, i:i + seq_len, :] * w[:, i]
+        conv_out = conv_out + seq[:, i:i + seq_len, :] * w[i]
     if conv_bias is not None:
         conv_out = conv_out + conv_bias.float()
     conv_out = torch.nn.functional.silu(conv_out)
