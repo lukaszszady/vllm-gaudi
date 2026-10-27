@@ -796,34 +796,44 @@ def test_bits_moe_traces_as_one_graph():
 
 
 @pytest.mark.parametrize("group", [4, 3, 0])
-def test_bits_moe_split_graphs_keeps_every_graph_within_one_group(group):
-    """split_graphs: the group loop runs eagerly, no graph sees the packed weights of more than one group."""
+def test_bits_moe_split_runs_one_static_graph_per_group(group):
+    """Split mode: the loop is plain Python, every group is its own static graph (no SymInt, one group of weights)."""
     import torch._dynamo as dynamo
     x, ids, weights, w13, w13_s, w2, w2_s, emin = _bits_moe_case(7)
     moe = _stub_bf16_moe()
-
-    def fn(x, ids, weights, w13, w13_s, w2, w2_s):
-        return situ.mxfp4_bits_moe(x, ids, weights, w13, w13_s, w2, w2_s, moe, "silu", emin, group, True)
-
-    packed_experts = []  # leading dim of every uint8 (packed weight / scale) graph input, per graph
+    graphs = []  # (leading dim of every uint8 graph input, any symbolic input)
 
     def backend(gm, example_inputs):
-        packed_experts.append([a.shape[0] for a in example_inputs if getattr(a, "dtype", None) == torch.uint8])
+        graphs.append(([a.shape[0] for a in example_inputs if getattr(a, "dtype", None) == torch.uint8],
+                       any(isinstance(a, torch.SymInt) for a in example_inputs)))
         return gm.forward
+
+    def group_fwd(x, ids, weights, w13, w13_s, w2, w2_s, activation, experts_min, experts_max, **kwargs):
+        return situ.mxfp4_bits_group(x, ids, weights, w13, w13_s, w2, w2_s, moe, activation, experts_min, experts_max,
+                                     **kwargs)
 
     dynamo.reset()
     try:
-        out = torch.compile(fn, backend=backend)(x, ids, weights, w13, w13_s, w2, w2_s)
+        compiled = torch.compile(group_fwd, backend=backend, dynamic=False)
+        out = situ.mxfp4_bits_moe_split(compiled, x, ids, weights, w13, w13_s, w2, w2_s, "silu", emin, group)
+        again = situ.mxfp4_bits_moe_split(compiled, x, ids, weights, w13, w13_s, w2, w2_s, "silu", emin, group)
     finally:
         dynamo.reset()
-    if group == 0:
-        assert packed_experts == [[8, 8, 8, 8]]  # one group: no break, one graph as without split_graphs
-    else:
-        assert len(packed_experts) > 1 and all(n <= group for g in packed_experts for n in g)
-    eager = fn(x, ids, weights, w13, w13_s, w2, w2_s)  # graph_break is a no-op outside dynamo
-    assert torch.equal(out, eager)
+    sizes = [min(group, 8) if group else 8] * (8 // group if group else 1)
+    if group and 8 % group:
+        sizes.append(8 % group)
+    # w13, w13_s, w2, w2_s of one group each; the second pass hits the cache
+    assert [g[0] for g in graphs] == [[n] * 4 for n in sizes]
+    assert not any(g[1] for g in graphs)
+    assert torch.equal(out, again)
     no_split = situ.mxfp4_bits_moe(x, ids, weights, w13, w13_s, w2, w2_s, moe, "silu", emin, group)
-    assert torch.equal(eager, no_split)
+    assert torch.equal(out, no_split)
+
+
+def test_bits_moe_group_loop_has_no_graph_break():
+    """The traced (non-split) loop stays a single graph: no torch._dynamo.graph_break() in mxfp4_bits_moe."""
+    import inspect
+    assert "graph_break" not in inspect.getsource(situ.mxfp4_bits_moe)
 
 
 def test_bits_split_graphs_env(monkeypatch):

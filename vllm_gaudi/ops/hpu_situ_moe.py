@@ -243,6 +243,30 @@ def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int | Callabl
     return True, max(0, int(group))
 
 
+def mxfp4_bits_group(hidden_states: torch.Tensor, expert_routing_table: torch.Tensor, router_weights: torch.Tensor,
+                     w13: torch.Tensor, w13_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
+                     moe_fn: Callable[..., torch.Tensor], activation: str, experts_min: int, experts_max: int,
+                     **kwargs) -> torch.Tensor:
+    """Bit-assembly dequant of the (already sliced) experts ``experts_min .. experts_max`` + one ``moe_fn`` call."""
+    w12 = dequant_mxfp4_bits(w13, w13_scale, clamp_scales=False)
+    w3 = dequant_mxfp4_bits(w2, w2_scale, clamp_scales=False)
+    return moe_fn(hidden_states=hidden_states,
+                  expert_routing_table=expert_routing_table,
+                  router_weights=router_weights,
+                  w12=w12.unbind(0),
+                  w3=w3.unbind(0),
+                  permuted_weights=True,
+                  activation=activation,
+                  experts_min=experts_min,
+                  experts_max=experts_max,
+                  **kwargs)
+
+
+def _expert_groups(num_experts: int, group: int) -> list[tuple[int, int]]:
+    step = num_experts if group <= 0 else min(group, num_experts)
+    return [(start, min(start + step, num_experts)) for start in range(0, num_experts, step)]
+
+
 def mxfp4_bits_moe(hidden_states: torch.Tensor,
                    expert_routing_table: torch.Tensor,
                    router_weights: torch.Tensor,
@@ -254,47 +278,55 @@ def mxfp4_bits_moe(hidden_states: torch.Tensor,
                    activation: str,
                    experts_min: int,
                    group: int = 0,
-                   split_graphs: bool = False,
                    **kwargs) -> torch.Tensor:
     """MXFP4 MoE as a gather-free bf16 dequant of the local experts + the bf16 fused MoE op ``moe_fn``.
 
     Replacement for ``mixture_of_experts.mxfp4_fused_weights``, whose internal per-expert cast runs serially before
     each expert's GEMMs. Here the dequant is plain elementwise int16 work (fusable by the graph compiler) over the
-    stacked per-rank tensors w13 [E, 2I, H/2] / w2 [E, H, I/2] (+ E8M0 scales, range checked at load: no clamp),
-    and ``moe_fn`` (``torch.ops.hpu.mixture_of_experts``) gets per-expert bf16 views with ``permuted_weights=True``.
+    stacked per-rank packed weights ``w13`` [E, 2I, H/2] / ``w2`` [E, H, I/2] and scales, followed by the bf16 op.
+    ``expert_routing_table`` must be int64 and ``router_weights`` in the activation dtype (bf16 op requirement).
+
     ``group`` > 0 dequantizes and runs at most that many experts at a time (lower peak memory, one op call per
     group, outputs summed) like the moe_n_slice loop of the bf16 op; 0 = all local experts in one call. ``kwargs``
     (chunk_size / total_experts) are passed through. All shapes are static.
-
-    In one compiled graph the groups do not depend on each other's output, so the graph compiler may schedule the
-    dequant of several groups before their MoE calls and keep their int16 temporaries / bf16 weights alive together;
-    ``split_graphs`` puts a dynamo graph break into the group loop (torch.compile mode only, a no-op in eager mode):
-    the loop then runs eagerly and the dequant / MoE call of each group are compiled as their own graphs, which
-    bounds the transient memory to one group at the cost of a few graph launches per group (pick a group that
-    divides the local expert count, a smaller last group compiles extra graphs).
     """
-    num_experts = w13.shape[0]
-    step = num_experts if group <= 0 else min(group, num_experts)
     out = None
-    for start in range(0, num_experts, step):
-        end = min(start + step, num_experts)
-        if split_graphs and start > 0:
-            torch._dynamo.graph_break()
-        w12 = dequant_mxfp4_bits(w13[start:end], w13_scale[start:end], clamp_scales=False)
-        w3 = dequant_mxfp4_bits(w2[start:end], w2_scale[start:end], clamp_scales=False)
-        part = moe_fn(hidden_states=hidden_states,
-                      expert_routing_table=expert_routing_table,
-                      router_weights=router_weights,
-                      w12=w12.unbind(0),
-                      w3=w3.unbind(0),
-                      permuted_weights=True,
-                      activation=activation,
-                      experts_min=experts_min + start,
-                      experts_max=experts_min + end - 1,
-                      **kwargs)
+    for start, end in _expert_groups(w13.shape[0], group):
+        part = mxfp4_bits_group(hidden_states, expert_routing_table, router_weights, w13[start:end],
+                                w13_scale[start:end], w2[start:end], w2_scale[start:end], moe_fn, activation,
+                                experts_min + start, experts_min + end - 1, **kwargs)
         out = part if out is None else out + part
-        # free this group's bf16 weights before the next group is dequantized (eager loop, e.g. split_graphs)
-        del w12, w3, part
+    return out
+
+
+def mxfp4_bits_moe_split(group_fn: Callable[..., torch.Tensor],
+                         hidden_states: torch.Tensor,
+                         expert_routing_table: torch.Tensor,
+                         router_weights: torch.Tensor,
+                         w13: torch.Tensor,
+                         w13_scale: torch.Tensor,
+                         w2: torch.Tensor,
+                         w2_scale: torch.Tensor,
+                         activation: str,
+                         experts_min: int,
+                         group: int = 0,
+                         **kwargs) -> torch.Tensor:
+    """``mxfp4_bits_moe`` with the group loop in plain Python (call it outside any traced region).
+
+    In one graph the groups are independent, so the graph compiler may keep the int16 temporaries / bf16 weights of
+    several groups alive together. Here every group runs through ``group_fn`` (``mxfp4_bits_group`` with the MoE op
+    bound, compiled with ``dynamic=False``): one graph per group and shape, the transient memory is bounded by one
+    group. A ``torch._dynamo.graph_break()`` in the loop does not do this: dynamo skips the whole frame ('graph break
+    in loop'), and the dequant called from the eager frame is recompiled with symbolic sizes for the w13 / w2 shapes,
+    which Synapse rejects ('Invalid Tensor Size', synStatus 26). Only the sum of the group outputs runs eagerly.
+    """
+    out = None
+    for start, end in _expert_groups(w13.shape[0], group):
+        part = group_fn(hidden_states, expert_routing_table, router_weights, w13[start:end], w13_scale[start:end],
+                        w2[start:end], w2_scale[start:end], activation, experts_min + start, experts_min + end - 1,
+                        **kwargs)
+        out = part if out is None else out + part
+        del part
     return out
 
 
