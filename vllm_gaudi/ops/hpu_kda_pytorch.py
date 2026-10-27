@@ -647,7 +647,8 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
                         output_norm_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Out-of-place ``attn_res``: returns ``(new_prefix, new_blocks, mixed)``, no input is modified.
 
-    Same numbers as the Triton kernel (see ``attn_res_torch``, which adds its in-place side effects). Needed in
+    Same numbers as the Triton kernel up to the rounding of the softmax weights of the stored blocks and of their
+    weighted sum to the bank dtype (see ``attn_res_torch``, which adds its in-place side effects). Needed in
     torch.compile mode, where regional compilation makes the prefix and the block bank graph inputs and HPU
     compile can silently drop in-place writes to them. ``new_prefix`` is ``prefix`` itself without a delta and
     ``new_blocks`` is ``blocks`` itself without a block write (no copy in those cases). All shapes are static.
@@ -673,11 +674,19 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
     if num_blocks == 0:
         mixed = updated
     else:
-        values = torch.cat((new_blocks[:, :num_blocks].float(), updated.unsqueeze(1)), dim=1)  # [M, S, D]
-        rstd = torch.rsqrt(values.pow(2).mean(dim=-1) + eps)  # [M, S]
-        logits = (values * (norm_weight.float() * qk_weight.float())).sum(dim=-1) * rstd
-        probs = torch.softmax(logits, dim=-1)
-        mixed = (probs.unsqueeze(-1) * values).sum(dim=1)
+        # The stored blocks are read in their own dtype (no fp32 copy of the [M, S, D] bank, no cat with the
+        # prefix): every value of the reference fp32 mix is exactly representable in that dtype anyway. The
+        # updated prefix is a separate [M, D] term; reductions accumulate in fp32 and the weighted sum of the
+        # blocks is one batched matmul ([M, 1, S] x [M, S, D]) on the matrix engine.
+        bank = new_blocks[:, :num_blocks]  # [M, S, D]
+        qk = norm_weight.float() * qk_weight.float()  # [D]
+        bank_rstd = torch.rsqrt(torch.square(bank.float()).sum(dim=-1) / hidden + eps)  # [M, S]
+        bank_logits = (bank.float() * qk).sum(dim=-1) * bank_rstd
+        own_rstd = torch.rsqrt(torch.square(updated).sum(dim=-1, keepdim=True) / hidden + eps)  # [M, 1]
+        own_logit = (updated * qk).sum(dim=-1, keepdim=True) * own_rstd
+        probs = torch.softmax(torch.cat((bank_logits, own_logit), dim=-1), dim=-1)  # [M, S + 1]
+        bank_probs = probs[:, :num_blocks].to(bank.dtype).unsqueeze(1)  # [M, 1, S]
+        mixed = torch.bmm(bank_probs, bank).squeeze(1).float() + probs[:, num_blocks:] * updated
     if output_norm_weight is not None:
         mixed = mixed * torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps)
         mixed = mixed * output_norm_weight.float()
