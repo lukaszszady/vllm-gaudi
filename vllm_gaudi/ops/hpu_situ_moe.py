@@ -210,8 +210,8 @@ def _record_bits_layer(use_bits: bool) -> None:
     _bits_layer_counts["bits" if use_bits else "fused"] += 1
 
 
-def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int | Callable[[], int], has_bias: bool, block_size: int,
-                              w13: torch.Tensor, w13_scale: torch.Tensor, w2: torch.Tensor,
+def decide_mxfp4_bits_dequant(mode_value: str | None, group_value: int | Callable[[], int], has_bias: bool,
+                              block_size: int, w13: torch.Tensor, w13_scale: torch.Tensor, w2: torch.Tensor,
                               w2_scale: torch.Tensor, label: str = "") -> tuple[bool, int]:
     """Whether one MXFP4 MoE layer uses the bits path (HPU_KIMI_MXFP4_DEQUANT=bits) and with which expert group.
 
