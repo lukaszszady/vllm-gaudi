@@ -49,6 +49,13 @@ def stub_vllm_modules(monkeypatch):
             monkeypatch.setitem(sys.modules, name, module)
 
 
+@pytest.fixture(autouse=True)
+def drain_background_drops(monkeypatch):
+    """No test may leak queued drops into the next one (it depends on monkeypatch to run before its teardown)."""
+    yield
+    assert wpc._dropper.wait_idle(10), "background drops did not finish"
+
+
 @pytest.fixture
 def shards(tmp_path):
     paths = []
@@ -275,7 +282,7 @@ def test_all_shards_dropped_when_iterator_completes(monkeypatch, shards):
     dropped = []
     _slow_fadvise(monkeypatch, 0.05, dropped)
     list(wpc.wrap_safetensors_iterator(_fake_iterator([]))(shards, True, None))
-    assert sorted(dropped) == sorted(shards)
+    assert sorted(dropped) == sorted(os.path.realpath(p) for p in shards)
 
 
 def test_summary_reports_count_and_background_time(monkeypatch, shards):
@@ -303,8 +310,12 @@ def test_exception_in_drop_thread_does_not_crash_loading(monkeypatch, shards):
 def test_wait_is_bounded(monkeypatch, shards):
     monkeypatch.setenv("VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_LAG", "0")
     monkeypatch.setenv("VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_WAIT", "0.1")
-    _slow_fadvise(monkeypatch, 0.6, [])
+    dropped = []
+    _slow_fadvise(monkeypatch, 0.6, dropped)
     start = time.monotonic()
     list(wpc.wrap_safetensors_iterator(_fake_iterator([]))(shards, True, None))
     assert time.monotonic() - start < 1.0
-    time.sleep(2)  # let the daemon thread finish before other tests
+    deadline = time.monotonic() + 10  # the drops go on in the background after the bounded wait
+    while len(dropped) < 3 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(dropped) == 3

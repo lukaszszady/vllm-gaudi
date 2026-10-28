@@ -174,13 +174,17 @@ class _BackgroundDropper:
         self._queue: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._fallback_logged = False
 
     def submit(self, path: str, batch: _DropBatch) -> None:
         batch.submit()
         try:
             self._ensure_thread()
         except Exception as exc:  # no thread (e.g. interpreter shutdown): drop in place rather than lose the drop
-            logger.warning("Weight page cache: background drop thread not started (%s), dropping synchronously", exc)
+            if not self._fallback_logged:  # once per process, not per shard
+                self._fallback_logged = True
+                logger.warning("Weight page cache: background drop thread not started (%s), dropping synchronously",
+                               exc)
             self._run(path, batch)
             return
         self._queue.put((path, batch))
@@ -203,7 +207,15 @@ class _BackgroundDropper:
     def _loop(self) -> None:
         while True:
             path, batch = self._queue.get()
-            self._run(path, batch)
+            try:
+                self._run(path, batch)
+            finally:
+                self._queue.task_done()
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Block until the queue is drained and the in-flight drop is done; False on timeout."""
+        with self._queue.all_tasks_done:
+            return self._queue.all_tasks_done.wait_for(lambda: self._queue.unfinished_tasks == 0, timeout)
 
 
 _dropper = _BackgroundDropper()
@@ -270,7 +282,8 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
                     _dropper.submit(files[next_drop], batch)
                     next_drop += 1
                 if started % _LOG_EVERY_SHARDS == 0:
-                    logger.info("Weight page cache: %d/%d shards loaded: %s", started, len(files), host_memory_line())
+                    logger.info("Weight page cache: %d/%d shards loaded (%d drops pending): %s", started, len(files),
+                                batch.pending, host_memory_line())
         finally:
             # Also runs when loading stops early, so no opened shard stays cached because of this process.
             for st_file in files[next_drop:started]:
