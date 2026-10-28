@@ -794,8 +794,10 @@ class HPUWorker(WorkerBase):
             else:
                 with HabanaMemoryProfiler() as m:
                     self.model_runner.initialize_kv_cache(self.kv_cache_config)
-                    self.model_runner.defragmenter = OnlineDefragmenter(self.model_runner.kv_caches,
-                                                                        self.model_runner.block_size)
+                    self.model_runner.defragmenter = OnlineDefragmenter(
+                        self.model_runner.kv_caches,
+                        self.model_runner.block_size,
+                        hybrid=self.model_runner.num_mamba_like_layers > 0)
                     gc.collect()
                     torch.hpu.synchronize()
                 msg = f"Waking up KV cache, reinitializing it took {m.get_summary_string()}"
