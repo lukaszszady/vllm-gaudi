@@ -5,6 +5,8 @@ import importlib.util
 import os
 import pathlib
 
+import pytest
+
 _PATH = pathlib.Path(__file__).resolve().parents[2] / "vllm_gaudi" / "extension" / "profiling_cfg.py"
 _spec = importlib.util.spec_from_file_location("profiling_cfg_under_test", _PATH)
 cfg = importlib.util.module_from_spec(_spec)
@@ -239,3 +241,70 @@ def test_trace_handler_records_written_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "WRITTEN_TRACES", [])
     cfg.make_trace_handler(str(tmp_path), 0, use_gzip=False)(_OneArgProf())
     assert len(cfg.WRITTEN_TRACES) == 1 and cfg.WRITTEN_TRACES[0].endswith(".pt.trace.json")
+
+
+def test_profile_blocks_mode_env():
+    assert cfg.profile_blocks_scattered({}) is False
+    assert cfg.profile_blocks_scattered({"VLLM_PROFILE_BLOCKS": "repeat"}) is False
+    assert cfg.profile_blocks_scattered({"VLLM_PROFILE_BLOCKS": " Scatter "}) is True
+    with pytest.raises(ValueError):
+        cfg.profile_blocks_scattered({"VLLM_PROFILE_BLOCKS": "random"})
+
+
+def test_pad_owner_block_in_scheduler_units():
+    # Kimi-K3: 128-token kernel blocks, 384-token scheduler blocks; the pad kernel block 3648 lies in block 1216
+    assert cfg.pad_owner_block(3648, 128, 384) == 1216
+    assert cfg.pad_owner_block(3648, 128, 128) == 3648
+
+
+def test_scattered_blocks_are_distinct_and_skip_null_and_excluded_blocks():
+    # VLLM_PROFILE_DECODE=24,3648 with 384-token scheduler blocks: 24 requests x 51 blocks
+    alloc = cfg.ScatteredBlockAllocator(3648, exclude={1216})
+    ids = [b for _ in range(24) for b in alloc.take(0, 51)]
+    assert len(set(ids)) == len(ids) == 24 * 51
+    assert 0 not in ids and 1216 not in ids and max(ids) < 3648
+    assert not alloc.wrapped
+    first = ids[:51]
+    assert first != sorted(first)  # scattered, not one contiguous run
+    assert max(first) - min(first) > 51
+
+
+def test_scattered_blocks_are_deterministic_and_independent_per_group():
+    a, b = cfg.ScatteredBlockAllocator(100), cfg.ScatteredBlockAllocator(100)
+    assert a.take(0, 10) == b.take(0, 10)
+    assert a.take(1, 10) != a.take(0, 10)
+    assert b.take(1, 1) == cfg.ScatteredBlockAllocator(100).take(1, 1)
+
+
+def test_scattered_blocks_wrap_when_the_pool_is_exhausted():
+    alloc = cfg.ScatteredBlockAllocator(5, exclude={2})
+    assert alloc.pool_size == 3
+    ids = alloc.take(0, 3)
+    assert sorted(ids) == [1, 3, 4] and not alloc.wrapped
+    assert alloc.take(0, 2) == ids[:2] and alloc.wrapped
+    with pytest.raises(ValueError):
+        cfg.ScatteredBlockAllocator(2, exclude={1})
+
+
+def test_profile_sampling_unset_keeps_greedy():
+    assert cfg.profile_sampling_kwargs(None) is None
+    assert cfg.profile_sampling_kwargs("  ") is None
+
+
+def test_profile_sampling_default_uses_model_defaults():
+    # Kimi-K3's generation_config.json has no sampling keys -> SamplingParams defaults (temperature 1.0)
+    assert cfg.profile_sampling_kwargs("default", {}) == {}
+    defaults = dict(temperature=0.6, top_p=0.95, max_tokens=10)
+    assert cfg.profile_sampling_kwargs("default", defaults) == dict(temperature=0.6, top_p=0.95)
+
+
+def test_profile_sampling_explicit_items_override_defaults():
+    assert cfg.profile_sampling_kwargs("temperature=1.0, top_p=0.95") == dict(temperature=1.0, top_p=0.95)
+    kwargs = cfg.profile_sampling_kwargs("default,top_k=50", dict(temperature=0.7, top_k=20))
+    assert kwargs == dict(temperature=0.7, top_k=50) and isinstance(kwargs["top_k"], int)
+
+
+def test_profile_sampling_rejects_unknown_items():
+    for spec in ("greedy", "seed=1", "top_p", "top_k=abc"):
+        with pytest.raises(ValueError):
+            cfg.profile_sampling_kwargs(spec)
