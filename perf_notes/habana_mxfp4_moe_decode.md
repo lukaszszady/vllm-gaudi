@@ -117,6 +117,28 @@ Fewer per-expert costs would shrink this wait as well.
 4. **Document `chunk_size` / `total_experts`** and any env or flags that change the per-expert loop in
    decode: does `chunk_size` change the number of GEMM waves, and is there a dynamic variant that skips
    empty experts?
+   - **Measured: yes, `chunk_size` changes the number of expert chunks and GEMM waves.** We used the same
+     decode profile (bs 24, 56 local experts) with `VLLM_MOE_CHUNK=32,512` and
+     `VLLM_MOE_TOKEN_BOUNDARY=64,1000000`, so the call gets `chunk_size=32, total_experts=896` instead of
+     `0, 0`. The recipe structure is unchanged: one recipe per call, 84 recipe ids and 532 executions per
+     step. Only the per-call loop shrinks:
+
+     | | `chunk_size=0, total_experts=0` | `chunk_size=32, total_experts=896` |
+     |---|---|---|
+     | `MOE/layer_0/chunk_j` per call | 56 | 29 |
+     | GEMMs per call (waves of 8) | 912 (114) | 480 (60) |
+     | Empty chunk | 16 GEMMs, 0.97 µs each, 11.7 µs | 16 GEMMs, 0.93 µs each, 10.8 µs |
+     | Span per call | 0.560 ms + 0.0548 ms x active | 0.380 ms + 0.0547 ms x active |
+     | Decode step, rank 0 / rank 8 | 205.6 / 207.6 ms | 189.1 / 190.8 ms |
+
+   - In both modes the active experts fill the first chunks (`chunk_0..N-1`).
+   - `router_stage3_bf16` x56, `weighted_sum_reduction_bf16` x56 and the per-active-expert cast cost are
+     unchanged.
+   - The gain is ~0.18 ms per call, ~16.5 ms per step (-8%).
+   - Still open for the Habana owner:
+     - how the chunk count (29) is derived from `chunk_size`, `total_experts` and the token count;
+     - what happens when more than that number of local experts are active in one call. The max seen
+       here is 19.
 
 ## Responsible component
 
