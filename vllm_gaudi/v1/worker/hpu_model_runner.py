@@ -6538,6 +6538,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # Since the model is warmed up for all possible tensor sizes,
             # Dynamo can skip checking the guards
             torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+            logger.info("VLLM_FULL_WARMUP enabled: dynamo skip_guard_eval_unsafe set after warmup")
         elapsed_time = end_time - start_time
         msg = (f"Warmup finished in {elapsed_time:.0f} secs, "
                f"allocated {format_bytes(end_mem - start_mem)} of device memory")
