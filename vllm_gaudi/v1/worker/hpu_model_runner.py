@@ -1598,6 +1598,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._PAD_BLOCK_ID = -1
         self._MAMBA_PAD_BLOCK_ID = -1
         self._dummy_num_blocks = 0
+        self._num_attn_blocks = 0
 
         if self.vllm_config.parallel_config.data_parallel_size > 1 and htorch.utils.internal.is_lazy(
         ) and not self.model_config.enforce_eager:
@@ -5836,10 +5837,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     min_tokens_per_seq = sw_blocks * decode_block_size
                 else:
                     min_tokens_per_seq = decode_block_size
+                # Contiguous PA buckets by the highest kernel block id + 1, so
+                # place the dummy blocks to make that id bucket - 1, capped at
+                # the physical pool. Under virtual block splitting scheduler
+                # block s holds kernel blocks s * ratio .. s * ratio + ratio - 1.
+                num_attn_blocks = self._num_attn_blocks
+                blocks_per_kv_block = num_attn_blocks // self.kv_cache_config.num_blocks
+                block_id, last_kernel_block = divmod(
+                    min(decode_num_blocks, num_attn_blocks) - 1, blocks_per_kv_block)
+                if blocks_per_kv_block > 1 and not self.interleaved_sliding_window:
+                    # Positions 0..len must end in kernel block last_kernel_block.
+                    min_tokens_per_seq = (last_kernel_block + 1) * decode_block_size - 1
                 decode_seq_lengths = [min_tokens_per_seq] * decode_bs
-                # Cap block_id at physical pool — contiguous PA uses
-                # block_id as the allocation base which must be valid.
-                block_id = min(decode_num_blocks - 1, self.kv_cache_config.num_blocks - 1)
             else:
                 decode_seq_lengths = self._generate_seq_lengths(decode_bs, decode_num_blocks, decode_block_size)
                 block_id = 0
@@ -6382,6 +6391,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.bucketing_manager.skip_decode_block_clamp = (self.attn_block_size != self.block_size
                                                               or self.num_gdn > 0 or self.num_mamba_like_layers > 0
                                                               or self.interleaved_sliding_window)
+            # Hybrids run contiguous PA without the defragmenter (see
+            # OnlineDefragmenter), so any decode batch may reach the pool size.
+            self.bucketing_manager.decode_full_block_range = (self.use_contiguous_pa
+                                                              and self.num_mamba_like_layers > 0)
             if self.attn_block_size != self.block_size:
                 self.bucketing_manager.block_size = self.attn_block_size
             try:
@@ -6418,7 +6431,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             )
 
         if not self.is_pooling_model:
-            self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size)
+            self.defragmenter = OnlineDefragmenter(self.kv_caches,
+                                                   self.block_size,
+                                                   hybrid=self.num_mamba_like_layers > 0)
         # before the profiling run too: past the limit dynamo silently runs the frame eagerly
         if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
             multiplier = 5 if self.compile_config.regional_compilation else 1
@@ -6540,7 +6555,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # reusing defragmenter used in warmup causes accuracy drops, which is why we re-create
         # and re-initialize it.
         if not self.is_pooling_model:
-            self.defragmenter = OnlineDefragmenter(self.kv_caches, self.block_size)
+            self.defragmenter = OnlineDefragmenter(self.kv_caches,
+                                                   self.block_size,
+                                                   hybrid=self.num_mamba_like_layers > 0)
 
     def shutdown_inc(self, suppress=suppress, finalize_calibration=finalize_calibration):
         global shutdown_inc_called
@@ -6836,6 +6853,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # block table), so only the tensor identity can separate layers inside a
         # group. Key by position to restore the pre-#51718 sharing.
         mamba_state_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
+        # Real attention rows (excluding the pad row) when virtual block
+        # splitting allocates the attention caches in kernel blocks.
+        num_attn_kernel_blocks: Optional[int] = None
 
         def _mamba_state_tensors(spec: MambaSpec, layer_pos: int, num_slots: int) -> tuple[torch.Tensor, ...]:
             key = (spec, layer_pos, num_slots)
@@ -6914,6 +6934,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         # The flat tensor must accommodate all kernel blocks.
                         blocks_per_kv_block = kv_cache_spec.block_size // attn_kernel_block_size
                         num_kernel_blocks = num_blocks * blocks_per_kv_block
+                        num_attn_kernel_blocks = max(num_attn_kernel_blocks or 0, num_kernel_blocks)
                         kv_cache_shape = self.attn_backend.get_kv_cache_shape(num_kernel_blocks + 1,
                                                                               attn_kernel_block_size,
                                                                               kv_cache_spec.num_kv_heads,
@@ -7112,11 +7133,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
+        # Attention block ids and decode block buckets are in kernel blocks of
+        # attn_block_size. Under hybrid virtual block splitting the scheduler
+        # id num_blocks is a real kernel block (the first one of scheduler block
+        # num_blocks / blocks_per_kv_block), so padding tokens must target the
+        # trailing pad row instead, or they overwrite a live request's KV.
+        num_attn_blocks = num_blocks if num_attn_kernel_blocks is None else num_attn_kernel_blocks
+        self._num_attn_blocks = num_attn_blocks
         if self.enable_bucketing:
-            self.bucketing_manager.num_hpu_blocks = num_blocks
+            # Contiguous PA buckets by the highest kernel block id + 1.
+            self.bucketing_manager.num_hpu_blocks = num_attn_blocks if self.use_contiguous_pa else num_blocks
 
-        self._PAD_BLOCK_ID = num_blocks
-        self._PAD_SLOT_ID = num_blocks * self.attn_block_size
+        self._PAD_BLOCK_ID = num_attn_blocks
+        self._PAD_SLOT_ID = num_attn_blocks * self.attn_block_size
         self._MAMBA_PAD_BLOCK_ID = num_blocks
         self._dummy_num_blocks = num_blocks
 
