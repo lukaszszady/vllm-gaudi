@@ -18,10 +18,17 @@ Environment:
   VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_LAG  shards kept cached behind the current one (default 4). The ranks of a node
                                        read the same shards at about the same time; the lag lets slower ranks still
                                        hit the cache instead of re-reading a shard that a faster rank dropped.
+  VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_WAIT seconds the end of loading waits for the background drops (default 600)
+
+The fadvise calls run in one daemon thread per process, so a slow call (all ranks of a node advise the same shard
+at once, on network file systems that takes seconds) does not delay the loading of the next shard.
 """
 import contextlib
 import functools
 import os
+import queue
+import threading
+import time
 from collections.abc import Callable, Generator, Iterator
 
 import torch
@@ -32,7 +39,9 @@ logger = init_logger()
 
 _ENV_DROP = "VLLM_HPU_DROP_WEIGHT_PAGE_CACHE"
 _ENV_LAG = "VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_LAG"
+_ENV_WAIT = "VLLM_HPU_DROP_WEIGHT_PAGE_CACHE_WAIT"
 _DEFAULT_LAG = 4
+_DEFAULT_WAIT_S = 600.0
 _AUTO_MIN_FRACTION = 0.25  # auto mode: active when the shards are larger than this fraction of MemTotal
 _LOG_EVERY_SHARDS = 16
 # Strategies whose iteration state does not cross shard boundaries, so the iterator can be called once per shard.
@@ -119,6 +128,87 @@ def drop_file_page_cache(path: str) -> bool:
         os.close(fd)
 
 
+def _wait_seconds() -> float:
+    value = os.getenv(_ENV_WAIT, "")
+    try:
+        return max(0.0, float(value)) if value else _DEFAULT_WAIT_S
+    except ValueError:
+        logger.warning("%s=%r is not a number, using %d", _ENV_WAIT, value, _DEFAULT_WAIT_S)
+        return _DEFAULT_WAIT_S
+
+
+class _DropBatch:
+    """Results of the background drops requested by one loader run."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self.pending = 0
+        self.dropped = 0
+        self.failed = 0
+        self.total_s = 0.0
+        self.max_s = 0.0
+
+    def submit(self):
+        with self._cond:
+            self.pending += 1
+
+    def done(self, ok: bool, seconds: float):
+        with self._cond:
+            self.dropped += ok
+            self.failed += not ok
+            self.total_s += seconds
+            self.max_s = max(self.max_s, seconds)
+            self.pending -= 1
+            self._cond.notify_all()
+
+    def wait(self, timeout: float) -> bool:
+        """Block until every submitted drop is done; False when the timeout expired first."""
+        with self._cond:
+            return self._cond.wait_for(lambda: self.pending == 0, timeout)
+
+
+class _BackgroundDropper:
+    """One lazily started daemon thread that runs drop_file_page_cache for queued shard paths."""
+
+    def __init__(self):
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def submit(self, path: str, batch: _DropBatch) -> None:
+        batch.submit()
+        try:
+            self._ensure_thread()
+        except Exception as exc:  # no thread (e.g. interpreter shutdown): drop in place rather than lose the drop
+            logger.warning("Weight page cache: background drop thread not started (%s), dropping synchronously", exc)
+            self._run(path, batch)
+            return
+        self._queue.put((path, batch))
+
+    def _ensure_thread(self) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._loop, name="hpu-weight-page-cache-drop", daemon=True)
+                self._thread.start()
+
+    @staticmethod
+    def _run(path: str, batch: _DropBatch) -> None:
+        start, ok = time.monotonic(), False
+        try:
+            ok = drop_file_page_cache(path)
+        except Exception as exc:  # never crash loading
+            logger.warning("Weight page cache: drop of %s failed: %s", path, exc)
+        batch.done(ok, time.monotonic() - start)
+
+    def _loop(self) -> None:
+        while True:
+            path, batch = self._queue.get()
+            self._run(path, batch)
+
+
+_dropper = _BackgroundDropper()
+
+
 def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.Tensor]]],
                               seen: list[str] | None = None,
                               force: bool = True):
@@ -164,7 +254,7 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
         logger.info("Weight page cache: dropping shards after use (lag %d of %d shards, %.1f GiB); before: %s", lag,
                     len(files),
                     _files_size_bytes(files) / 2**30, host_memory_line())
-        dropped = failed = 0
+        batch = _DropBatch()
         started = 0  # shards opened so far
         next_drop = 0  # first shard whose cache is not dropped yet
         try:
@@ -177,17 +267,21 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
                 # One shard per call: the shard's safe_open handle (and its mmap) is closed when the call ends.
                 yield from original([st_file], False, safetensors_load_strategy, *args, **kwargs)
                 while next_drop <= i - lag:
-                    ok = drop_file_page_cache(files[next_drop])
-                    dropped, failed, next_drop = dropped + ok, failed + (not ok), next_drop + 1
+                    _dropper.submit(files[next_drop], batch)
+                    next_drop += 1
                 if started % _LOG_EVERY_SHARDS == 0:
                     logger.info("Weight page cache: %d/%d shards loaded: %s", started, len(files), host_memory_line())
         finally:
             # Also runs when loading stops early, so no opened shard stays cached because of this process.
             for st_file in files[next_drop:started]:
-                ok = drop_file_page_cache(st_file)
-                dropped, failed = dropped + ok, failed + (not ok)
-            logger.info("Weight page cache: loader finished, fadvise(DONTNEED) called for %d shards (%d failed)",
-                        dropped, failed)
+                _dropper.submit(st_file, batch)
+            if not batch.wait(_wait_seconds()):
+                logger.warning("Weight page cache: %d background drops still pending after %.0f s", batch.pending,
+                               _wait_seconds())
+            logger.info(
+                "Weight page cache: loader finished, fadvise(DONTNEED) called for %d shards (%d failed); "
+                "background fadvise time total %.1f s, max %.2f s per shard", batch.dropped, batch.failed,
+                batch.total_s, batch.max_s)
 
     return iterator
 
