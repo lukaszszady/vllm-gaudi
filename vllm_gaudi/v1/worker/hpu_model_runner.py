@@ -43,6 +43,7 @@ from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.hpu_weight_page_cache import drop_weight_page_cache_during_load
+from vllm_gaudi.v1.worker.kv_block_layout import attn_pad_ids, contiguous_dummy_decode_layout, pad_slot_cycle
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.model_executor.layers.attention import Attention
@@ -3315,8 +3316,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # set an out of range value for the padding tokens so that they
         # are ignored when inserting into the KV cache.
         slot_mapping = slot_mapping[:padded_batch_size]
-        pad_slot_base = self._PAD_BLOCK_ID * decode_block_size
-        dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
+        dummy_slots = pad_slot_cycle(self._PAD_BLOCK_ID * decode_block_size, decode_block_size)
         slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
 
         #####################################
@@ -5841,13 +5841,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # place the dummy blocks to make that id bucket - 1, capped at
                 # the physical pool. Under virtual block splitting scheduler
                 # block s holds kernel blocks s * ratio .. s * ratio + ratio - 1.
-                num_attn_blocks = self._num_attn_blocks
-                blocks_per_kv_block = num_attn_blocks // self.kv_cache_config.num_blocks
-                block_id, last_kernel_block = divmod(
-                    min(decode_num_blocks, num_attn_blocks) - 1, blocks_per_kv_block)
-                if blocks_per_kv_block > 1 and not self.interleaved_sliding_window:
-                    # Positions 0..len must end in kernel block last_kernel_block.
-                    min_tokens_per_seq = (last_kernel_block + 1) * decode_block_size - 1
+                block_id, min_tokens_per_seq = contiguous_dummy_decode_layout(
+                    decode_num_blocks, self._num_attn_blocks, self.kv_cache_config.num_blocks, decode_block_size,
+                    min_tokens_per_seq, self.interleaved_sliding_window)
                 decode_seq_lengths = [min_tokens_per_seq] * decode_bs
             else:
                 decode_seq_lengths = self._generate_seq_lengths(decode_bs, decode_num_blocks, decode_block_size)
@@ -7138,14 +7134,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # id num_blocks is a real kernel block (the first one of scheduler block
         # num_blocks / blocks_per_kv_block), so padding tokens must target the
         # trailing pad row instead, or they overwrite a live request's KV.
-        num_attn_blocks = num_blocks if num_attn_kernel_blocks is None else num_attn_kernel_blocks
+        num_attn_blocks, self._PAD_BLOCK_ID, self._PAD_SLOT_ID = attn_pad_ids(num_blocks, num_attn_kernel_blocks,
+                                                                              self.attn_block_size)
         self._num_attn_blocks = num_attn_blocks
         if self.enable_bucketing:
             # Contiguous PA buckets by the highest kernel block id + 1.
             self.bucketing_manager.num_hpu_blocks = num_attn_blocks if self.use_contiguous_pa else num_blocks
 
-        self._PAD_BLOCK_ID = num_attn_blocks
-        self._PAD_SLOT_ID = num_attn_blocks * self.attn_block_size
         self._MAMBA_PAD_BLOCK_ID = num_blocks
         self._dummy_num_blocks = num_blocks
 
