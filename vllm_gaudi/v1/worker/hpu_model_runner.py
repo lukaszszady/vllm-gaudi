@@ -36,8 +36,9 @@ from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemoryProfiler, HabanaProfilerCounterHelper,
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.graph_state import forward_graph_mode
-from vllm_gaudi.extension.profiling_cfg import (bucketing_max_batched_tokens, hold_before_exit, profile_exit_delay_s,
-                                                profiling_max_batched_tokens)
+from vllm_gaudi.extension.profiling_cfg import (ScatteredBlockAllocator, bucketing_max_batched_tokens, hold_before_exit,
+                                                pad_owner_block, profile_blocks_scattered, profile_exit_delay_s,
+                                                profile_sampling_kwargs, profiling_max_batched_tokens)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.extension.debug import init_debug_logger
@@ -5665,7 +5666,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                            total_tokens,
                            scheduled_tokens,
                            is_prompt,
-                           block_id=0):
+                           block_id=0,
+                           block_alloc=None,
+                           sampling_params=None):
         # Spec decode: blocks should include look ahead tokens (eagle)
         total_tokens_for_blocks = total_tokens
         if self.speculative_config and self.speculative_config.use_eagle():
@@ -5683,6 +5686,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                      (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
                      for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_like_layers > 0 else [[block_id] *
                                                                                                             num_blocks]
+        if block_alloc is not None:
+            block_ids = [block_alloc.take(gid, len(ids)) for gid, ids in enumerate(block_ids)]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
             if hasattr(self.model_config, 'task') and self.model_config.task is not None:
@@ -5705,7 +5710,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 lora_request=None,
             )
         else:
-            sampling_params = SamplingParams(temperature=0.0)
+            sampling_params = SamplingParams(temperature=0.0) if sampling_params is None else sampling_params.clone()
 
             req = NewRequestData(
                 req_id=req_id,
@@ -5774,7 +5779,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ctx_list = ctx_list if len(ctx_list) > 0 else [0] * len(prompt_list)
         return prompt_list, ctx_list
 
-    def _prepare_dummy_scenario(self, prompt_cfg, decode_cfg):
+    def _prepare_dummy_scenario(self, prompt_cfg, decode_cfg, block_alloc=None, sampling_params=None):
+        """``block_alloc`` / ``sampling_params`` (profile mode only) replace block id 0 and greedy sampling."""
         requests: list[NewRequestData] = []
         scheduled_tokens: dict[str, int] = {}
 
@@ -5816,7 +5822,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                             num_computed_tokens=(context_len * self.block_size),
                                             total_tokens=tokens,
                                             scheduled_tokens=prompt_query_len,
-                                            is_prompt=True)
+                                            is_prompt=True,
+                                            block_alloc=block_alloc,
+                                            sampling_params=sampling_params)
         if decode_cfg:
             decode_bs, decode_query_len, decode_num_blocks = decode_cfg
             # Use attn_block_size (the actual kernel block granularity used in
@@ -5851,7 +5859,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                         total_tokens=dsl,
                                         scheduled_tokens=1,
                                         is_prompt=False,
-                                        block_id=block_id)
+                                        block_id=block_id,
+                                        block_alloc=block_alloc,
+                                        sampling_params=sampling_params)
         self._execute_dummy_scenario(requests, scheduled_tokens)
 
     def _execute_dummy_scenario(self, requests, scheduled_tokens):
@@ -5913,11 +5923,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                              (decode_cfg, self.bucketing_manager.decode_buckets)):
             if cfg and cfg not in buckets:
                 bisect.insort(buckets, cfg)
+        scatter_cfg, sampling_params = self._profiling_request_options(rank)
         torch.hpu.synchronize()
         profiler = self._profiler_call(profiler, "start", rank)
         for i in range(steps):
             step_start = time.perf_counter()
-            self._prepare_dummy_scenario(prompt_cfg, decode_cfg)
+            block_alloc = ScatteredBlockAllocator(*scatter_cfg) if scatter_cfg else None
+            self._prepare_dummy_scenario(prompt_cfg, decode_cfg, block_alloc, sampling_params)
+            if block_alloc is not None and block_alloc.wrapped:
+                logger.warning("VLLM_PROFILE_BLOCKS=scatter: the dummy batch needs more than the %d free KV blocks, "
+                               "block ids repeat", block_alloc.pool_size)
             torch.hpu.synchronize()
             logger.info("Profiling dummy step %d/%d took %.1f s on rank %d", i + 1, steps,
                         time.perf_counter() - step_start, rank)
@@ -5926,6 +5941,35 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self._barrier_after_profiling(rank)
         # Same delay on every rank (VLLM_PROFILE_EXIT_DELAY_S, default 0) so the traces can be copied off the pod.
         hold_before_exit(profile_exit_delay_s())
+
+    def _profiling_request_options(self, rank):
+        """ScatteredBlockAllocator args and SamplingParams of the dummy requests (VLLM_PROFILE_BLOCKS / _SAMPLING).
+
+        Unset: every block id is 0 (the paged-attention gather re-reads one block) and sampling is greedy, which
+        understates decode cost against serving. 'scatter' gives each request distinct blocks of the KV pool, the
+        same ids in every step; the scheduler block holding the decode pad kernel block is excluded.
+        """
+        scatter_cfg = None
+        if profile_blocks_scattered():
+            if self.use_contiguous_pa:
+                logger.warning("VLLM_PROFILE_BLOCKS=scatter is ignored with contiguous PA")
+            else:
+                num_blocks = self.kv_cache_config.num_blocks
+                exclude = {
+                    pad_owner_block(self._PAD_BLOCK_ID, self.attn_block_size, g.kv_cache_spec.block_size)
+                    for g in self.kv_cache_config.kv_cache_groups
+                }
+                scatter_cfg = (num_blocks, exclude)
+                logger.info("Profiling dummy requests use scattered KV blocks on rank %d (%d blocks, excluded %s)",
+                            rank, num_blocks, sorted(exclude))
+        sampling_kwargs = profile_sampling_kwargs(os.environ.get('VLLM_PROFILE_SAMPLING'),
+                                                  self.model_config.get_diff_sampling_param())
+        sampling_params = None
+        if sampling_kwargs is not None:
+            sampling_params = SamplingParams(**sampling_kwargs)
+            logger.info("Profiling dummy requests sample with %s on rank %d", sampling_kwargs or "SamplingParams "
+                        "defaults", rank)
+        return scatter_cfg, sampling_params
 
     @staticmethod
     def _barrier_after_profiling(rank: int) -> None:

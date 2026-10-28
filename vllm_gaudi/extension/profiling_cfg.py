@@ -6,9 +6,10 @@ from __future__ import annotations
 import gzip
 import logging
 import os
+import random
 import shutil
 import time
-from typing import Callable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
 # under the 'vllm' logger tree: vLLM attaches its handler there, other names would drop the INFO lines
 _logger = logging.getLogger('vllm.gaudi.profiling')
@@ -41,6 +42,94 @@ def bucketing_max_batched_tokens(tokens: int, mamba_chunk_size: int, profiling: 
     if not profiling or mamba_chunk_size <= 0:
         return tokens
     return -(-tokens // mamba_chunk_size) * mamba_chunk_size
+
+
+def profile_blocks_scattered(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """VLLM_PROFILE_BLOCKS: 'repeat' (default) gives every dummy block id 0, so the paged-attention KV gather
+    re-reads one cached block; 'scatter' gives each dummy request its own blocks spread over the KV pool."""
+    environ = os.environ if environ is None else environ
+    mode = (environ.get('VLLM_PROFILE_BLOCKS') or 'repeat').strip().lower()
+    if mode not in ('repeat', 'scatter'):
+        raise ValueError(f"VLLM_PROFILE_BLOCKS must be 'repeat' or 'scatter', got {mode!r}")
+    return mode == 'scatter'
+
+
+def pad_owner_block(pad_kernel_block: int, kernel_block_size: int, block_size: int) -> int:
+    """Scheduler block (``block_size`` tokens) containing the decode pad kernel block, which padded batch slots
+    write to; dummy requests must not own it."""
+    return pad_kernel_block * kernel_block_size // block_size
+
+
+class ScatteredBlockAllocator:
+    """Distinct scheduler block ids for the dummy requests of the profile mode.
+
+    Every KV cache group draws from its own fixed random permutation of ``[1, num_blocks)`` (block 0 is vLLM's
+    null block) minus ``exclude``, so a request's blocks are scattered over the pool like after a long serve.
+    Ids repeat only when a group's pool is exhausted; ``wrapped`` tells whether that happened.
+    """
+
+    def __init__(self, num_blocks: int, exclude: Iterable[int] = (), seed: int = 0):
+        excluded = set(exclude)
+        self._base = [b for b in range(1, num_blocks) if b not in excluded]
+        if not self._base:
+            raise ValueError(f"no block left for dummy requests (num_blocks={num_blocks}, exclude={sorted(excluded)})")
+        self._seed = seed
+        self._pools: dict[int, list[int]] = {}
+        self._used: dict[int, int] = {}
+        self.wrapped = False
+
+    @property
+    def pool_size(self) -> int:
+        return len(self._base)
+
+    def take(self, group: int, n: int) -> list[int]:
+        pool = self._pools.get(group)
+        if pool is None:
+            pool = self._pools[group] = list(self._base)
+            random.Random(self._seed + group).shuffle(pool)
+        used = self._used.get(group, 0)
+        self._used[group] = used + n
+        self.wrapped = self.wrapped or used + n > len(pool)
+        return [pool[(used + i) % len(pool)] for i in range(n)]
+
+
+# SamplingParams fields VLLM_PROFILE_SAMPLING may set (a generation config may also carry e.g. max_tokens).
+_SAMPLING_FIELDS = {
+    'temperature': float,
+    'top_p': float,
+    'top_k': int,
+    'min_p': float,
+    'repetition_penalty': float,
+    'presence_penalty': float,
+    'frequency_penalty': float,
+}
+
+
+def profile_sampling_kwargs(spec: Optional[str], model_defaults: Optional[Mapping] = None) -> Optional[dict]:
+    """SamplingParams kwargs for the dummy requests from VLLM_PROFILE_SAMPLING (None = unset: greedy as before).
+
+    'default' takes the model's generation-config defaults (``model_defaults``) on top of the SamplingParams
+    defaults (temperature 1.0, no top-k/top-p), i.e. what a request without sampling fields gets; ``vllm bench
+    serve`` no longer sends temperature 0. 'key=value' items set fields explicitly and combine with 'default',
+    e.g. 'default,top_p=0.95' or 'temperature=0.7,top_k=50'.
+    """
+    if spec is None or not spec.strip():
+        return None
+    kwargs: dict = {}
+    for item in (s.strip() for s in spec.split(',')):
+        if not item:
+            continue
+        if item == 'default':
+            defaults = model_defaults or {}
+            kwargs.update({k: _SAMPLING_FIELDS[k](v) for k, v in defaults.items() if k in _SAMPLING_FIELDS})
+            continue
+        key, sep, value = item.partition('=')
+        key = key.strip()
+        if not sep or key not in _SAMPLING_FIELDS:
+            raise ValueError(f"VLLM_PROFILE_SAMPLING item {item!r}: expected 'default' or one of "
+                             f"{sorted(_SAMPLING_FIELDS)} as key=value")
+        kwargs[key] = _SAMPLING_FIELDS[key](value.strip())
+    return kwargs
 
 
 # Paths of the traces written by make_trace_handler in this process (logged by hold_before_exit).
