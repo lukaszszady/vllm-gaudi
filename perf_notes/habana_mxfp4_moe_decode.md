@@ -118,6 +118,50 @@ Fewer per-expert costs would shrink this wait as well.
    decode: does `chunk_size` change the number of GEMM waves, and is there a dynamic variant that skips
    empty experts?
 
+## Responsible component
+
+### Evidence
+
+This is from the rank 0 trace of one decode step, 92 MoE calls. The `EventName` path of every device event
+encodes the graph node it belongs to.
+
+- **One call is one bridge node.** All kernels of a call are in one recipe execution, with a single
+  `recipeId`, e.g. 6421 kernels in recipe 58528. The same recipe also holds the gate linear and
+  `routed_input_transform`.
+- **The node path shows the expansion.** Paths look like
+  `.../routed_experts/moe_op/mixture_of_experts/moe_bf16/<n>_complex/<kernel>`:
+  - the bridge emits one node with GUID `moe_bf16`, used for the MXFP4 variant as well;
+  - the graph compiler extracts it as a complex GUID (`<n>_complex`);
+  - a graph compiler MoE pass then slices it into `MOE/layer_0/chunk_0` .. `chunk_55`, one chunk per local
+    expert;
+  - each chunk has its own `lb_bundle_<n>` (LayeredBrain bundle).
+- **No host activity per expert.** The only host events that overlap the device execution are
+  `synchronizeEvent` / `synchronizeAllStreams`. The whole graph is one launch.
+- **Inactive experts are already half skipped.** Per chunk:
+
+  | Chunk | Count | GEMMs | Mean GEMM | Chunk span | `cast_packed_mxfp4_to_bf16` | `memcpy_u8` |
+  |---|---|---|---|---|---|---|
+  | Inactive | 4325 | 16 | 0.97 µs | 11.7 µs | 0 | 0 |
+  | Active | 827 | 16 | 11.8 µs | 132 µs | 384 | 118 |
+
+  So the runtime drops the TPC work of an expert with zero tokens, but still issues its MME work, two waves of
+  8 GEMMs.
+- **Some per-expert work sits outside the chunks.** `router_stage3_bf16` x56 and `weighted_sum_reduction_bf16`
+  x56 are outside the `MOE/...` chunks, at the complex GUID level.
+
+### Target per request
+
+| Request | Component | Why | Confidence |
+|---|---|---|---|
+| 1. Skip inactive experts | Graph compiler MoE slicing pass and MME dynamic-shape handling; complex GUID `moe_bf16` for `router_stage3` / `weighted_sum_reduction` | Zero-token chunks already lose their TPC kernels but keep 16 near-empty GEMMs; the per-expert reduction nodes come from the complex GUID decomposition | high that it is in Synapse, not the bridge; medium on the GC vs complex-GUID split |
+| 2. Lower per-wave overhead | Graph compiler scheduling (LayeredBrain bundles per chunk, MME descriptor/sync per wave) | Waves are serialized inside one recipe with no host involvement | medium |
+| 3a. Dequant inside the GEMM | Graph compiler (MME/TPC fusion), possibly MME capability | The cast is a separate TPC node per expert slice feeding the GEMM | medium |
+| 3b. Faster cast | TPC kernel library (`cast_packed_mxfp4_to_bf16_*_optimized`) | 384 launches per expert at ~1.6 TB/s | high |
+| 4. Document `chunk_size` / `total_experts` | PyTorch bridge op schema (`torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights`), plus the owner of the `moe_bf16` complex GUID | The bridge maps the arguments to node parameters | high |
+
+The PyTorch bridge does not expand the op, so changes there alone cannot help. The `habana_frameworks` source of
+the op registration is not visible from the logs or traces, so its file location is not cited here.
+
 ## Reproduction
 
 Profiling is done with the vllm-gaudi dummy-batch profiler:
