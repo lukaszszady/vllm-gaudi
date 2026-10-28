@@ -28,8 +28,6 @@ if TYPE_CHECKING:
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
-
-
 # begin-env-vars-definition
 environment_variables: dict[str, Callable[[], Any]] = {
     # Contiguous cache fetching to avoid using costly gather operation on
