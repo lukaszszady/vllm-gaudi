@@ -984,16 +984,6 @@ def _optional_runner_absent(exc: BaseException, mod_name: str, cls_name: str) ->
     return (isinstance(exc, ModuleNotFoundError) and exc.name == mod_name) or isinstance(exc, AttributeError)
 
 
-def _retry_failed_kimi_patches() -> None:
-    """Retry the patches that failed only because vllm was partially imported at the time.
-
-    By the time the report runs the model exists, so every vllm module it needs is fully imported; nothing else
-    retries after that point. Patches that are installed already return early.
-    """
-    if any(name.startswith("moe_runner_delegation") for name in _KIMI_PATCHES_FAILED):
-        _patch_moe_runner_delegation()
-
-
 def report_kimi_patches(model) -> None:
     """Log the Kimi-K3 patch status once per process, after the model has been built.
 
@@ -1006,7 +996,6 @@ def report_kimi_patches(model) -> None:
     if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_model(model):
         return
     _KIMI_PATCHES_REPORTED = True
-    _retry_failed_kimi_patches()
     _kimi_patches_log_installed()
     _kimi_patches_log_failed()
 
@@ -1017,7 +1006,6 @@ def report_kimi_patches_on_load_failure(model_config) -> None:
     if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_config(model_config):
         return
     _KIMI_PATCHES_REPORTED = True
-    _retry_failed_kimi_patches()
     _kimi_patches_log_failed()
 
 
@@ -1173,6 +1161,12 @@ def _patch_moe_runner_delegation() -> None:
             mod = __import__(mod_name, fromlist=[cls_name])
             cls = getattr(mod, cls_name)
             if getattr(cls, "_patched_delegation", False):
+                # Already patched, on this class or (ROCmLatentMoERunner subclasses MoERunner) on a base class that
+                # the lookup reaches by inheritance: covered. Record it so that it clears an earlier failed attempt.
+                _kimi_patch_installed(f"moe_runner_delegation[{cls_name}]")
+                if "_patched_delegation" not in vars(cls):
+                    _kimi_patch_logger().debug("Kimi-K3 patch 'moe_runner_delegation[%s]' is covered by a base class",
+                                               cls_name)
                 continue
             orig_getattr = getattr(cls, "__getattr__", None)
 

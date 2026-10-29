@@ -270,33 +270,61 @@ def test_a_patch_warned_by_the_config_report_is_not_warned_again_by_the_model_re
     assert len(caplog.records) == 1
 
 
-def test_a_delegation_patch_that_failed_early_is_retried_before_the_report(patches, monkeypatch, caplog):
-    name = "moe_runner_delegation[ROCmLatentMoERunner]"
-    patches._kimi_patch_failed(name)
-    calls = []
+def _delegation_modules(monkeypatch):
+    """Real hierarchy: ROCmLatentMoERunner subclasses MoERunner, like in upstream vllm."""
 
-    def retry():
-        calls.append(1)
-        patches._kimi_patch_installed(name)
+    class MoERunner:
+        pass
 
-    monkeypatch.setattr(patches, "_patch_moe_runner_delegation", retry)
+    class ROCmLatentMoERunner(MoERunner):
+        pass
+
+    names = {
+        "vllm.model_executor.layers.fused_moe.runner.moe_runner": ("MoERunner", MoERunner),
+        "vllm.models.kimi_k3.amd.latent_moe_runner": ("ROCmLatentMoERunner", ROCmLatentMoERunner),
+    }
+    for mod_name, (cls_name, cls) in names.items():
+        mod = types.ModuleType(mod_name)
+        setattr(mod, cls_name, cls)
+        monkeypatch.setitem(sys.modules, mod_name, mod)
+    return MoERunner, ROCmLatentMoERunner
+
+
+def test_delegation_covered_by_a_patched_base_clears_an_earlier_circular_import_failure(patches, monkeypatch, caplog):
+    base, sub = _delegation_modules(monkeypatch)
+    latent = "vllm.models.kimi_k3.amd.latent_moe_runner"
+    saved = sys.modules[latent]
+
+    class _PartiallyInitialised(types.ModuleType):
+        """First attempt: vllm is still importing, so the ROCm module raises a circular ImportError."""
+
+        def __getattr__(self, name):
+            raise ImportError(f"cannot import name {name!r} from partially initialized module 'vllm.utils.torch_utils'")
+
+    monkeypatch.setitem(sys.modules, latent, _PartiallyInitialised(latent))
+    patches._patch_moe_runner_delegation()
+    assert "moe_runner_delegation[ROCmLatentMoERunner]" in patches._KIMI_PATCHES_FAILED
+    assert "moe_runner_delegation[MoERunner]" in patches._KIMI_PATCHES_INSTALLED
+
+    # second attempt: the module imports; the base is patched already, the subclass gets it by inheritance
+    monkeypatch.setitem(sys.modules, latent, saved)
+    patches._patch_moe_runner_delegation()
+    assert "_patched_delegation" not in vars(sub) and "__getattr__" not in vars(sub)
+    assert "moe_runner_delegation[ROCmLatentMoERunner]" in patches._KIMI_PATCHES_INSTALLED
+    assert not patches._KIMI_PATCHES_FAILED
+
     with caplog.at_level(logging.INFO, logger=LOGGER):
         patches.report_kimi_patches(_model("vllm.models.kimi_k3.amd.model"))
-    assert calls == [1]
     assert [r.levelno for r in caplog.records] == [logging.INFO]
+    assert "moe_runner_delegation[ROCmLatentMoERunner]" in caplog.records[0].getMessage()
 
 
-def test_a_delegation_patch_that_still_fails_after_the_retry_warns_once(patches, monkeypatch, caplog):
-    patches._kimi_patch_failed("moe_runner_delegation[ROCmLatentMoERunner]")
-    monkeypatch.setattr(patches, "_patch_moe_runner_delegation", lambda: None)
-    with caplog.at_level(logging.INFO, logger=LOGGER):
-        patches.report_kimi_patches(_model("vllm.models.kimi_k3.amd.model"))
-    assert [r.levelno for r in caplog.records] == [logging.INFO, logging.WARNING]
-
-
-def test_no_retry_when_nothing_failed(patches, monkeypatch):
-    monkeypatch.setattr(patches, "_patch_moe_runner_delegation", lambda: pytest.fail("retried"))
-    patches.report_kimi_patches(_model("vllm.models.kimi_k3.amd.model"))
+def test_delegation_works_through_inheritance(patches, monkeypatch):
+    base, sub = _delegation_modules(monkeypatch)
+    patches._patch_moe_runner_delegation()
+    runner = sub()
+    runner.routed_experts = types.SimpleNamespace(num_experts=7)
+    assert runner.num_experts == 7
 
 
 def _record(name, msg, level=logging.WARNING):
