@@ -282,8 +282,8 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
                     _dropper.submit(files[next_drop], batch)
                     next_drop += 1
                 if started % _LOG_EVERY_SHARDS == 0:
-                    logger.info("Weight page cache: %d/%d shards loaded (%d drops pending): %s", started, len(files),
-                                batch.pending, host_memory_line())
+                    logger.debug("Weight page cache: %d/%d shards loaded (%d drops pending): %s", started, len(files),
+                                 batch.pending, host_memory_line())
         finally:
             # Also runs when loading stops early, so no opened shard stays cached because of this process.
             for st_file in files[next_drop:started]:

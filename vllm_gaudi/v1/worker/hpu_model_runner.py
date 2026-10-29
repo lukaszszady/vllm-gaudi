@@ -857,8 +857,8 @@ def maybe_tag_kda_cache_groups(model, kv_cache_config: KVCacheConfig):
                                                        lambda gid: torch.tensor(gid, dtype=torch.long, device="hpu"))
     if not (tagged or untagged):
         return
-    logger.info("KDA cache groups: tagged %d layers (per group: %s)", sum(tagged.values()),
-                dict(sorted(tagged.items())))
+    logger.debug("KDA cache groups: tagged %d layers (per group: %s)", sum(tagged.values()),
+                 dict(sorted(tagged.items())))
     if untagged:
         logger.warning("KDA modules without a mamba cache group (%d): %s", len(untagged), untagged[:8])
     if unmatched:

@@ -934,7 +934,12 @@ def _kimi_patch_installed(name: str) -> None:
 
 
 def _kimi_patches_log_installed() -> None:
-    _kimi_patch_logger().info("Kimi-K3 patches installed: %s", ", ".join(_KIMI_PATCHES_INSTALLED))
+    # The effective SiTU implementation is part of this line (not a separate one): accuracy triage needs to know
+    # whether the routed experts ran exact SiTU or the approximate silu alias.
+    import vllm_gaudi.envs as gaudi_envs
+    from vllm_gaudi.ops.hpu_situ_moe import situ_impl_or_exact
+    _kimi_patch_logger().info("Kimi-K3 patches installed: %s; situ_impl=%s", ", ".join(_KIMI_PATCHES_INSTALLED),
+                              situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL))
 
 
 def _kimi_patches_log_failed() -> None:
@@ -1115,7 +1120,7 @@ def _patch_latent_moe_runner_forward() -> None:
 
     logger = init_logger()
     if not gaudi_envs.HPU_INLINE_MOE_ENTRY:
-        logger.info("Kimi-K3 latent MoE runner patch skipped because HPU_INLINE_MOE_ENTRY=0")
+        logger.debug("Kimi-K3 latent MoE runner patch skipped because HPU_INLINE_MOE_ENTRY=0")
         return
     try:
         from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
@@ -1138,12 +1143,12 @@ def _patch_latent_moe_runner_forward() -> None:
 
     ROCmLatentMoERunner._fused_forward = _hpu_fused_forward
     ROCmLatentMoERunner._patched_hpu_fused_forward = True
-    logger.info("Patched %s._fused_forward with the inline HPU MoE path, pid %d", ROCmLatentMoERunner.__name__,
-                os.getpid())
+    logger.debug("Patched %s._fused_forward with the inline HPU MoE path, pid %d", ROCmLatentMoERunner.__name__,
+                 os.getpid())
 
 
 def _configure_situ_aliases() -> str:
-    """Validate HPU_KIMI_SITU_IMPL, log the approximation warning and return the effective implementation.
+    """Validate HPU_KIMI_SITU_IMPL and return the effective implementation (debug note for "silu").
 
     SiTU (Kimi-K3 routed experts): the fused Habana op only knows silu/gelu. "exact" (default) computes the
     experts unfused (ops/hpu_situ_moe.py); "silu" maps "situ" to silu in the activation normalizers
@@ -1157,8 +1162,8 @@ def _configure_situ_aliases() -> str:
 
     situ_impl = situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL, _ext_logger().error)
     if situ_impl == "silu":
-        _ext_logger().warning("HPU_KIMI_SITU_IMPL=silu: the Kimi-K3 routed experts use silu instead of SiTU "
-                              "(beta*tanh(gate/beta)*sigmoid(gate)*up); model outputs are APPROXIMATE")
+        _ext_logger().debug("HPU_KIMI_SITU_IMPL=silu: the Kimi-K3 routed experts use silu instead of SiTU "
+                            "(beta*tanh(gate/beta)*sigmoid(gate)*up); model outputs are APPROXIMATE")
     return situ_impl
 
 

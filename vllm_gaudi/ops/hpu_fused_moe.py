@@ -899,8 +899,8 @@ def prime_moe_runners_for_compile(model: torch.nn.Module) -> int:
             logged_tail = True
         primed += 1
     if logged_tail:
-        logger.info("Kimi-K3 latent-MoE tail: up-projecting only this rank's hidden shard into the shared output.")
-    logger.info("Primed %d MoE runners for torch.compile, pid %d", primed, os.getpid())
+        logger.debug("Kimi-K3 latent-MoE tail: up-projecting only this rank's hidden shard into the shared output.")
+    logger.debug("Primed %d MoE runners for torch.compile, pid %d", primed, os.getpid())
     return primed
 
 

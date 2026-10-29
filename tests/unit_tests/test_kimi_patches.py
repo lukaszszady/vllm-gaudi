@@ -122,10 +122,20 @@ def test_an_outer_level_failure_cleared_by_the_final_attempt_does_not_warn(patch
     assert {"attn_res_op", "attn_res_linear"} <= set(patches._KIMI_PATCHES_INSTALLED)
 
 
-def test_installed_patches_are_listed_in_one_info_line(patches, caplog):
+def test_installed_patches_are_listed_in_one_info_line(patches, caplog, monkeypatch):
+    monkeypatch.delenv("HPU_KIMI_SITU_IMPL", raising=False)
     patches._kimi_patch_installed("a")
     patches._kimi_patch_installed("b")
     patches._kimi_patch_installed("a")
     with caplog.at_level(logging.INFO, logger=LOGGER):
         patches._kimi_patches_log_installed()
-    assert [r.getMessage() for r in caplog.records] == ["Kimi-K3 patches installed: a, b"]
+    assert [r.getMessage() for r in caplog.records] == ["Kimi-K3 patches installed: a, b; situ_impl=exact"]
+
+
+@pytest.mark.parametrize("value, expected", [("silu", "silu"), ("SiLU", "silu"), ("bogus", "exact")])
+def test_installed_summary_reports_effective_situ_impl(patches, caplog, monkeypatch, value, expected):
+    monkeypatch.setenv("HPU_KIMI_SITU_IMPL", value)
+    patches._kimi_patch_installed("a")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches._kimi_patches_log_installed()
+    assert [r.getMessage() for r in caplog.records] == [f"Kimi-K3 patches installed: a; situ_impl={expected}"]
