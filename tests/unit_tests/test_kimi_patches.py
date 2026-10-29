@@ -61,15 +61,65 @@ def test_linear_weights_patch_installs_once_and_leaves_the_decoder_layer_alone(p
     assert caplog.records == []
 
 
-def test_a_failing_patch_logs_a_warning_with_traceback(patches, monkeypatch, caplog):
-    # no vllm.models.kimi_k3 at all: the import inside the helper fails
+def test_a_failed_attempt_is_logged_at_debug_only(patches, monkeypatch, caplog):
+    # no vllm.models.kimi_k3 at all: the import inside the helper fails (like a circular import in an early attempt)
     monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.linear", None)
-    with caplog.at_level(logging.WARNING, logger=LOGGER):
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
         patches._patch_kimi_linear_weights()
     (record, ) = caplog.records
-    assert record.name == LOGGER and record.levelno == logging.WARNING
+    assert record.name == LOGGER and record.levelno == logging.DEBUG
     assert "linear_weights" in record.getMessage() and record.exc_info is not None
     assert "linear_weights" not in patches._KIMI_PATCHES_INSTALLED
+
+
+def test_a_patch_still_missing_after_the_final_attempt_warns_once_without_traceback(patches, monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.linear", None)
+    patches._patch_kimi_linear_weights()  # first attempt
+    patches._patch_kimi_linear_weights()  # final attempt
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        patches._kimi_patches_log_failed()
+    (record, ) = caplog.records
+    assert record.levelno == logging.WARNING and record.exc_info is None
+    assert "'linear_weights' was not installed" in record.getMessage()
+
+
+def test_a_patch_that_succeeds_in_the_final_attempt_does_not_warn(patches, monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.linear", None)
+    patches._patch_kimi_linear_weights()  # first attempt: circular import
+    _stub_linear(monkeypatch)
+    patches._patch_kimi_linear_weights()  # final attempt
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        patches._kimi_patches_log_failed()
+    assert caplog.records == []
+    assert "linear_weights" in patches._KIMI_PATCHES_INSTALLED
+
+
+def test_a_patch_without_an_installed_marker_is_cleared_by_ok(patches, caplog):
+    patches._KIMI_PATCHES_FAILED["hybrid_config"] = "ImportError: x"
+    patches._kimi_patch_ok("hybrid_config")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        patches._kimi_patches_log_failed()
+    assert caplog.records == [] and "hybrid_config" not in patches._KIMI_PATCHES_INSTALLED
+
+
+def test_an_outer_level_failure_cleared_by_the_final_attempt_does_not_warn(patches, monkeypatch, caplog):
+    attn_res = types.ModuleType("vllm_gaudi.ops.hpu_kda_pytorch")
+    attn_res.attn_res_torch = lambda *args, **kwargs: None
+    # first attempt: the outermost import of _patch_kimi_attn_res fails
+    monkeypatch.setitem(sys.modules, "vllm_gaudi.ops.hpu_kda_pytorch", None)
+    patches._patch_kimi_attn_res()
+    assert "attn_res" in patches._KIMI_PATCHES_FAILED
+    # final attempt: it imports; the inner upstream modules are missing, which is recorded under their own names
+    monkeypatch.setitem(sys.modules, "vllm_gaudi.ops.hpu_kda_pytorch", attn_res)
+    for name in ("vllm.models.kimi_k3.amd.ops.attn_res", "vllm.models.kimi_k3.amd.linear"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    for name in ("vllm.models", "vllm.models.kimi_k3", "vllm.models.kimi_k3.amd", "vllm.models.kimi_k3.amd.ops"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    patches._patch_kimi_attn_res()
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        patches._kimi_patches_log_failed()
+    assert caplog.records == []
+    assert {"attn_res_op", "attn_res_linear"} <= set(patches._KIMI_PATCHES_INSTALLED)
 
 
 def test_installed_patches_are_listed_in_one_info_line(patches, caplog):

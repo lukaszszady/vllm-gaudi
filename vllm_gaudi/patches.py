@@ -900,6 +900,7 @@ def _patch_triton_for_hpu() -> None:
 
 
 _KIMI_PATCHES_INSTALLED: list[str] = []
+_KIMI_PATCHES_FAILED: dict[str, str] = {}
 
 
 def _kimi_patch_logger():
@@ -909,17 +910,37 @@ def _kimi_patch_logger():
 
 
 def _kimi_patch_failed(name: str) -> None:
-    """Call from an ``except`` block: report the failed Kimi-K3 patch with its traceback instead of hiding it."""
-    _kimi_patch_logger().warning("Kimi-K3 patch '%s' was not installed", name, exc_info=True)
+    """Call from an ``except`` block: remember the failed Kimi-K3 patch.
+
+    The patches are installed in several attempts (plugin apply, then ``load_general_plugins``) and early attempts
+    legitimately hit partially initialised vllm modules, so a failure is only logged at DEBUG (with traceback).
+    ``_kimi_patches_log_failed`` warns about the patches that are still missing after the final attempt.
+    """
+    import sys
+    exc = sys.exc_info()[1]
+    _KIMI_PATCHES_FAILED[name] = f"{type(exc).__name__}: {exc}" if exc is not None else "unknown error"
+    _kimi_patch_logger().debug("Kimi-K3 patch '%s' failed in this attempt", name, exc_info=True)
+
+
+def _kimi_patch_ok(name: str) -> None:
+    """Clear an earlier failure of a patch that is not listed in the 'installed' summary."""
+    _KIMI_PATCHES_FAILED.pop(name, None)
 
 
 def _kimi_patch_installed(name: str) -> None:
+    _kimi_patch_ok(name)
     if name not in _KIMI_PATCHES_INSTALLED:
         _KIMI_PATCHES_INSTALLED.append(name)
 
 
 def _kimi_patches_log_installed() -> None:
     _kimi_patch_logger().info("Kimi-K3 patches installed: %s", ", ".join(_KIMI_PATCHES_INSTALLED))
+
+
+def _kimi_patches_log_failed() -> None:
+    """Call after the final install attempt: one WARNING (no traceback) per patch that is still missing."""
+    for name, reason in _KIMI_PATCHES_FAILED.items():
+        _kimi_patch_logger().warning("Kimi-K3 patch '%s' was not installed (%s)", name, reason)
 
 
 def _patch_rocm_platform_for_hpu() -> None:
@@ -957,22 +978,13 @@ def _patch_rocm_platform_for_hpu() -> None:
         rmod._ON_CDNA = False
         rmod._ON_RDNA = False
         rmod.RocmPlatform = type("RocmPlatform", (), {})
+        _kimi_patch_ok("rocm_platform_stub")
     except Exception:
         _kimi_patch_failed("rocm_platform_stub")
 
 
 def _patch_kimi_kda() -> None:
     """Pure PyTorch fallback for KDA on HPU (disabling GPU Triton kernels and dict metadata assertion)."""
-    try:
-        import vllm.models.kimi_k3.amd.ops.kda_decode as _kda_decode
-        _kda_decode.is_fused_kda_decode_supported = lambda *args, **kwargs: False
-    except Exception:
-        _kimi_patch_failed("kda_decode_support")
-    try:
-        import vllm.models.kimi_k3.amd.ops.kda_chunk as _kda_chunk
-        _kda_chunk.is_fused_kda_chunk_supported = lambda *args, **kwargs: False
-    except Exception:
-        _kimi_patch_failed("kda_chunk_support")
     try:
         import vllm.models.kimi_k3.amd.kda as _amd_kda
         _amd_kda.is_fused_kda_decode_supported = lambda *args, **kwargs: False
@@ -1022,6 +1034,7 @@ def _patch_mla_prefill_selector() -> None:
         try:
             import vllm.model_executor.layers.attention.mla_attention as mla_mod
             mla_mod.get_mla_prefill_backend = hpu_get_prefill
+            _kimi_patch_ok("mla_prefill_selector_attention_module")
         except Exception:
             _kimi_patch_failed("mla_prefill_selector_attention_module")
         _kimi_patch_installed("mla_prefill_selector")
@@ -1051,6 +1064,7 @@ def _patch_kimi_k3_hybrid_config() -> None:
                         self.hf_config.text_config.layer_types = l_types
 
             ModelConfig.__post_init__ = _hpu_post_init
+        _kimi_patch_ok("hybrid_config")
     except Exception:
         _kimi_patch_failed("hybrid_config")
 
@@ -1101,7 +1115,7 @@ def _patch_latent_moe_runner_forward() -> None:
 
     logger = init_logger()
     if not gaudi_envs.HPU_INLINE_MOE_ENTRY:
-        logger.info("Kimi-K3 latent MoE runner patch skipped because HPU_INLINE_MOE_ENTRY=0")
+        logger.debug("Kimi-K3 latent MoE runner patch skipped because HPU_INLINE_MOE_ENTRY=0")
         return
     try:
         from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
@@ -1124,12 +1138,12 @@ def _patch_latent_moe_runner_forward() -> None:
 
     ROCmLatentMoERunner._fused_forward = _hpu_fused_forward
     ROCmLatentMoERunner._patched_hpu_fused_forward = True
-    logger.info("Patched %s._fused_forward with the inline HPU MoE path, pid %d", ROCmLatentMoERunner.__name__,
-                os.getpid())
+    logger.debug("Patched %s._fused_forward with the inline HPU MoE path, pid %d", ROCmLatentMoERunner.__name__,
+                 os.getpid())
 
 
 def _configure_situ_aliases() -> str:
-    """Validate HPU_KIMI_SITU_IMPL, log the approximation warning and return the effective implementation.
+    """Validate HPU_KIMI_SITU_IMPL and return the effective implementation (debug note for "silu").
 
     SiTU (Kimi-K3 routed experts): the fused Habana op only knows silu/gelu. "exact" (default) computes the
     experts unfused (ops/hpu_situ_moe.py); "silu" maps "situ" to silu in the activation normalizers
@@ -1143,8 +1157,8 @@ def _configure_situ_aliases() -> str:
 
     situ_impl = situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL, _ext_logger().error)
     if situ_impl == "silu":
-        _ext_logger().warning("HPU_KIMI_SITU_IMPL=silu: the Kimi-K3 routed experts use silu instead of SiTU "
-                              "(beta*tanh(gate/beta)*sigmoid(gate)*up); model outputs are APPROXIMATE")
+        _ext_logger().debug("HPU_KIMI_SITU_IMPL=silu: the Kimi-K3 routed experts use silu instead of SiTU "
+                            "(beta*tanh(gate/beta)*sigmoid(gate)*up); model outputs are APPROXIMATE")
     return situ_impl
 
 
@@ -1227,6 +1241,7 @@ def _patch_kimi_attn_res() -> None:
             _kimi_patch_installed("attn_res_linear")
         except Exception:
             _kimi_patch_failed("attn_res_linear")
+        _kimi_patch_ok("attn_res")
     except Exception:
         _kimi_patch_failed("attn_res")
 
@@ -1317,6 +1332,7 @@ def _patch_kimi_k3_arch() -> None:
             _amd_linear.KimiMoE.forward = _safe_moe_forward
             _amd_linear.KimiMoE._patched_moe_2d = True
         _kimi_patch_installed("kimi_moe_2d")
+        _kimi_patch_ok("k3_arch")
         _kimi_patches_log_installed()
     except Exception:
         _kimi_patch_failed("k3_arch")
@@ -1474,6 +1490,7 @@ def _patch_compressed_tensors_mxfp4() -> None:
                 return (None, None)
 
             oracle_mod.select_deepseek_v4_mxfp4_moe_backend = hpu_select_backend
+            _kimi_patch_ok("compressed_tensors_mxfp4_oracle")
         except Exception:
             _kimi_patch_failed("compressed_tensors_mxfp4_oracle")
         _kimi_patch_installed("compressed_tensors_mxfp4")
@@ -1561,6 +1578,7 @@ def apply() -> None:
         _patch_kimi_k3_arch()
         _patch_compressed_tensors_mxfp4()
         _kimi_patches_log_installed()
+        _kimi_patches_log_failed()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 
