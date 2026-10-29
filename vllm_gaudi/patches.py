@@ -934,12 +934,7 @@ def _kimi_patch_installed(name: str) -> None:
 
 
 def _kimi_patches_log_installed() -> None:
-    # The effective SiTU implementation is part of this line (not a separate one): accuracy triage needs to know
-    # whether the routed experts ran exact SiTU or the approximate silu alias.
-    import vllm_gaudi.envs as gaudi_envs
-    from vllm_gaudi.ops.hpu_situ_moe import situ_impl_or_exact
-    _kimi_patch_logger().info("Kimi-K3 patches installed: %s; situ_impl=%s", ", ".join(_KIMI_PATCHES_INSTALLED),
-                              situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL))
+    _kimi_patch_logger().info("Kimi-K3 patches installed: %s", ", ".join(_KIMI_PATCHES_INSTALLED))
 
 
 def _kimi_patches_log_failed() -> None:
