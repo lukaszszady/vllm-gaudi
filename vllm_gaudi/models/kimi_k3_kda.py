@@ -10,7 +10,6 @@ Prefix caching (per-block mamba state caching) and speculative decoding are not 
 read from and written to a single slot per request.
 """
 
-import functools
 
 import torch
 
@@ -88,12 +87,18 @@ def run_with_deferred_kda_state(model, forward, *args, **kwargs):
     return out
 
 
-@functools.cache
-@torch.compiler.assume_constant_result  # dynamo ignores lru_cache and would trace the env import (graph break)
+_PREFILL_SETTINGS: list[tuple[int, int]] = []
+
+
+# Not functools.cache: dynamo ignores the wrapper, warns about it, and traces the body (env import = graph break).
+# assume_constant_result makes dynamo call the function at trace time and treat the result as a constant.
+@torch.compiler.assume_constant_result
 def _prefill_settings() -> tuple[int, int]:
     """HPU_KIMI_KDA_CHUNK_SIZE, HPU_KIMI_KDA_VEC_CHUNKS; read once."""
-    import vllm_gaudi.envs as gaudi_envs
-    return gaudi_envs.HPU_KIMI_KDA_CHUNK_SIZE, gaudi_envs.HPU_KIMI_KDA_VEC_CHUNKS
+    if not _PREFILL_SETTINGS:
+        import vllm_gaudi.envs as gaudi_envs
+        _PREFILL_SETTINGS.append((gaudi_envs.HPU_KIMI_KDA_CHUNK_SIZE, gaudi_envs.HPU_KIMI_KDA_VEC_CHUNKS))
+    return _PREFILL_SETTINGS[0]
 
 
 def _state_indices(self, attn_metadata) -> torch.Tensor:

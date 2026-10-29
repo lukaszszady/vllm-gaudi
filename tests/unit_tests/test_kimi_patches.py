@@ -268,3 +268,19 @@ def test_a_patch_warned_by_the_config_report_is_not_warned_again_by_the_model_re
         patches._report_kimi_config_patches(_Cfg("KimiK3ForConditionalGeneration"))
         patches.report_kimi_patches(_model("vllm.models.kimi_k3.model"))
     assert len(caplog.records) == 1
+
+
+def _record(name, msg, level=logging.WARNING):
+    return logging.LogRecord(name, level, __file__, 1, msg, None, None)
+
+
+def test_remote_tokenizer_notice_is_dropped_but_other_messages_are_kept(patches, monkeypatch):
+    handler = logging.StreamHandler()
+    monkeypatch.setattr(logging, "lastResort", handler)
+    patches._silence_remote_tokenizer_notice()
+    patches._silence_remote_tokenizer_notice()  # idempotent
+    assert len(handler.filters) == 1
+    notice = "transformers_modules.moonshotai.tokenization_kimi"
+    assert not handler.filter(_record(notice, "Calling super().encode with {'x': 1}"))
+    assert handler.filter(_record(notice, "Something else went wrong"))
+    assert handler.filter(_record("vllm.engine", "Calling super().encode with {'x': 1}"))

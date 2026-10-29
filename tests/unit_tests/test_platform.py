@@ -386,3 +386,17 @@ def test_check_and_update_config_does_not_rescale_granitemoehybrid_mamba_page_si
         f"granitemoehybrid models. Expected {CORRECT_MAMBA_PAGE_SIZE_PADDED}, "
         f"got {cache_config.mamba_page_size_padded} "
         f"(would be {CORRUPTED_MAMBA_PAGE_SIZE_PADDED} if rescaled with block_size=128).")
+
+
+def test_validate_environ_accepts_vllm_gaudi_flags(monkeypatch):
+    """VLLM_* flags read by vllm-gaudi must not be reported as unknown."""
+    for name in HpuPlatform.gaudi_env_vars:
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("VLLM_NOT_A_REAL_FLAG", "1")
+    with patch("vllm_gaudi.platform.logger") as log:
+        HpuPlatform.validate_environ(hard_fail=False)
+    warned = [c.args[1] for c in log.warning.call_args_list]
+    assert "VLLM_NOT_A_REAL_FLAG" in warned
+    assert not set(HpuPlatform.gaudi_env_vars) & set(warned)
+    with pytest.raises(ValueError, match="VLLM_NOT_A_REAL_FLAG"):
+        HpuPlatform.validate_environ(hard_fail=True)

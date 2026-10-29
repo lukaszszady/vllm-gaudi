@@ -1606,8 +1606,31 @@ def _patch_inc_quantization_config() -> None:
     register_quantization_config("inc")(_FakeINCConfig)
 
 
+class _RemoteTokenizerNoticeFilter:
+    """Drop the 'Calling super().encode with ...' notice of the Kimi remote tokenizer (tokenization_kimi.py).
+
+    The remote module logs through a ``transformers_modules.*`` logger that has no handler, so the record reaches
+    ``logging.lastResort`` (stderr) once per tokenization. Only this message of that namespace is dropped.
+    """
+
+    _PREFIX = "Calling super().encode with"
+
+    def filter(self, record) -> bool:
+        if record.name.startswith("transformers_modules"):
+            return not str(record.getMessage()).startswith(self._PREFIX)
+        return True
+
+
+def _silence_remote_tokenizer_notice() -> None:
+    import logging
+    handler = logging.lastResort
+    if handler is not None and not any(isinstance(f, _RemoteTokenizerNoticeFilter) for f in handler.filters):
+        handler.addFilter(_RemoteTokenizerNoticeFilter())
+
+
 def apply() -> None:
     """Install all HPU runtime monkey-patches."""
+    _silence_remote_tokenizer_notice()
     # --- torch.accelerator.empty_cache ---
     torch.accelerator.empty_cache = _hpu_accelerator_empty_cache
 
