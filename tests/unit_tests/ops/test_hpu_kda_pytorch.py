@@ -1510,17 +1510,19 @@ def test_chunked_vec_layer_forward_graph_inputs_after_the_break_are_dense(monkey
 
 def test_prefill_settings_come_from_envs_once(monkeypatch):
     module = _load_layer_module(monkeypatch, {"value": None})
-    module._prefill_settings.cache_clear()
+    # dynamo warns about functools.cache-wrapped functions called from compiled code
+    assert not hasattr(module._prefill_settings, "cache_clear")
+    module._PREFILL_SETTINGS.clear()
     monkeypatch.setenv("HPU_KIMI_KDA_CHUNK_SIZE", "32")
     monkeypatch.setenv("HPU_KIMI_KDA_VEC_CHUNKS", "4")
     assert module._prefill_settings() == (32, 4)
     monkeypatch.setenv("HPU_KIMI_KDA_CHUNK_SIZE", "64")  # cached: read once
     assert module._prefill_settings() == (32, 4)
-    module._prefill_settings.cache_clear()
+    module._PREFILL_SETTINGS.clear()
     monkeypatch.delenv("HPU_KIMI_KDA_CHUNK_SIZE")
     monkeypatch.delenv("HPU_KIMI_KDA_VEC_CHUNKS")
     assert module._prefill_settings() == (64, 16)
-    module._prefill_settings.cache_clear()
+    module._PREFILL_SETTINGS.clear()
 
 
 # ---------------------------------------------------------------------------------------------------------------
