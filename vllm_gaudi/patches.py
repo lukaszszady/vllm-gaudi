@@ -1161,6 +1161,12 @@ def _patch_moe_runner_delegation() -> None:
             mod = __import__(mod_name, fromlist=[cls_name])
             cls = getattr(mod, cls_name)
             if getattr(cls, "_patched_delegation", False):
+                # Already patched, on this class or (ROCmLatentMoERunner subclasses MoERunner) on a base class that
+                # the lookup reaches by inheritance: covered. Record it so that it clears an earlier failed attempt.
+                _kimi_patch_installed(f"moe_runner_delegation[{cls_name}]")
+                if "_patched_delegation" not in vars(cls):
+                    _kimi_patch_logger().debug("Kimi-K3 patch 'moe_runner_delegation[%s]' is covered by a base class",
+                                               cls_name)
                 continue
             orig_getattr = getattr(cls, "__getattr__", None)
 
