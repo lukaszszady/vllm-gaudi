@@ -131,8 +131,8 @@ def test_installed_patches_are_listed_in_one_info_line(patches, caplog):
     assert [r.getMessage() for r in caplog.records] == ["Kimi-K3 patches installed: a, b"]
 
 
-def _model(patches, module):
-    cls = type("Model", (), {"__module__": module})
+def _model(module, bases=()):
+    cls = type("Model", bases, {"__module__": module})
     return cls()
 
 
@@ -146,7 +146,7 @@ def test_repeated_attempts_log_nothing_above_debug(patches, caplog):
 
 def test_final_report_is_logged_once_even_if_called_twice(patches, caplog):
     patches._kimi_patch_installed("a")
-    model = _model(patches, "vllm.models.kimi_k3.model")
+    model = _model("vllm.models.kimi_k3.model")
     with caplog.at_level(logging.INFO, logger=LOGGER):
         patches.report_kimi_patches(model)
         patches.report_kimi_patches(model)
@@ -157,7 +157,7 @@ def test_a_still_missing_patch_gives_exactly_one_warning(patches, caplog):
     patches._kimi_patch_installed("a")
     patches._kimi_patch_failed("kda_forward")
     patches._kimi_patch_failed("kda_forward")
-    model = _model(patches, "vllm.models.kimi_k3.model")
+    model = _model("vllm.models.kimi_k3.model")
     with caplog.at_level(logging.INFO, logger=LOGGER):
         patches.report_kimi_patches(model)
         patches.report_kimi_patches(model)
@@ -170,16 +170,101 @@ def test_a_non_kimi_model_logs_nothing(patches, caplog):
     patches._kimi_patch_installed("a")
     patches._kimi_patch_failed("b")
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
-        patches.report_kimi_patches(_model(patches, "vllm.model_executor.models.llama"))
+        patches.report_kimi_patches(_model("vllm.model_executor.models.llama"))
     assert caplog.records == []
 
 
-def test_an_absent_rocm_runner_is_not_applicable_not_missing(patches, caplog, monkeypatch):
+def test_an_absent_rocm_runner_is_not_applicable_not_missing(patches, caplog):
     name = "moe_runner_delegation[ROCmLatentMoERunner]"
     patches._kimi_patch_failed(name)  # e.g. an earlier circular-import attempt
     patches._kimi_patch_not_applicable(name)
     patches._kimi_patch_installed("a")
     assert name not in patches._KIMI_PATCHES_FAILED
     with caplog.at_level(logging.INFO, logger=LOGGER):
-        patches.report_kimi_patches(_model(patches, "vllm.models.kimi_k3.model"))
+        patches.report_kimi_patches(_model("vllm.models.kimi_k3.model"))
     assert [r.levelno for r in caplog.records] == [logging.INFO]
+
+
+def test_kimi_subclass_is_detected_through_the_mro(patches, caplog):
+    base = type(_model("vllm.models.kimi_k3.amd.model"))
+    sub = _model("some.other.module", bases=(base, ))
+    patches._kimi_patch_installed("a")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches.report_kimi_patches(sub)
+    assert [r.getMessage() for r in caplog.records] == ["Kimi-K3 patches installed: a"]
+
+
+@pytest.mark.parametrize("module", [
+    "vllm.model_executor.models.kimi_vl", "vllm.model_executor.models.kimi_k25", "vllm.model_executor.models.kimi_audio"
+])
+def test_other_kimi_models_get_no_k3_report(patches, caplog, module):
+    patches._kimi_patch_failed("kda_forward")
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        patches.report_kimi_patches(_model(module))
+    assert not [r for r in caplog.records if r.levelno > logging.DEBUG]
+
+
+@pytest.mark.parametrize("exc, mod, cls, absent", [
+    (ModuleNotFoundError("x", name="m.latent"), "m.latent", "ROCmLatentMoERunner", True),
+    (AttributeError("no class"), "m.latent", "ROCmLatentMoERunner", True),
+    (ImportError("circular"), "m.latent", "ROCmLatentMoERunner", False),
+    (ModuleNotFoundError("x", name="other"), "m.latent", "ROCmLatentMoERunner", False),
+    (ModuleNotFoundError("x", name="m.moe_runner"), "m.moe_runner", "MoERunner", False),
+    (AttributeError("no class"), "m.moe_runner", "MoERunner", False),
+])
+def test_only_a_missing_rocm_runner_is_not_applicable(patches, exc, mod, cls, absent):
+    assert patches._optional_runner_absent(exc, mod, cls) is absent
+
+
+class _Cfg:
+
+    def __init__(self, *archs):
+        self.architectures = list(archs)
+
+
+def test_get_model_failure_reports_missing_patches_once_for_kimi(patches, caplog):
+    patches._kimi_patch_failed("kda_forward")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches.report_kimi_patches_on_load_failure(_Cfg("KimiK3ForConditionalGeneration"))
+        patches.report_kimi_patches_on_load_failure(_Cfg("KimiK3ForConditionalGeneration"))
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "kda_forward" in caplog.records[0].getMessage()
+
+
+def test_get_model_failure_of_another_architecture_logs_nothing(patches, caplog):
+    patches._kimi_patch_failed("kda_forward")
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        patches.report_kimi_patches_on_load_failure(_Cfg("LlamaForCausalLM"))
+    assert not [r for r in caplog.records if r.levelno > logging.DEBUG]
+
+
+def test_config_report_warns_only_for_config_side_patches_of_a_kimi_arch(patches, caplog):
+    # the #942 pattern: per-attempt failures that are irrelevant to a process that only builds the config
+    for name in ("kda_forward", "kimi_gdn_forward", "linear_weights", "attn_res_op", "attn_res_linear"):
+        patches._kimi_patch_failed(name)
+    patches._kimi_patch_failed("k3_arch")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches._report_kimi_config_patches(_Cfg("LlamaForCausalLM"))
+        assert caplog.records == []
+        patches._report_kimi_config_patches(_Cfg("KimiK3ForConditionalGeneration"))
+        patches._report_kimi_config_patches(_Cfg("KimiK3ForConditionalGeneration"))
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "k3_arch" in caplog.records[0].getMessage()
+
+
+def test_config_report_is_silent_when_config_patches_are_installed(patches, caplog):
+    patches._kimi_patch_failed("kda_forward")
+    patches._kimi_patch_failed("k3_arch")
+    patches._kimi_patch_installed("kimi_moe_2d")
+    patches._kimi_patch_ok("k3_arch")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches._report_kimi_config_patches(_Cfg("KimiK3ForConditionalGeneration"))
+    assert caplog.records == []
+
+
+def test_a_patch_warned_by_the_config_report_is_not_warned_again_by_the_model_report(patches, caplog):
+    patches._kimi_patch_failed("k3_arch")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        patches._report_kimi_config_patches(_Cfg("KimiK3ForConditionalGeneration"))
+        patches.report_kimi_patches(_model("vllm.models.kimi_k3.model"))
+    assert len(caplog.records) == 1

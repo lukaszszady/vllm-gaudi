@@ -943,18 +943,45 @@ def _kimi_patches_log_installed() -> None:
     _kimi_patch_logger().info("Kimi-K3 patches installed: %s", ", ".join(_KIMI_PATCHES_INSTALLED))
 
 
-def _kimi_patches_log_failed() -> None:
-    """Call after the final install attempt: one WARNING (no traceback) per patch that is still missing."""
-    for name, reason in _KIMI_PATCHES_FAILED.items():
+def _kimi_patches_log_failed(only=None) -> None:
+    """One WARNING (no traceback) per patch that is still missing and was not reported yet.
+
+    ``only`` restricts the report to the patches that matter to the calling process.
+    """
+    for name, reason in list(_KIMI_PATCHES_FAILED.items()):
+        if name in _KIMI_PATCHES_WARNED or (only is not None and name not in only):
+            continue
+        _KIMI_PATCHES_WARNED.add(name)
         _kimi_patch_logger().warning("Kimi-K3 patch '%s' was not installed (%s)", name, reason)
 
 
 _KIMI_PATCHES_REPORTED = False
+_KIMI_CONFIG_REPORTED = False
+_KIMI_PATCHES_WARNED: set[str] = set()
+# vllm.models.kimi_k3 holds all K3 classes (KimiK3ForConditionalGeneration, KimiLinearForCausalLM, MTP, DSpark);
+# Kimi-VL, Kimi-K2.5 and Kimi-Audio live in vllm.model_executor.models.kimi_* and are not K3.
+_KIMI_K3_MODULE = "vllm.models.kimi_k3"
+_KIMI_K3_ARCHITECTURES = ("KimiK3ForConditionalGeneration", "KimiK3MTPModel", "KimiLinearForCausalLM",
+                          "K3DSparkModel")
+# Patches that act in the process which builds the config (APIServer, EngineCore), not only in model workers.
+_KIMI_CONFIG_PATCHES = ("hybrid_config", "k3_arch")
 
 
 def _is_kimi_k3_model(model) -> bool:
-    prefixes = ("vllm.models.kimi_k3", "vllm.model_executor.models.kimi")
-    return any(c.__module__.startswith(prefixes) for c in type(model).__mro__)
+    return any(c.__module__.startswith(_KIMI_K3_MODULE) for c in type(model).__mro__)
+
+
+def _is_kimi_k3_config(model_config) -> bool:
+    archs = getattr(model_config, "architectures", None) or getattr(
+        getattr(model_config, "hf_config", None), "architectures", None) or ()
+    return any(a in _KIMI_K3_ARCHITECTURES for a in archs)
+
+
+def _optional_runner_absent(exc: BaseException, mod_name: str, cls_name: str) -> bool:
+    """True when the ROCm-only latent MoE runner does not exist in this vllm build (not a failure on HPU)."""
+    if cls_name != "ROCmLatentMoERunner":
+        return False
+    return (isinstance(exc, ModuleNotFoundError) and exc.name == mod_name) or isinstance(exc, AttributeError)
 
 
 def report_kimi_patches(model) -> None:
@@ -971,6 +998,30 @@ def report_kimi_patches(model) -> None:
     _KIMI_PATCHES_REPORTED = True
     _kimi_patches_log_installed()
     _kimi_patches_log_failed()
+
+
+def report_kimi_patches_on_load_failure(model_config) -> None:
+    """``get_model`` raised: no model exists, so say which patches are missing (the likely cause) before re-raising."""
+    global _KIMI_PATCHES_REPORTED
+    if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_config(model_config):
+        return
+    _KIMI_PATCHES_REPORTED = True
+    _kimi_patches_log_failed()
+
+
+def _report_kimi_config_patches(model_config) -> None:
+    """Warn once per process about missing config-side patches, right after a Kimi-K3 ModelConfig was built.
+
+    APIServer and EngineCore never build the model, but they build the config, which needs ``k3_arch`` (architecture
+    resolution) and ``hybrid_config`` (this hook). The patched ``ModelConfig.__post_init__`` is a definite late
+    point: the patches are installed by then, so a name still in the failed list is really missing. Patches that
+    only matter to model workers (kda_forward, attn_res_*, ...) are left to ``report_kimi_patches``.
+    """
+    global _KIMI_CONFIG_REPORTED
+    if _KIMI_CONFIG_REPORTED or not _is_kimi_k3_config(model_config):
+        return
+    _KIMI_CONFIG_REPORTED = True
+    _kimi_patches_log_failed(only=_KIMI_CONFIG_PATCHES)
 
 
 def _patch_rocm_platform_for_hpu() -> None:
@@ -1080,6 +1131,7 @@ def _patch_kimi_k3_hybrid_config() -> None:
         if orig_post_init is not None:
             def _hpu_post_init(self, *args, **kwargs):
                 orig_post_init(self, *args, **kwargs)
+                _report_kimi_config_patches(self)
                 # Ensure KimiMoE does not pad moe_intermediate_size from 3072 to 4096 under EP (saves ~30 GB memory per card)
                 for cfg_obj in (getattr(self, "hf_text_config", None), getattr(self, "hf_config", None)):
                     if cfg_obj is not None:
@@ -1131,9 +1183,7 @@ def _patch_moe_runner_delegation() -> None:
         except Exception as exc:
             name = f"moe_runner_delegation[{cls_name}]"
             # The ROCm runner is optional: a vllm build without it is not a failure.
-            absent = (isinstance(exc, ModuleNotFoundError) and exc.name == mod_name) or (
-                isinstance(exc, AttributeError) and cls_name == "ROCmLatentMoERunner")
-            if absent:
+            if _optional_runner_absent(exc, mod_name, cls_name):
                 _kimi_patch_not_applicable(name)
             else:
                 _kimi_patch_failed(name)
