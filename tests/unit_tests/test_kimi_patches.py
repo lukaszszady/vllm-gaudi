@@ -268,3 +268,48 @@ def test_a_patch_warned_by_the_config_report_is_not_warned_again_by_the_model_re
         patches._report_kimi_config_patches(_Cfg("KimiK3ForConditionalGeneration"))
         patches.report_kimi_patches(_model("vllm.models.kimi_k3.model"))
     assert len(caplog.records) == 1
+
+
+def test_a_delegation_patch_that_failed_early_is_retried_before_the_report(patches, monkeypatch, caplog):
+    name = "moe_runner_delegation[ROCmLatentMoERunner]"
+    patches._kimi_patch_failed(name)
+    calls = []
+
+    def retry():
+        calls.append(1)
+        patches._kimi_patch_installed(name)
+
+    monkeypatch.setattr(patches, "_patch_moe_runner_delegation", retry)
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches.report_kimi_patches(_model("vllm.models.kimi_k3.amd.model"))
+    assert calls == [1]
+    assert [r.levelno for r in caplog.records] == [logging.INFO]
+
+
+def test_a_delegation_patch_that_still_fails_after_the_retry_warns_once(patches, monkeypatch, caplog):
+    patches._kimi_patch_failed("moe_runner_delegation[ROCmLatentMoERunner]")
+    monkeypatch.setattr(patches, "_patch_moe_runner_delegation", lambda: None)
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches.report_kimi_patches(_model("vllm.models.kimi_k3.amd.model"))
+    assert [r.levelno for r in caplog.records] == [logging.INFO, logging.WARNING]
+
+
+def test_no_retry_when_nothing_failed(patches, monkeypatch):
+    monkeypatch.setattr(patches, "_patch_moe_runner_delegation", lambda: pytest.fail("retried"))
+    patches.report_kimi_patches(_model("vllm.models.kimi_k3.amd.model"))
+
+
+def _record(name, msg, level=logging.WARNING):
+    return logging.LogRecord(name, level, __file__, 1, msg, None, None)
+
+
+def test_remote_tokenizer_notice_is_dropped_but_other_messages_are_kept(patches, monkeypatch):
+    handler = logging.StreamHandler()
+    monkeypatch.setattr(logging, "lastResort", handler)
+    patches._silence_remote_tokenizer_notice()
+    patches._silence_remote_tokenizer_notice()  # idempotent
+    assert len(handler.filters) == 1
+    notice = "transformers_modules.moonshotai.tokenization_kimi"
+    assert not handler.filter(_record(notice, "Calling super().encode with {'x': 1}"))
+    assert handler.filter(_record(notice, "Something else went wrong"))
+    assert handler.filter(_record("vllm.engine", "Calling super().encode with {'x': 1}"))

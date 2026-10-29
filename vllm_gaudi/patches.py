@@ -984,6 +984,16 @@ def _optional_runner_absent(exc: BaseException, mod_name: str, cls_name: str) ->
     return (isinstance(exc, ModuleNotFoundError) and exc.name == mod_name) or isinstance(exc, AttributeError)
 
 
+def _retry_failed_kimi_patches() -> None:
+    """Retry the patches that failed only because vllm was partially imported at the time.
+
+    By the time the report runs the model exists, so every vllm module it needs is fully imported; nothing else
+    retries after that point. Patches that are installed already return early.
+    """
+    if any(name.startswith("moe_runner_delegation") for name in _KIMI_PATCHES_FAILED):
+        _patch_moe_runner_delegation()
+
+
 def report_kimi_patches(model) -> None:
     """Log the Kimi-K3 patch status once per process, after the model has been built.
 
@@ -996,6 +1006,7 @@ def report_kimi_patches(model) -> None:
     if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_model(model):
         return
     _KIMI_PATCHES_REPORTED = True
+    _retry_failed_kimi_patches()
     _kimi_patches_log_installed()
     _kimi_patches_log_failed()
 
@@ -1006,6 +1017,7 @@ def report_kimi_patches_on_load_failure(model_config) -> None:
     if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_config(model_config):
         return
     _KIMI_PATCHES_REPORTED = True
+    _retry_failed_kimi_patches()
     _kimi_patches_log_failed()
 
 
@@ -1606,8 +1618,31 @@ def _patch_inc_quantization_config() -> None:
     register_quantization_config("inc")(_FakeINCConfig)
 
 
+class _RemoteTokenizerNoticeFilter:
+    """Drop the 'Calling super().encode with ...' notice of the Kimi remote tokenizer (tokenization_kimi.py).
+
+    The remote module logs through a ``transformers_modules.*`` logger that has no handler, so the record reaches
+    ``logging.lastResort`` (stderr) once per tokenization. Only this message of that namespace is dropped.
+    """
+
+    _PREFIX = "Calling super().encode with"
+
+    def filter(self, record) -> bool:
+        if record.name.startswith("transformers_modules"):
+            return not str(record.getMessage()).startswith(self._PREFIX)
+        return True
+
+
+def _silence_remote_tokenizer_notice() -> None:
+    import logging
+    handler = logging.lastResort
+    if handler is not None and not any(isinstance(f, _RemoteTokenizerNoticeFilter) for f in handler.filters):
+        handler.addFilter(_RemoteTokenizerNoticeFilter())
+
+
 def apply() -> None:
     """Install all HPU runtime monkey-patches."""
+    _silence_remote_tokenizer_notice()
     # --- torch.accelerator.empty_cache ---
     torch.accelerator.empty_cache = _hpu_accelerator_empty_cache
 
