@@ -1937,11 +1937,7 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         return ret
 
     def _get_compiled_forward(self):
-        # Inside a compiled region call the op directly: building the nested torch.compile wrapper there is a
-        # graph break ('torch.compile call with > 1 args'), and Dynamo keeps the frames split at that break for
-        # every layer traced before the wrapper existed, even after it is cached.
-        if torch.compiler.is_compiling():
-            return _mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd
+        # Bisect: always the nested torch.compile wrapper, as before the in-graph call (upstream behaviour).
         if self._compiled_forward is None:
             fwd = _mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd
             self._compiled_forward = torch.compile(fwd, backend="hpu_backend")
