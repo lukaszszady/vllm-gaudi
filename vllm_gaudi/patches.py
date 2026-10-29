@@ -933,6 +933,12 @@ def _kimi_patch_installed(name: str) -> None:
         _KIMI_PATCHES_INSTALLED.append(name)
 
 
+def _kimi_patch_not_applicable(name: str) -> None:
+    """The patch targets something this vllm build does not have: neither installed nor missing."""
+    _KIMI_PATCHES_FAILED.pop(name, None)
+    _kimi_patch_logger().debug("Kimi-K3 patch '%s' is not applicable here", name, exc_info=True)
+
+
 def _kimi_patches_log_installed() -> None:
     _kimi_patch_logger().info("Kimi-K3 patches installed: %s", ", ".join(_KIMI_PATCHES_INSTALLED))
 
@@ -941,6 +947,30 @@ def _kimi_patches_log_failed() -> None:
     """Call after the final install attempt: one WARNING (no traceback) per patch that is still missing."""
     for name, reason in _KIMI_PATCHES_FAILED.items():
         _kimi_patch_logger().warning("Kimi-K3 patch '%s' was not installed (%s)", name, reason)
+
+
+_KIMI_PATCHES_REPORTED = False
+
+
+def _is_kimi_k3_model(model) -> bool:
+    prefixes = ("vllm.models.kimi_k3", "vllm.model_executor.models.kimi")
+    return any(c.__module__.startswith(prefixes) for c in type(model).__mro__)
+
+
+def report_kimi_patches(model) -> None:
+    """Log the Kimi-K3 patch status once per process, after the model has been built.
+
+    The patches are installed in several attempts, in every process (APIServer, EngineCore, workers), and an
+    attempt cannot tell whether it is the last one, so nothing above DEBUG is logged while installing. The model
+    runner calls this right after ``get_model``: only a process that really built a Kimi-K3 model reports, once,
+    with the INFO summary and one WARNING per patch that is still missing.
+    """
+    global _KIMI_PATCHES_REPORTED
+    if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_model(model):
+        return
+    _KIMI_PATCHES_REPORTED = True
+    _kimi_patches_log_installed()
+    _kimi_patches_log_failed()
 
 
 def _patch_rocm_platform_for_hpu() -> None:
@@ -1098,8 +1128,15 @@ def _patch_moe_runner_delegation() -> None:
             cls.__getattr__ = _make_getattr(orig_getattr, cls)
             cls._patched_delegation = True
             _kimi_patch_installed(f"moe_runner_delegation[{cls_name}]")
-        except Exception:
-            _kimi_patch_failed(f"moe_runner_delegation[{cls_name}]")
+        except Exception as exc:
+            name = f"moe_runner_delegation[{cls_name}]"
+            # The ROCm runner is optional: a vllm build without it is not a failure.
+            absent = (isinstance(exc, ModuleNotFoundError) and exc.name == mod_name) or (
+                isinstance(exc, AttributeError) and cls_name == "ROCmLatentMoERunner")
+            if absent:
+                _kimi_patch_not_applicable(name)
+            else:
+                _kimi_patch_failed(name)
 
 
 def _patch_latent_moe_runner_forward() -> None:
@@ -1333,7 +1370,6 @@ def _patch_kimi_k3_arch() -> None:
             _amd_linear.KimiMoE._patched_moe_2d = True
         _kimi_patch_installed("kimi_moe_2d")
         _kimi_patch_ok("k3_arch")
-        _kimi_patches_log_installed()
     except Exception:
         _kimi_patch_failed("k3_arch")
 
@@ -1577,8 +1613,6 @@ def apply() -> None:
         _patch_kimi_k3_hybrid_config()
         _patch_kimi_k3_arch()
         _patch_compressed_tensors_mxfp4()
-        _kimi_patches_log_installed()
-        _kimi_patches_log_failed()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 

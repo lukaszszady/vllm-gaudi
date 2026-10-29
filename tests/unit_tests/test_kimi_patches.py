@@ -129,3 +129,57 @@ def test_installed_patches_are_listed_in_one_info_line(patches, caplog):
     with caplog.at_level(logging.INFO, logger=LOGGER):
         patches._kimi_patches_log_installed()
     assert [r.getMessage() for r in caplog.records] == ["Kimi-K3 patches installed: a, b"]
+
+
+def _model(patches, module):
+    cls = type("Model", (), {"__module__": module})
+    return cls()
+
+
+def test_repeated_attempts_log_nothing_above_debug(patches, caplog):
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        for _ in range(3):
+            patches._kimi_patch_failed("kda_forward")
+            patches._kimi_patch_installed("attn_res_op")
+    assert caplog.records == []
+
+
+def test_final_report_is_logged_once_even_if_called_twice(patches, caplog):
+    patches._kimi_patch_installed("a")
+    model = _model(patches, "vllm.models.kimi_k3.model")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches.report_kimi_patches(model)
+        patches.report_kimi_patches(model)
+    assert [r.getMessage() for r in caplog.records] == ["Kimi-K3 patches installed: a"]
+
+
+def test_a_still_missing_patch_gives_exactly_one_warning(patches, caplog):
+    patches._kimi_patch_installed("a")
+    patches._kimi_patch_failed("kda_forward")
+    patches._kimi_patch_failed("kda_forward")
+    model = _model(patches, "vllm.models.kimi_k3.model")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches.report_kimi_patches(model)
+        patches.report_kimi_patches(model)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "kda_forward" in warnings[0].getMessage()
+
+
+def test_a_non_kimi_model_logs_nothing(patches, caplog):
+    patches._kimi_patch_installed("a")
+    patches._kimi_patch_failed("b")
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        patches.report_kimi_patches(_model(patches, "vllm.model_executor.models.llama"))
+    assert caplog.records == []
+
+
+def test_an_absent_rocm_runner_is_not_applicable_not_missing(patches, caplog, monkeypatch):
+    name = "moe_runner_delegation[ROCmLatentMoERunner]"
+    patches._kimi_patch_failed(name)  # e.g. an earlier circular-import attempt
+    patches._kimi_patch_not_applicable(name)
+    patches._kimi_patch_installed("a")
+    assert name not in patches._KIMI_PATCHES_FAILED
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        patches.report_kimi_patches(_model(patches, "vllm.models.kimi_k3.model"))
+    assert [r.levelno for r in caplog.records] == [logging.INFO]

@@ -29,6 +29,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import vllm_gaudi.envs as gaudi_envs
 import vllm_gaudi.extension.environment as environment
+from vllm_gaudi.patches import report_kimi_patches
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cache_groups
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
@@ -4936,6 +4937,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # threshold (recipe cache eviction), see hpu_weight_page_cache.
             with ctx, drop_weight_page_cache_during_load():
                 self.model = get_model(vllm_config=self.vllm_config)
+            report_kimi_patches(self.model)
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_device_memory
