@@ -1475,7 +1475,7 @@ def _mark_kimi_k3_construction(model_cls: type, shared_layer_classes: tuple[type
     """
     if "_hpu_kimi_k3_init" in vars(model_cls):
         return
-    orig_init = model_cls.__init__
+    orig_init = model_cls.__init__  # type: ignore[misc]
 
     @functools.wraps(orig_init)
     def __init__(self, *args, **kwargs):
@@ -1483,10 +1483,10 @@ def _mark_kimi_k3_construction(model_cls: type, shared_layer_classes: tuple[type
             orig_init(self, *args, **kwargs)
         for module in self.modules():
             if isinstance(module, shared_layer_classes):
-                module._hpu_kimi_k3 = True
+                module._hpu_kimi_k3 = True  # type: ignore[attr-defined]
 
-    model_cls.__init__ = __init__
-    model_cls._hpu_kimi_k3_init = True
+    model_cls.__init__ = __init__  # type: ignore[misc]
+    model_cls._hpu_kimi_k3_init = True  # type: ignore[attr-defined]
 
 
 def _patch_kimi_k3_arch() -> None:
