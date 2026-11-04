@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Pure helpers of the Kimi-K3 video input path (no vLLM or torch imports).
+
+Kept apart from ``kimi_k3_video.py`` so that frame sampling, chunking, timestamps, prompt construction and the vision
+token count can be unit-tested on a CPU host without the Kimi-K3 classes of vLLM.
+
+Kimi-K3 publishes no video prompt format. The helpers follow the Kimi-K2.5/K2.6 one, because K3 reuses the K2.5 vision
+tower, its image processor (``KimiK25FusedVisionProcessor``) and the ``<|media_*|>`` special tokens: the video is
+sampled at ``min(sample_fps, source fps)``, cut into chunks of ``temporal_merge_kernel_size`` frames (the tower
+mean-pools each chunk over time into one picture worth of tokens) and every chunk gets its own timestamped block::
+
+    00:00:02.000<|media_begin|>video<|media_content|><|media_pad|>*N<|media_end|>
+
+Only the ``<|media_pad|>`` positions carry vision embeddings.
+"""
+
+import math
+from collections.abc import Callable, Mapping, Sequence
+
+# Modality placeholder the chat parser inserts for a ``video_url`` content part. Like the image one it is ordinary text
+# (not a special token); the processor replaces it with the chunk blocks below.
+K3_VIDEO_PLACEHOLDER = "<|kimi_video_placeholder|>"
+
+# Kimi-K3 ``media_proc_cfg`` fall-backs, used only when the checkpoint config lacks the key.
+DEFAULT_TEMPORAL_CHUNK_SIZE = 4  # temporal_merge_kernel_size
+DEFAULT_MAX_SAMPLE_FPS = 8.0  # sample_fps
+
+# Request-level video decoding defaults of the K3 chat renderer (--media-io-kwargs and per-request media_io_kwargs take
+# precedence). The loader keeps min(num_frames, source frames, floor(duration * fps)) frames, so these two cap the
+# decoded video at 8 frames per second and at 256 frames; the final sampling and chunking is done by
+# ``plan_video_chunks``.
+K3_VIDEO_LOADER_FPS = DEFAULT_MAX_SAMPLE_FPS
+K3_VIDEO_LOADER_MAX_FRAMES = 256
+
+# Shape of the dummy video used for profiling and MM warmup when ``--limit-mm-per-prompt`` gives no override: 20 frames
+# of 864x480 at 2 fps are 5 chunks of 558 vision tokens.
+DUMMY_VIDEO_WIDTH = 864
+DUMMY_VIDEO_HEIGHT = 480
+DUMMY_VIDEO_NUM_FRAMES = 20
+DUMMY_VIDEO_FPS = 2.0
+
+_SECONDS_PER_MINUTE = 60
+_SECONDS_PER_HOUR = 3600
+_MS_PER_SECOND = 1000
+
+
+def sample_frame_indices(num_loaded: int, source_total: int, source_fps: float, max_sample_fps: float) -> list[int]:
+    """Indices (into the ``num_loaded`` decoded frames) kept at ``min(max_sample_fps, source_fps)``.
+
+    Same arithmetic as the K2.6 ``navit_resize_video``: ``max(round(total * sample_fps / fps), 1)`` frames, evenly
+    spread (linspace, rounded) over the decoded frames and never more than were decoded.
+    """
+    if num_loaded <= 0:
+        raise ValueError("The video has no frames")
+    if source_fps <= 0:
+        raise ValueError(f"Invalid video fps: {source_fps}")
+    sample_fps = min(max_sample_fps, source_fps)
+    total = max(source_total, num_loaded)
+    sampled = min(max(round(total * sample_fps / source_fps), 1), num_loaded)
+    if sampled == 1:
+        return [0]
+    step = (num_loaded - 1) / (sampled - 1)
+    return [round(i * step) for i in range(sampled)]
+
+
+def split_into_chunks(indices: Sequence[int], chunk_size: int) -> list[list[int]]:
+    """Cut the sampled frame indices into chunks of ``chunk_size``; the last chunk may be shorter."""
+    if chunk_size < 1:
+        raise ValueError(f"Invalid chunk size: {chunk_size}")
+    return [list(indices[i:i + chunk_size]) for i in range(0, len(indices), chunk_size)]
+
+
+def format_timestamp(seconds: float) -> str:
+    """``hh:mm:ss.fff`` (the K3 ``timestamp_mode``)."""
+    total_ms = max(round(seconds * _MS_PER_SECOND), 0)
+    hours, rest = divmod(total_ms, _SECONDS_PER_HOUR * _MS_PER_SECOND)
+    minutes, rest = divmod(rest, _SECONDS_PER_MINUTE * _MS_PER_SECOND)
+    secs, millis = divmod(rest, _MS_PER_SECOND)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def plan_video_chunks(
+    num_loaded: int,
+    source_total: int,
+    source_fps: float,
+    source_indices: Sequence[int] | None,
+    max_sample_fps: float = DEFAULT_MAX_SAMPLE_FPS,
+    chunk_size: int = DEFAULT_TEMPORAL_CHUNK_SIZE,
+) -> tuple[list[list[int]], list[float]]:
+    """Chunks (lists of decoded-frame indices) of a video and the start time in seconds of every chunk.
+
+    ``source_indices`` are the positions in the source video of the decoded frames (the loader metadata
+    ``frames_indices``); the start time of a chunk is the source position of its first frame divided by the source fps.
+    Without them the decoded frames are taken as evenly spread over the source duration.
+    """
+    kept = sample_frame_indices(num_loaded, source_total, source_fps, max_sample_fps)
+    chunks = split_into_chunks(kept, chunk_size)
+    starts = []
+    for chunk in chunks:
+        first = chunk[0]
+        if source_indices is not None and len(source_indices) == num_loaded:
+            position = source_indices[first]
+        else:
+            position = first * max(source_total, num_loaded) / num_loaded
+        starts.append(position / source_fps)
+    return chunks, starts
+
+
+def navit_chunk_tokens(
+    width: int,
+    height: int,
+    media_proc_cfg: Mapping[str, object],
+) -> int:
+    """Vision tokens of ONE video chunk, whatever its length (the tower pools the frames of a chunk over time).
+
+    Re-implements the size arithmetic of ``navit_resize_video`` for a chunk (``nframes`` = chunk length, avg fps 1,
+    unlimited sample fps) so the count can be checked without vLLM. The patch limit per frame is
+    ``min(in_patch_limit_each_frame, in_patch_limit_video / sampled_frames)``; the second term never binds for 4-frame
+    chunks with the K3 config, so it is not modelled. The processor itself counts with the checkpoint image processor;
+    this is the reference for the unit tests.
+    """
+    patch_size = int(media_proc_cfg["patch_size"])  # type: ignore[call-overload]
+    merge = int(media_proc_cfg["merge_kernel_size"])  # type: ignore[call-overload]
+    per_frame_limit = media_proc_cfg.get("in_patch_limit_each_frame") or media_proc_cfg["in_patch_limit"]
+    side_limit = int(media_proc_cfg["patch_limit_on_one_side"])  # type: ignore[call-overload]
+
+    s1 = math.sqrt(per_frame_limit /
+                   (max(1.0, width // patch_size) * max(1.0, height // patch_size)))  # type: ignore[operator]
+    s2 = side_limit * patch_size / width
+    s3 = side_limit * patch_size / height
+    scale = min(1.0, s1, s2, s3)
+    new_w = min(max(1, int(width * scale)), side_limit * patch_size)
+    new_h = min(max(1, int(height * scale)), side_limit * patch_size)
+
+    factor = merge * patch_size
+    pad_w = (factor - new_w % factor) % factor
+    pad_h = (factor - new_h % factor) % factor
+    return ((new_h + pad_h) // factor) * ((new_w + pad_w) // factor)
+
+
+def build_video_prompt(
+    chunk_starts: Sequence[float],
+    tokens_per_chunk: Sequence[int],
+    media_token: str,
+) -> str:
+    """Prompt text replacing one video placeholder: one timestamped media block per chunk, joined without separator."""
+    if len(chunk_starts) != len(tokens_per_chunk):
+        raise ValueError("chunk_starts and tokens_per_chunk must have the same length")
+    return "".join(f"{format_timestamp(start)}<|media_begin|>video<|media_content|>"
+                   f"{media_token * tokens}<|media_end|>" for start, tokens in zip(chunk_starts, tokens_per_chunk))
+
+
+def video_vision_tokens(
+    width: int,
+    height: int,
+    num_frames: int,
+    source_fps: float,
+    media_proc_cfg: Mapping[str, object],
+    chunk_tokens_fn: Callable[[int, int, Mapping[str, object]], int] = navit_chunk_tokens,
+) -> int:
+    """Total ``<|media_pad|>`` count of a ``num_frames`` video (what the scheduler reserves for the item)."""
+    chunk_size = int(media_proc_cfg.get("temporal_merge_kernel_size",
+                                        DEFAULT_TEMPORAL_CHUNK_SIZE))  # type: ignore[call-overload]
+    max_fps = float(media_proc_cfg.get("sample_fps", DEFAULT_MAX_SAMPLE_FPS))  # type: ignore[arg-type]
+    chunks, _ = plan_video_chunks(num_frames, num_frames, source_fps, None, max_fps, chunk_size)
+    return len(chunks) * chunk_tokens_fn(width, height, media_proc_cfg)

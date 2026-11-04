@@ -976,7 +976,7 @@ _KIMI_PATCHES_WARNED: set[str] = set()
 _KIMI_K3_MODULE = "vllm.models.kimi_k3"
 _KIMI_K3_ARCHITECTURES = KIMI_K3_ARCHITECTURES
 # Patches that act in the process which builds the config (APIServer, EngineCore), not only in model workers.
-_KIMI_CONFIG_PATCHES = ("hybrid_config", "k3_arch")
+_KIMI_CONFIG_PATCHES = ("hybrid_config", "k3_arch", "k3_video")
 
 
 def _is_kimi_k3_model(model) -> bool:
@@ -1042,6 +1042,7 @@ def ensure_kimi_k3_patches(model_config) -> None:
     except Exception as e:  # reported below through the failed list
         _kimi_patch_logger().debug("Kimi-K3 package import failed before the patch retry: %s", e)
     _patch_kimi_k3_arch()
+    _patch_kimi_k3_video()
     # Idempotent (marked) patches that can have failed in an early attempt. _patch_compressed_tensors_mxfp4 is only
     # re-run when its class patch failed: re-running it after a success would wrap its own wrappers.
     _patch_kimi_k3_hybrid_config()
@@ -1604,6 +1605,20 @@ def _patch_kimi_k3_arch() -> None:
         _kimi_patch_failed("k3_arch")
 
 
+def _patch_kimi_k3_video() -> None:
+    """Add the video modality to the Kimi-K3 model (K3 only, see ``vllm_gaudi/models/kimi_k3_video.py``).
+
+    Depends on the K3 model registration of ``_patch_kimi_k3_arch``; a failure is recorded like the other Kimi patches
+    and reported as a WARNING by ``_kimi_patches_log_failed`` (image input keeps working without it).
+    """
+    try:
+        from vllm_gaudi.models.kimi_k3_video import install_kimi_k3_video
+        install_kimi_k3_video()
+        _kimi_patch_installed("k3_video")
+    except Exception:
+        _kimi_patch_failed("k3_video")
+
+
 def _hpu_mxfp4_routed_apply(layer, x, topk_weights, topk_ids, group_size):
     """Run the routed experts of an MXFP4 MoE layer on HPU (exact SiTU when needed, else the fused MXFP4 op)."""
     # imported at call time: these modules are not importable yet while the patches are applied
@@ -1864,6 +1879,7 @@ def apply() -> None:
     _patch_moe_runner_delegation()
     _patch_kimi_k3_hybrid_config()
     _patch_kimi_k3_arch()
+    _patch_kimi_k3_video()
 
     # --- Deferred patches (cleanup_dist_env_and_memory + sampler) ---
     # We cannot import ``vllm.distributed.parallel_state`` or the sampler
@@ -1903,6 +1919,7 @@ def apply() -> None:
         _patch_latent_moe_runner_forward()
         _patch_kimi_k3_hybrid_config()
         _patch_kimi_k3_arch()
+        _patch_kimi_k3_video()
         _patch_compressed_tensors_mxfp4()
 
     _load_general_with_hpu_patches._hpu_patches_wrapper = True  # type: ignore[attr-defined]

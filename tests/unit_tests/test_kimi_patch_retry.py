@@ -37,7 +37,7 @@ def patches(monkeypatch):
     monkeypatch.setattr(mod, "_KIMI_PATCHES_FAILED", {})
     # the other patches of the retry are not under test here
     for name in ("_patch_kimi_k3_hybrid_config", "_patch_mla_prefill_selector", "_patch_latent_moe_runner_forward",
-                 "_patch_compressed_tensors_mxfp4"):
+                 "_patch_compressed_tensors_mxfp4", "_patch_kimi_k3_video"):
         monkeypatch.setattr(mod, name, lambda: None)
     monkeypatch.setattr(mod, "_kimi_patches_live", _live_kda_only(mod))
     mod.module = module

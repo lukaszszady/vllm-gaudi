@@ -1,0 +1,488 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Kimi-K3 video input: pure helpers, prompt construction, K3-only gating and the processor / model glue.
+
+Runs without vllm: the vllm classes the video module builds on are replaced by small stubs.
+"""
+import importlib.util
+import logging
+import sys
+import types
+from pathlib import Path
+
+import pytest
+import torch
+
+ROOT = Path(__file__).resolve().parents[2] / "vllm_gaudi"
+UTILS_NAME = "vllm_gaudi.models.kimi_k3_video_utils"
+
+# media_proc_cfg of the Kimi-K3 checkpoint (the keys the helpers read)
+K3_CFG = {
+    "patch_size": 14,
+    "merge_kernel_size": 2,
+    "in_patch_limit": 65536,
+    "patch_limit_on_one_side": 512,
+    "in_patch_limit_each_frame": 16384,
+    "in_patch_limit_video": 655360,
+    "temporal_merge_kernel_size": 4,
+    "sample_fps": 8.0,
+}
+IBM_WIDTH, IBM_HEIGHT, IBM_FRAMES, IBM_FPS = 864, 480, 20, 2.0
+IBM_CHUNK_TOKENS = 558  # 868x504 padded -> 62 x 36 patches / 2x2 merge
+IBM_VISION_TOKENS = 5 * IBM_CHUNK_TOKENS
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def utils(monkeypatch):
+    monkeypatch.delitem(sys.modules, UTILS_NAME, raising=False)
+    mod = _load(UTILS_NAME, ROOT / "models" / "kimi_k3_video_utils.py")
+    monkeypatch.setitem(sys.modules, UTILS_NAME, mod)
+    return mod
+
+
+# ---------------------------------------------------------------- pure helpers
+
+
+def test_ibm_shape_is_five_chunks_of_558_tokens(utils):
+    assert utils.navit_chunk_tokens(IBM_WIDTH, IBM_HEIGHT, K3_CFG) == IBM_CHUNK_TOKENS
+    assert utils.video_vision_tokens(IBM_WIDTH, IBM_HEIGHT, IBM_FRAMES, IBM_FPS, K3_CFG) == IBM_VISION_TOKENS == 2790
+
+
+def test_sampling_keeps_every_frame_of_a_low_fps_video(utils):
+    assert utils.sample_frame_indices(20, 20, 2.0, 8.0) == list(range(20))
+
+
+def test_sampling_downsamples_to_the_sample_fps(utils):
+    # 30 fps source, 3 s: 90 decoded frames -> 24 frames at 8 fps, evenly spread, first and last frame kept
+    kept = utils.sample_frame_indices(90, 90, 30.0, 8.0)
+    assert len(kept) == 24
+    assert kept[0] == 0 and kept[-1] == 89
+    assert kept == sorted(set(kept))
+
+
+def test_sampling_never_exceeds_the_decoded_frames(utils):
+    # the loader already dropped frames (fps cap): the plan cannot invent more than were decoded
+    assert len(utils.sample_frame_indices(10, 300, 30.0, 8.0)) == 10
+
+
+def test_single_frame_video(utils):
+    assert utils.sample_frame_indices(1, 1, 24.0, 8.0) == [0]
+
+
+@pytest.mark.parametrize("args", [(0, 1, 2.0, 8.0), (4, 4, 0.0, 8.0)])
+def test_sampling_rejects_invalid_input(utils, args):
+    with pytest.raises(ValueError):
+        utils.sample_frame_indices(*args)
+
+
+def test_chunking_by_four_with_a_short_tail(utils):
+    chunks = utils.split_into_chunks(list(range(10)), 4)
+    assert chunks == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+    with pytest.raises(ValueError):
+        utils.split_into_chunks([0], 0)
+
+
+@pytest.mark.parametrize("seconds,text", [(0, "00:00:00.000"), (2.0, "00:00:02.000"), (61.5, "00:01:01.500"),
+                                          (3725.123, "01:02:05.123"), (-1, "00:00:00.000")])
+def test_timestamp_format(utils, seconds, text):
+    assert utils.format_timestamp(seconds) == text
+
+
+def test_plan_uses_source_positions_for_start_times(utils):
+    chunks, starts = utils.plan_video_chunks(20, 20, 2.0, list(range(20)))
+    assert [len(c) for c in chunks] == [4] * 5
+    assert starts == [0.0, 2.0, 4.0, 6.0, 8.0]
+
+
+def test_plan_without_source_positions_spreads_frames_over_the_duration(utils):
+    _, starts = utils.plan_video_chunks(8, 8, 2.0, None)
+    assert starts == [0.0, 2.0]
+
+
+def test_prompt_has_one_timestamped_block_per_chunk(utils):
+    prompt = utils.build_video_prompt([0.0, 2.0], [3, 2], "<P>")
+    assert prompt == ("00:00:00.000<|media_begin|>video<|media_content|><P><P><P><|media_end|>"
+                      "00:00:02.000<|media_begin|>video<|media_content|><P><P><|media_end|>")
+    with pytest.raises(ValueError):
+        utils.build_video_prompt([0.0], [1, 2], "<P>")
+
+
+def test_prompt_pad_count_for_the_ibm_shape(utils):
+    chunks, starts = utils.plan_video_chunks(IBM_FRAMES, IBM_FRAMES, IBM_FPS, None)
+    prompt = utils.build_video_prompt(starts, [IBM_CHUNK_TOKENS] * len(chunks), "<|media_pad|>")
+    assert prompt.count("<|media_pad|>") == IBM_VISION_TOKENS
+    assert prompt.count("<|media_begin|>video<|media_content|>") == 5
+
+
+# --------------------------------------------------------------- vllm stubs
+
+
+class _Info:
+    media_token = "<|media_pad|>"
+    media_token_id = 7
+
+    def __init__(self):
+        self.image_processor = types.SimpleNamespace(media_proc_cfg=K3_CFG, preprocess=self._preprocess)
+        self.preprocess_calls = []
+
+    def _get_expected_hidden_size(self):
+        return None
+
+    allow_missing_mm_embeddings = False
+
+    def get_tokenizer(self):
+        return "tokenizer"
+
+    def media_tokens_calculator(self, media):
+        frame = media["video_chunk"][0]
+        return self.utils.navit_chunk_tokens(frame.size[0], frame.size[1], K3_CFG)
+
+    def _preprocess(self, medias, **kwargs):
+        self.preprocess_calls.append(medias)
+        grids = []
+        for media in medias:
+            frame = media["video_chunk"][0]
+            grids.append([len(media["video_chunk"]), 36, 62] if frame.size == (IBM_WIDTH, IBM_HEIGHT) else [1, 2, 2])
+        grid = torch.tensor(grids)
+        return {"pixel_values": torch.zeros(int(grid.prod(-1).sum()), 4), "grid_thws": grid}
+
+
+class _FieldConfig:
+
+    def __init__(self, kind, modality, sizes=None, keep_on_cpu=False):
+        self.kind, self.modality, self.sizes, self.keep_on_cpu = kind, modality, sizes, keep_on_cpu
+
+    @classmethod
+    def flat_from_sizes(cls, modality, sizes, dim=0, *, keep_on_cpu=False):
+        return cls("flat", modality, sizes, keep_on_cpu)
+
+    @classmethod
+    def batched(cls, modality, *, keep_on_cpu=False):
+        return cls("batched", modality, None, keep_on_cpu)
+
+
+@pytest.fixture
+def video(monkeypatch, utils):
+    """The video module built against stub vllm classes. Returns a namespace with the module and its fakes."""
+    ns = types.SimpleNamespace(utils=utils, registrations=[])
+    _Info.utils = utils
+
+    class BaseDummy:
+
+        def get_dummy_text(self, mm_counts):
+            return "<|kimi_image_placeholder|>" * mm_counts.get("image", 0)
+
+        def get_dummy_mm_data(self, seq_len, mm_counts, mm_options=None):
+            return {"image": ["img"] * mm_counts.get("image", 0)}
+
+    class BaseProcessor:
+
+        def __init__(self):
+            self.info = _Info()
+
+        def _call_hf_processor(self, hf_data, hf_kwargs):
+            return {"pixel_values": torch.zeros(1, 4), "grid_thws": torch.tensor([[1, 2, 2]])}
+
+        def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
+            return {"pixel_values": _FieldConfig("flat", "image")}
+
+        def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+            return ["image-update"]
+
+    class K3Model:
+        marked = []
+
+        @classmethod
+        def get_placeholder_str(cls, modality, i):
+            if modality == "image":
+                return "<|kimi_image_placeholder|>"
+            raise ValueError(modality)
+
+        def _mark_tower_model(self, vllm_config, modalities, *args, **kwargs):
+            K3Model.marked.append(modalities)
+
+        def embed_multimodal(self, **kwargs):
+            return "image-path"
+
+    class OtherModel(K3Model):  # stands for Kimi-K2.5/K2.6
+        pass
+
+    OtherModel.get_placeholder_str = classmethod(K3Model.get_placeholder_str.__func__)
+    OtherModel._mark_tower_model = K3Model._mark_tower_model
+    OtherModel.embed_multimodal = K3Model.embed_multimodal
+
+    class Registry:
+
+        def register_processor(self, processor, *, info, dummy_inputs):
+
+            def deco(cls):
+                ns.registrations.append((cls, processor, info, dummy_inputs))
+                return cls
+
+            return deco
+
+    def stub(name, **attrs):
+        mod = types.ModuleType(name)
+        mod.__dict__.update(attrs)
+        mod.__path__ = []
+        parts = name.split(".")
+        for depth in range(1, len(parts)):  # parent packages, so that `import a.b.c` resolves
+            parent = ".".join(parts[:depth])
+            if parent not in sys.modules or not hasattr(sys.modules[parent], "__path__"):
+                pkg = types.ModuleType(parent)
+                pkg.__path__ = []
+                monkeypatch.setitem(sys.modules, parent, pkg)
+        monkeypatch.setitem(sys.modules, name, mod)
+        if len(parts) > 1:
+            setattr(sys.modules[".".join(parts[:-1])], parts[-1], mod)
+        return mod
+
+    class BatchFeature(dict):
+
+        def __init__(self, data=None, **kwargs):
+            super().__init__(data or {})
+
+    class MultiModalDataParser:
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class VideoProcessorItems:
+        pass
+
+    class PromptUpdateDetails:
+
+        def __init__(self, full, token_id):
+            self.full, self.token_id = full, token_id
+
+        @classmethod
+        def select_token_id(cls, full, token_id):
+            return cls(full, token_id)
+
+    class PromptReplacement:
+
+        def __init__(self, modality, target, replacement):
+            self.modality, self.target, self.replacement = modality, target, replacement
+
+    renderer = stub("vllm.renderers.kimi_k3", _K3_MEDIA_IO_DEFAULTS={"image": {"image_mode": None}})
+    amd_model = stub(
+        "vllm.models.kimi_k3.amd.model",
+        KimiK3ForConditionalGeneration=K3Model,
+        vision_tower_forward=lambda tower, pixels, grids, **kw:
+        [torch.full((int(g[1] * g[2] // 4), 3), float(i)) for i, g in enumerate(grids)],
+    )
+    stub("transformers", BatchFeature=BatchFeature)
+    stub("vllm.multimodal", MULTIMODAL_REGISTRY=Registry())
+    stub("vllm.multimodal.inputs", MultiModalFieldConfig=_FieldConfig)
+    stub("vllm.multimodal.parse", MultiModalDataParser=MultiModalDataParser, VideoProcessorItems=VideoProcessorItems)
+    stub("vllm.multimodal.processing",
+         PromptReplacement=PromptReplacement,
+         PromptUpdateDetails=PromptUpdateDetails,
+         cached_encode=lambda tok, text, add_special_tokens=False: ("enc", text))
+    stub("vllm.models.kimi_k3.common.mm_preprocess",
+         KimiK3DummyInputsBuilder=BaseDummy,
+         KimiK3MultiModalProcessor=BaseProcessor,
+         KimiK3ProcessingInfo=_Info)
+
+    monkeypatch.delitem(sys.modules, "vllm_gaudi.models.kimi_k3_video", raising=False)
+    ns.mod = _load("vllm_gaudi.models.kimi_k3_video", ROOT / "models" / "kimi_k3_video.py")
+    monkeypatch.setitem(sys.modules, "vllm_gaudi.models.kimi_k3_video", ns.mod)
+    ns.K3Model, ns.OtherModel, ns.renderer, ns.amd_model = K3Model, OtherModel, renderer, amd_model
+    ns.PromptReplacement = PromptReplacement
+    K3Model.marked.clear()
+    return ns
+
+
+def _ibm_video(utils):
+    import numpy as np
+    frames = np.zeros((IBM_FRAMES, IBM_HEIGHT, IBM_WIDTH, 3), dtype=np.uint8)
+    metadata = {"total_num_frames": IBM_FRAMES, "fps": IBM_FPS, "frames_indices": list(range(IBM_FRAMES))}
+    return frames, metadata
+
+
+# -------------------------------------------------------------------- gating
+
+
+def test_install_touches_only_the_k3_model(video):
+    video.mod.install_kimi_k3_video()
+
+    assert [r[0] for r in video.registrations] == [video.K3Model]
+    assert video.K3Model.get_placeholder_str("video", 0) == "<|kimi_video_placeholder|>"
+    assert video.K3Model.get_placeholder_str("image", 0) == "<|kimi_image_placeholder|>"
+    assert video.renderer._K3_MEDIA_IO_DEFAULTS["video"] == {"num_frames": 256, "fps": 8.0}
+    assert video.renderer._K3_MEDIA_IO_DEFAULTS["image"] == {"image_mode": None}
+
+
+def test_other_models_keep_their_behaviour(video):
+    """Negative check: a Kimi-K2.5/K2.6-like class (and any other model) gets no video support from the K3 patch."""
+    video.mod.install_kimi_k3_video()
+
+    other = video.OtherModel
+    with pytest.raises(ValueError):
+        other.get_placeholder_str("video", 0)
+    assert other.get_placeholder_str("image", 0) == "<|kimi_image_placeholder|>"
+    assert other.embed_multimodal(other(), **{video.mod.VIDEO_PIXEL_VALUES: torch.zeros(1)}) == "image-path"
+    other()._mark_tower_model(None, "image")
+    assert video.K3Model.marked[-1] == "image"
+    assert "_hpu_kimi_k3_video" not in vars(other)
+
+
+def test_install_is_idempotent(video):
+    video.mod.install_kimi_k3_video()
+    video.mod.install_kimi_k3_video()
+    assert len(video.registrations) == 1
+
+
+def test_tower_is_marked_for_both_modalities(video):
+    video.mod.install_kimi_k3_video()
+    video.K3Model()._mark_tower_model(None, "image")
+    assert video.K3Model.marked == [{"image", "video"}]
+
+
+def test_image_requests_take_the_unchanged_path(video):
+    video.mod.install_kimi_k3_video()
+    assert video.K3Model().embed_multimodal(pixel_values=torch.zeros(1), grid_thws=torch.zeros(1, 3)) == "image-path"
+
+
+def test_failed_install_is_logged_as_a_warning(video, monkeypatch, caplog):
+    """_patch_kimi_k3_arch swallows exceptions; the video patch must not stay silent."""
+    for name in ("vllm", "vllm.envs"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.config", types.SimpleNamespace(get_current_vllm_config_or_none=lambda: None))
+    monkeypatch.delitem(sys.modules, "vllm_gaudi.patches", raising=False)
+    patches = importlib_import("vllm_gaudi.patches")
+    monkeypatch.setattr(patches, "_KIMI_PATCHES_INSTALLED", [])
+    monkeypatch.setattr(patches, "_KIMI_PATCHES_FAILED", {})
+    monkeypatch.setattr(patches, "_KIMI_PATCHES_WARNED", set())
+
+    def boom():
+        raise RuntimeError("no video for you")
+
+    monkeypatch.setattr(video.mod, "install_kimi_k3_video", boom)
+    patches._patch_kimi_k3_video()
+    assert "k3_video" in patches._KIMI_PATCHES_FAILED
+    with caplog.at_level(logging.WARNING, logger="vllm.gaudi.kimi_patches"):
+        patches._kimi_patches_log_failed(only=patches._KIMI_CONFIG_PATCHES)
+    assert any("k3_video" in r.getMessage() and "no video for you" in r.getMessage() for r in caplog.records)
+
+    monkeypatch.setattr(video.mod, "install_kimi_k3_video", lambda: None)
+    patches._patch_kimi_k3_video()
+    assert "k3_video" not in patches._KIMI_PATCHES_FAILED
+    assert "k3_video" in patches._KIMI_PATCHES_INSTALLED
+
+
+def importlib_import(name):
+    import importlib
+    return importlib.import_module(name)
+
+
+# --------------------------------------------------------- processor and model
+
+
+def _processor(video):
+    video.mod.install_kimi_k3_video()
+    return video.registrations[0][1]()
+
+
+def test_dummy_video_defaults_to_the_ibm_shape(video):
+    video.mod.install_kimi_k3_video()
+    builder = video.registrations[0][3]()
+    assert builder.get_dummy_text({"video": 2}) == "<|kimi_video_placeholder|>" * 2
+    data = builder.get_dummy_mm_data(1024, {"video": 2, "image": 0})
+    frames, metadata = data["video"][0]
+    assert frames.shape == (20, 480, 864, 3) and len(data["video"]) == 2
+    assert metadata["fps"] == 2.0 and metadata["total_num_frames"] == 20
+    override = types.SimpleNamespace(width=64, height=32, num_frames=8)
+    frames, _ = builder.get_dummy_mm_data(1024, {"video": 1}, {"video": override})["video"][0]
+    assert frames.shape == (8, 32, 64, 3)
+
+
+def test_data_parser_asks_for_video_metadata(video):
+    video.mod.install_kimi_k3_video()
+    assert video.registrations[0][2]().get_data_parser().kwargs["video_needs_metadata"] is True
+    assert video.registrations[0][2]().get_supported_mm_limits() == {"image": None, "video": None}
+
+
+def test_processor_builds_one_grid_per_chunk(video):
+    proc = _processor(video)
+    out = proc._call_hf_processor({"videos": [_ibm_video(video.utils)]}, {})
+
+    assert out[video.mod.VIDEO_GRID_THWS].tolist() == [[4, 36, 62]] * 5
+    assert out[video.mod.VIDEO_NUM_CHUNKS].tolist() == [5]
+    assert "pixel_values" not in out  # images are not touched
+    (medias, ) = proc.info.preprocess_calls
+    assert [len(m["video_chunk"]) for m in medias] == [4] * 5
+    assert all(m["type"] == "video_chunk" for m in medias)
+
+
+def test_images_and_videos_in_one_request(video):
+    proc = _processor(video)
+    out = proc._call_hf_processor({"images": ["img"], "videos": [_ibm_video(video.utils)]}, {})
+    assert "pixel_values" in out and video.mod.VIDEO_PIXEL_VALUES in out
+
+
+def test_fields_slice_the_flat_tensors_per_video(video):
+    proc = _processor(video)
+    hf_inputs = proc._call_hf_processor({"videos": [_ibm_video(video.utils)] * 2}, {})
+    fields = proc._get_mm_fields_config(hf_inputs, {})
+
+    chunk_patches = 4 * 36 * 62
+    assert fields[video.mod.VIDEO_PIXEL_VALUES].sizes.tolist() == [5 * chunk_patches] * 2
+    assert fields[video.mod.VIDEO_GRID_THWS].sizes.tolist() == [5, 5]
+    assert fields[video.mod.VIDEO_GRID_THWS].keep_on_cpu and fields[video.mod.VIDEO_NUM_CHUNKS].keep_on_cpu
+    assert all(f.modality == "video" for k, f in fields.items() if k != "pixel_values")
+
+
+def test_fields_without_video_are_the_image_fields(video):
+    proc = _processor(video)
+    assert list(proc._get_mm_fields_config({"pixel_values": 1}, {})) == ["pixel_values"]
+
+
+def test_prompt_replacement_has_2790_media_pads(video):
+    proc = _processor(video)
+    item = _ibm_video(video.utils)
+    items = types.SimpleNamespace(get=lambda i: item)
+
+    class Items(dict):
+
+        def get_items(self, modality, typ):
+            return items
+
+    updates = proc._get_prompt_updates(Items(video=items), {}, None)
+    assert updates[0] == "image-update"
+    replacement = updates[1]
+    assert replacement.modality == "video"
+    assert replacement.target == ("enc", "<|kimi_video_placeholder|>")
+    details = replacement.replacement(0)
+    assert details.token_id == 7
+    _, text = details.full
+    assert text.count("<|media_pad|>") == IBM_VISION_TOKENS
+    assert text.startswith("00:00:00.000<|media_begin|>video<|media_content|>")
+    assert text.count("<|media_end|>") == 5 and "00:00:08.000<|media_begin|>" in text
+
+
+def test_embed_returns_one_tensor_per_video(video):
+    video.mod.install_kimi_k3_video()
+    grid = torch.tensor([[4, 36, 62]] * 5 + [[4, 36, 62]] * 3)
+    model = video.K3Model()
+    model.vision_tower, model.mm_projector, model.use_data_parallel = object(), object(), False
+    out = model.embed_multimodal(
+        **{
+            video.mod.VIDEO_PIXEL_VALUES: torch.zeros(1),
+            video.mod.VIDEO_GRID_THWS: grid,
+            video.mod.VIDEO_NUM_CHUNKS: torch.tensor([5, 3]),
+        })
+    assert [t.shape[0] for t in out] == [5 * 558, 3 * 558]
+
+
+def test_mixed_group_is_rejected(video):
+    video.mod.install_kimi_k3_video()
+    with pytest.raises(ValueError):
+        video.K3Model().embed_multimodal(pixel_values=torch.zeros(1), **{video.mod.VIDEO_PIXEL_VALUES: torch.zeros(1)})
