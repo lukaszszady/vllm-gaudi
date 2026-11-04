@@ -468,6 +468,63 @@ def test_prompt_replacement_has_2790_media_pads(video):
     assert text.count("<|media_end|>") == 5 and "00:00:08.000<|media_begin|>" in text
 
 
+def _prompt_text(proc, item):
+    items = types.SimpleNamespace(get=lambda i: item)
+
+    class Items(dict):
+
+        def get_items(self, modality, typ):
+            return items
+
+    return proc._get_prompt_updates(Items(video=items), {}, None)[1].replacement(0).full[1]
+
+
+def test_last_incomplete_chunk_through_processor_prompt_and_embed(video):
+    """18 frames at 2 fps: four chunks of 4 frames and a tail chunk of 2 (a frame is never dropped or padded)."""
+    import numpy as np
+    frames = np.zeros((18, IBM_HEIGHT, IBM_WIDTH, 3), dtype=np.uint8)
+    item = (frames, {"total_num_frames": 18, "fps": IBM_FPS, "frames_indices": list(range(18))})
+    proc = _processor(video)
+
+    out = proc._call_hf_processor({"videos": [item]}, {})
+    assert out[video.mod.VIDEO_GRID_THWS].tolist() == [[4, 36, 62]] * 4 + [[2, 36, 62]]
+    assert out[video.mod.VIDEO_NUM_CHUNKS].tolist() == [5]
+    assert [len(m["video_chunk"]) for m in proc.info.preprocess_calls[0]] == [4, 4, 4, 4, 2]
+
+    text = _prompt_text(proc, item)  # the tail chunk gets its own timestamped block with the usual token count
+    assert text.count("<|media_begin|>video<|media_content|>") == 5
+    assert text.count("<|media_pad|>") == 5 * 558
+    assert text.startswith("00:00:00.000<") and "00:00:08.000<|media_begin|>" in text
+
+    model = video.K3Model()
+    model.vision_tower, model.mm_projector, model.use_data_parallel = object(), object(), False
+    (embeds, ) = model.embed_multimodal(
+        **{
+            video.mod.VIDEO_PIXEL_VALUES: out[video.mod.VIDEO_PIXEL_VALUES],
+            video.mod.VIDEO_GRID_THWS: out[video.mod.VIDEO_GRID_THWS],
+            video.mod.VIDEO_NUM_CHUNKS: out[video.mod.VIDEO_NUM_CHUNKS],
+        })
+    assert embeds.shape[0] == 5 * 558
+
+
+def test_prompt_replacement_accepts_a_list_of_frames(video):
+    frames = _ibm_video(video.utils)[0]
+    item = (list(frames), {"total_num_frames": IBM_FRAMES, "fps": IBM_FPS})
+    assert _prompt_text(_processor(video), item).count("<|media_pad|>") == IBM_VISION_TOKENS
+
+
+def test_missing_fps_is_logged_as_a_warning(video, caplog):
+    frames = _ibm_video(video.utils)[0]
+    with caplog.at_level(logging.WARNING, logger="vllm"):
+        chunks, _ = video.mod.video_chunk_plan(frames, {}, K3_CFG)
+    assert len(chunks) == 5
+    assert any("no fps" in r.message and r.name.startswith("vllm.") for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="vllm"):
+        video.mod.video_chunk_plan(frames, {"fps": IBM_FPS}, K3_CFG)
+    assert not caplog.records
+
+
 def test_embed_returns_one_tensor_per_video(video):
     video.mod.install_kimi_k3_video()
     grid = torch.tensor([[4, 36, 62]] * 5 + [[4, 36, 62]] * 3)

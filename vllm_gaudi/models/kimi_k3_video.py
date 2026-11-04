@@ -17,9 +17,11 @@ How a ``video_url`` request flows through the patched model:
    time) and concatenates the chunk embeddings of a video into ONE tensor per video, the contract of the HPU runner.
 
 Video tensors use their own keyword names (``video_pixel_values`` / ``video_grid_thws`` / ``video_num_chunks``) so the
-model can tell a video group from an image group. The vision tower is run eagerly (it is not part of the
-torch.compile region), so a video only adds a new input shape; MM warmup compiles nothing extra but runs the tower on
-the shapes given by ``--limit-mm-per-prompt`` (see ``docs/features/kimi_k3_video.md``).
+model can tell a video group from an image group. The vision tower is not eager on HPU: in torch.compile mode regional
+compilation compiles every ``nn.ModuleList`` of the model, including ``vision_tower.encoder.blocks``, and in lazy mode
+the tower runs in an HPU graph. A video chunk (T=4, 36x62 patches for 864x480) is a new input shape, so it creates new
+graphs. The multimodal warmup precompiles them from the video shape of ``--limit-mm-per-prompt`` (see
+``docs/features/kimi_k3_video.md``); a video shape that was not warmed up compiles on the first request.
 
 The K3 classes cannot be imported while the plugin loads, so everything that subclasses them is built by
 ``install_kimi_k3_video`` when the K3 patches are applied.
@@ -51,6 +53,7 @@ VIDEO_NUM_CHUNKS = "video_num_chunks"
 # Marker set on the patched model class; makes the installation idempotent.
 _INSTALLED_FLAG = "_hpu_kimi_k3_video"
 
+# Must stay in the "vllm.*" tree: other loggers are silent in vllm-gaudi.
 logger = logging.getLogger("vllm.gaudi.kimi_k3_video")
 
 
@@ -64,7 +67,12 @@ def _split_video_item(item: Any) -> tuple[Any, Mapping[str, Any]]:
 def video_chunk_plan(frames: Any, metadata: Mapping[str, Any], media_proc_cfg: Mapping[str, Any]):
     """Chunks and chunk start times of a decoded video (``frames``: ``[N, H, W, 3]``) from its loader metadata."""
     num_loaded = len(frames)
-    source_fps = float(metadata.get("fps") or DUMMY_VIDEO_FPS)
+    source_fps = metadata.get("fps")
+    if not source_fps:
+        logger.warning("Video loader gave no fps; assuming %s fps for the frame sampling and chunk timestamps",
+                       DUMMY_VIDEO_FPS)
+        source_fps = DUMMY_VIDEO_FPS
+    source_fps = float(source_fps)
     return plan_video_chunks(
         num_loaded,
         int(metadata.get("total_num_frames") or num_loaded),
@@ -194,6 +202,7 @@ def _make_classes():
 
             def get_replacement(item_idx: int) -> PromptUpdateDetails:
                 frames, metadata = _split_video_item(videos.get(item_idx))
+                frames = np.asarray(frames)
                 chunks, starts = video_chunk_plan(frames, metadata, cfg)
                 # Tokens of a chunk do not depend on its pixels, only on the frame size: count them with blank frames
                 # of the real size through the same calculator the image path uses.

@@ -23,8 +23,11 @@ For example, a 20-frame 864x480 video at 2 fps gives 5 chunks of 558 vision toke
 
 ## Warmup
 
-The vision tower runs eagerly, so a new video shape does not compile new graphs, but multimodal warmup still runs the
-tower on the configured shapes. To warm up the video shape pass it explicitly:
+The vision tower is compiled on HPU: in torch.compile mode regional compilation compiles every `nn.ModuleList`,
+including `vision_tower.encoder.blocks`, and in lazy mode the tower runs in an HPU graph. A video chunk (for example
+T=4 frames, 36x62 patches for 864x480) is a new input shape and creates new graphs. Multimodal warmup precompiles them
+from the video shape of `--limit-mm-per-prompt`; a video shape that is not warmed up compiles on the first request. To
+warm up the video shape pass it explicitly:
 
 ```bash
 --limit-mm-per-prompt '{"image": 20, "video": {"count": 1, "width": 864, "height": 480, "num_frames": 20}}'
