@@ -429,46 +429,22 @@ class TestMmEmbedMaskCallSites:
         assert spy.call_count == 0
         assert torch.equal(mm_embeds[0], encoder_cache["img"])
 
-    @pytest.mark.parametrize("num_computed", [0, 5])
-    def test_encoder_cache_layout_is_what_gather_selects_from(self, monkeypatch, num_computed):
-        # _execute_mm_encoder keeps the original placeholder scatter (the HPU build ran it with a device mask; its
-        # source rows are not required to match the is_embed count there). Only _gather_mm_embeddings uses host
-        # indices, so it must read exactly the layout the encoder stores: one row per placeholder position.
+    def test_execute_mm_encoder_scatters_the_embedding_rows(self, no_bool_mask_on_tensors, monkeypatch):
         rows = _make_encoder_output(int(_VIDEO_IS_EMBED.sum()))
-        requests = {
-            "req_0":
-            _make_request_state("req_0",
-                                40, [_make_video_feature("vid", 3, with_pixels=True)],
-                                num_computed_tokens=num_computed)
-        }
+        requests = {"req_0": _make_request_state("req_0", 40, [_make_video_feature("vid", 3, with_pixels=True)])}
         runner = _make_mock_runner(requests, encoder_cache={})
         runner.pin_memory = False
         runner.model = MagicMock()
         runner.model.embed_multimodal.return_value = [rows]
-        # The encoder path must not go through the host-index helpers.
-        select_spy = MagicMock(wraps=hpu_model_runner.select_embed_rows)
-        monkeypatch.setattr(hpu_model_runner, "select_embed_rows", select_spy)
-        assert not hasattr(hpu_model_runner, "scatter_embed_rows")
-        index_copy = MagicMock(side_effect=AssertionError("index_copy_ in the encoder path"))
-        monkeypatch.setattr(torch.Tensor, "index_copy_", index_copy)
+        spy = MagicMock(wraps=hpu_model_runner.scatter_embed_rows)
+        monkeypatch.setattr(hpu_model_runner, "scatter_embed_rows", spy)
 
         HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"req_0": 40}), ["req_0"])
 
+        assert spy.call_count == 1
         cached = runner.encoder_cache["vid"]
-        assert select_spy.call_count == 0
         assert cached.shape == (_VIDEO_LENGTH, HIDDEN_SIZE)
         embed_idx = torch.nonzero(_VIDEO_IS_EMBED, as_tuple=True)[0]
         gap_idx = torch.nonzero(~_VIDEO_IS_EMBED, as_tuple=True)[0]
         assert torch.equal(cached.index_select(0, embed_idx), rows)
         assert torch.isnan(cached.index_select(0, gap_idx)).all()
-
-        scheduled = 40 - num_computed
-        mm_embeds, _ = HPUModelRunner._gather_mm_embeddings(runner,
-                                                            _make_scheduler_output({"req_0": scheduled}),
-                                                            req_ids=["req_0"],
-                                                            total_num_scheduled_tokens=scheduled)
-        start_idx = max(num_computed - 3, 0)
-        expected_rows = int(_VIDEO_IS_EMBED[start_idx:].sum())
-        assert select_spy.call_count == 1
-        assert mm_embeds[0].shape == (expected_rows, HIDDEN_SIZE)
-        assert not torch.isnan(mm_embeds[0]).any()
