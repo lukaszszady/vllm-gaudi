@@ -276,17 +276,34 @@ def _patch_model_class(model_cls, amd_model) -> None:
         if isinstance(num_chunks, list):
             num_chunks = torch.stack(list(num_chunks))
         grid_thws = grid_thws.reshape(-1, grid_thws.shape[-1])
-        # One tensor per chunk row from the tower; the runner needs one per video.
+        # Always the plain (non data-parallel) tower call. With use_data_parallel (the default for K3: 12 vision heads
+        # do not divide TP16, see is_vit_use_data_parallel, vllm/model_executor/models/vision.py:141)
+        # vision_tower_forward (kimi_k25_vit.py:869) goes through run_dp_sharded_mrope_vision_model, which sizes every
+        # output as t*h*w // merge_area patches and so ignores the temporal pooling of tpool_patch_merger
+        # (kimi_k25_vit.py:656-679): a t=4 chunk then yields 4x the 18x31 rows it really has. Images (t=1) are not
+        # affected. In data-parallel mode the tower layers are replicated (disable_tp), so every rank can run the
+        # whole batch itself.
         per_chunk = amd_model.vision_tower_forward(
             self.vision_tower,
             pixel_values,
             grid_thws,
             mm_projector=self.mm_projector,
-            use_data_parallel=self.use_data_parallel,
+            use_data_parallel=False,
         )
+        chunks_per_video = num_chunks.reshape(-1).tolist()
+        if len(per_chunk) != sum(chunks_per_video):
+            raise ValueError(f"Kimi-K3 video: the vision tower returned {len(per_chunk)} chunk embeddings for "
+                             f"{sum(chunks_per_video)} chunks")
+        merge_h, merge_w = self.vision_tower.merge_kernel_size
+        for i, (_, h, w) in enumerate(grid_thws.tolist()):
+            expected = (h // merge_h) * (w // merge_w)
+            if per_chunk[i].shape[0] != expected:
+                raise ValueError(f"Kimi-K3 video: chunk {i} has {per_chunk[i].shape[0]} embedding rows, expected "
+                                 f"{expected} ((h={h})//{merge_h} * (w={w})//{merge_w})")
+        # One tensor per chunk row from the tower; the runner needs one per video.
         outputs = []
         start = 0
-        for count in num_chunks.reshape(-1).tolist():
+        for count in chunks_per_video:
             outputs.append(torch.cat(list(per_chunk[start:start + count]), dim=0))
             start += count
         return outputs

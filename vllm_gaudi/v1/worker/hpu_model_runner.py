@@ -2226,7 +2226,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # _gather_mm_embeddings, so reordering is not necessary.
 
         # Cache the encoder outputs.
-        for (mm_hash, pos_info), output in zip(
+        for (modality, _), (mm_hash, pos_info), output in zip(
+                mm_kwargs,
                 mm_hashes_pos,
                 encoder_outputs,
         ):
@@ -2235,6 +2236,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if is_embed is None:
                 scattered_output = output
             else:
+                # The mask lives on the host, so the count is free. A mismatch means the model returned a different
+                # number of embeddings than the prompt has placeholder tokens; fail here with both sizes instead of
+                # inside the device copy.
+                num_embed = int(is_embed.sum())
+                if output.shape[0] != num_embed:
+                    raise ValueError(f"Encoder output of the {modality} item {mm_hash} has {output.shape[0]} rows, "
+                                     f"but its prompt placeholder has {num_embed} embedding positions "
+                                     f"(placeholder length {is_embed.shape[0]})")
                 # Same result as placeholders[is_embed] = output, without a boolean mask on the device
                 scattered_output = scatter_embed_rows(output, is_embed, fill_value=torch.nan)
 
@@ -2294,9 +2303,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
-                    mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
-                else:
-                    mm_embeds_item = encoder_output[start_idx:end_idx]
 
                 sliced_output = encoder_output[start_idx:end_idx]
                 # Same result as sliced_output[is_embed], without a boolean mask on the device

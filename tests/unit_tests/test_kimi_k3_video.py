@@ -298,8 +298,7 @@ def video(monkeypatch, utils):
     amd_model = stub(
         "vllm.models.kimi_k3.amd.model",
         KimiK3ForConditionalGeneration=K3Model,
-        vision_tower_forward=lambda tower, pixels, grids, **kw:
-        [torch.full((int(g[1] * g[2] // 4), 3), float(i)) for i, g in enumerate(grids)],
+        vision_tower_forward=_stub_vision_tower_forward,
     )
     stub("transformers", BatchFeature=BatchFeature)
     stub("vllm.multimodal", MULTIMODAL_REGISTRY=Registry())
@@ -321,6 +320,24 @@ def video(monkeypatch, utils):
     ns.PromptReplacement = PromptReplacement
     K3Model.marked.clear()
     return ns
+
+
+def _stub_vision_tower_forward(tower, pixels, grids, *, use_data_parallel=False, **kw):
+    """Row counts of the real vision_tower_forward for a [t, h, w] grid with a 2x2 merge, without the tower weights.
+
+    The plain path pools a chunk over time (tpool_patch_merger): h*w//4 rows. The data-parallel path
+    (run_dp_sharded_mrope_vision_model) sizes its outputs as t*h*w//4 and ignores the pooling, which is the upstream
+    behaviour that made a 4-frame chunk return 4x the rows.
+    """
+    merge_area = tower.merge_kernel_size[0] * tower.merge_kernel_size[1]
+    return [
+        torch.full((int((g[0] if use_data_parallel else 1) * g[1] * g[2] // merge_area), 3), float(i))
+        for i, g in enumerate(grids)
+    ]
+
+
+class _Tower:
+    merge_kernel_size = (2, 2)
 
 
 def _ibm_video(utils):
@@ -520,7 +537,7 @@ def test_last_incomplete_chunk_through_processor_prompt_and_embed(video):
     assert text.startswith("00:00:00.000<") and "00:00:08.000<|media_begin|>" in text
 
     model = video.K3Model()
-    model.vision_tower, model.mm_projector, model.use_data_parallel = object(), object(), False
+    model.vision_tower, model.mm_projector, model.use_data_parallel = _Tower(), object(), False
     (embeds, ) = model.embed_multimodal(
         **{
             video.mod.VIDEO_PIXEL_VALUES: out[video.mod.VIDEO_PIXEL_VALUES],
@@ -552,7 +569,7 @@ def test_embed_returns_one_tensor_per_video(video):
     video.mod.install_kimi_k3_video()
     grid = torch.tensor([[4, 36, 62]] * 5 + [[4, 36, 62]] * 3)
     model = video.K3Model()
-    model.vision_tower, model.mm_projector, model.use_data_parallel = object(), object(), False
+    model.vision_tower, model.mm_projector, model.use_data_parallel = _Tower(), object(), False
     out = model.embed_multimodal(
         **{
             video.mod.VIDEO_PIXEL_VALUES: torch.zeros(1),
@@ -560,6 +577,78 @@ def test_embed_returns_one_tensor_per_video(video):
             video.mod.VIDEO_NUM_CHUNKS: torch.tensor([5, 3]),
         })
     assert [t.shape[0] for t in out] == [5 * 558, 3 * 558]
+
+
+def _video_model(video, use_data_parallel):
+    model = video.K3Model()
+    model.vision_tower, model.mm_projector, model.use_data_parallel = _Tower(), object(), use_data_parallel
+    return model
+
+
+@pytest.mark.parametrize("use_data_parallel", [False, True])
+def test_embed_rows_equal_the_placeholder_count_for_a_20_frame_864x480_video(video, use_data_parallel):
+    # Through the processor: the grids come from the processor, the placeholder count from the prompt replacement.
+    # The model may have use_data_parallel=True (K3 with TP16); the video path must not use the DP-sharded tower
+    # helper, whose outputs ignore the temporal pooling (5 chunks x 2232 = 11160 rows instead of 2790).
+    proc = _processor(video)
+    item = _ibm_video(video.utils)
+    out = proc._call_hf_processor({"videos": [item]}, {})
+    num_pads = _prompt_text(proc, item).count("<|media_pad|>")
+    assert num_pads == IBM_VISION_TOKENS == 2790
+
+    video.mod.install_kimi_k3_video()
+    (embeds, ) = _video_model(video, use_data_parallel).embed_multimodal(
+        **{
+            video.mod.VIDEO_PIXEL_VALUES: out[video.mod.VIDEO_PIXEL_VALUES],
+            video.mod.VIDEO_GRID_THWS: out[video.mod.VIDEO_GRID_THWS],
+            video.mod.VIDEO_NUM_CHUNKS: out[video.mod.VIDEO_NUM_CHUNKS],
+        })
+    assert embeds.shape[0] == num_pads
+    # Chunk order is kept: the rows of chunk i carry the marker value i of the stub tower.
+    assert embeds[:, 0].unique_consecutive().tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_embed_requests_the_plain_tower_even_with_data_parallel(video):
+    seen = []
+    orig = video.amd_model.vision_tower_forward
+
+    def tower(tower_, pixels, grids, **kw):
+        seen.append(kw["use_data_parallel"])
+        return orig(tower_, pixels, grids, **kw)
+
+    video.amd_model.vision_tower_forward = tower
+    video.mod.install_kimi_k3_video()
+    _video_model(video, True).embed_multimodal(
+        **{
+            video.mod.VIDEO_PIXEL_VALUES: torch.zeros(1),
+            video.mod.VIDEO_GRID_THWS: torch.tensor([[4, 36, 62]]),
+            video.mod.VIDEO_NUM_CHUNKS: torch.tensor([1]),
+        })
+    assert seen == [False]
+
+
+def test_embed_rejects_a_chunk_with_the_wrong_row_count(video):
+    video.mod.install_kimi_k3_video()
+    video.amd_model.vision_tower_forward = lambda tower, pixels, grids, **kw: [torch.zeros(4 * 558, 3)]
+    with pytest.raises(ValueError, match="chunk 0 has 2232 embedding rows, expected 558"):
+        _video_model(video, False).embed_multimodal(
+            **{
+                video.mod.VIDEO_PIXEL_VALUES: torch.zeros(1),
+                video.mod.VIDEO_GRID_THWS: torch.tensor([[4, 36, 62]]),
+                video.mod.VIDEO_NUM_CHUNKS: torch.tensor([1]),
+            })
+
+
+def test_embed_rejects_a_wrong_chunk_count(video):
+    video.mod.install_kimi_k3_video()
+    video.amd_model.vision_tower_forward = lambda tower, pixels, grids, **kw: [torch.zeros(558, 3)]
+    with pytest.raises(ValueError, match="1 chunk embeddings for 2 chunks"):
+        _video_model(video, False).embed_multimodal(
+            **{
+                video.mod.VIDEO_PIXEL_VALUES: torch.zeros(1),
+                video.mod.VIDEO_GRID_THWS: torch.tensor([[4, 36, 62]] * 2),
+                video.mod.VIDEO_NUM_CHUNKS: torch.tensor([2]),
+            })
 
 
 def test_mixed_group_is_rejected(video):
@@ -706,7 +795,7 @@ def test_video_pixels_reach_the_tower_in_the_model_dtype(video):
     proc.info.device_normalize = False
     out = proc._call_hf_processor({"videos": [_ibm_video(video.utils)]}, {})
     model = video.K3Model()
-    model.vision_tower, model.mm_projector, model.use_data_parallel = object(), object(), False
+    model.vision_tower, model.mm_projector, model.use_data_parallel = _Tower(), object(), False
     embeds = model.embed_multimodal(
         **{
             video.mod.VIDEO_PIXEL_VALUES: out[video.mod.VIDEO_PIXEL_VALUES],

@@ -448,3 +448,41 @@ class TestMmEmbedMaskCallSites:
         gap_idx = torch.nonzero(~_VIDEO_IS_EMBED, as_tuple=True)[0]
         assert torch.equal(cached.index_select(0, embed_idx), rows)
         assert torch.isnan(cached.index_select(0, gap_idx)).all()
+
+    @pytest.mark.parametrize("factor", [4, 0])
+    def test_execute_mm_encoder_rejects_a_row_count_that_differs_from_the_placeholder(
+            self, no_bool_mask_on_tensors, factor):
+        # 4x the rows is what a vision tower that skips the temporal pooling of a video chunk returns.
+        num_embed = int(_VIDEO_IS_EMBED.sum())
+        rows = _make_encoder_output(factor * num_embed)
+        requests = {"req_0": _make_request_state("req_0", 40, [_make_video_feature("vid", 3, with_pixels=True)])}
+        runner = _make_mock_runner(requests, encoder_cache={})
+        runner.pin_memory = False
+        runner.model = MagicMock()
+        runner.model.embed_multimodal.return_value = [rows]
+
+        with pytest.raises(ValueError) as err:
+            HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"req_0": 40}), ["req_0"])
+
+        message = str(err.value)
+        assert "video" in message and "vid" in message
+        assert f"has {factor * num_embed} rows" in message
+        assert f"{num_embed} embedding positions" in message
+        assert "vid" not in runner.encoder_cache
+
+    def test_gather_returns_the_rows_that_execute_mm_encoder_cached(self, no_bool_mask_on_tensors):
+        rows = _make_encoder_output(int(_VIDEO_IS_EMBED.sum()))
+        requests = {"req_0": _make_request_state("req_0", 40, [_make_video_feature("vid", 3, with_pixels=True)])}
+        runner = _make_mock_runner(requests, encoder_cache={})
+        runner.pin_memory = False
+        runner.model = MagicMock()
+        runner.model.embed_multimodal.return_value = [rows]
+        HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"req_0": 40}), ["req_0"])
+
+        mm_embeds, _ = HPUModelRunner._gather_mm_embeddings(runner,
+                                                            _make_scheduler_output({"req_0": 40}),
+                                                            req_ids=["req_0"],
+                                                            total_num_scheduled_tokens=40)
+
+        assert len(mm_embeds) == 1
+        assert torch.equal(mm_embeds[0], rows)
