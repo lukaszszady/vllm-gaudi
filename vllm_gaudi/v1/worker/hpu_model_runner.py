@@ -31,6 +31,7 @@ import vllm_gaudi.envs as gaudi_envs
 import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.kimi_k3_gate import is_kimi_k3_model_config
 from vllm_gaudi.patches import ensure_kimi_k3_patches, report_kimi_patches, report_kimi_patches_on_load_failure
+from vllm_gaudi.mm_warmup_inputs import build_dummy_processor_inputs, build_raw_image_processor_inputs
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cache_groups
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
@@ -6079,7 +6080,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # same grid as real traffic, guaranteeing a warmup cache hit.
                 processor_inputs = self._build_raw_image_processor_inputs(processor, modality, count, width, height)
             else:
-                processor_inputs = processor.dummy_inputs.get_dummy_processor_inputs(
+                processor_inputs = build_dummy_processor_inputs(
+                    processor,
                     seq_len=self.model_config_copy.max_model_len,
                     mm_counts={modality: count},
                     mm_options=mm_options,
@@ -6094,53 +6096,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return dummy_mm_inputs
 
     def _build_raw_image_processor_inputs(self, processor, modality, count, width, height):
-        """Build ProcessorInputs from raw WxH images, bypassing the upstream
-        per-dimension clamp in DummyInputsBuilder._get_dummy_images.
-
-        Mirrors get_dummy_processor_inputs (dummy_text + parse_mm_data +
-        ProcessorInputs) but supplies our own solid image at the requested raw
-        WxH. The upstream builder clamps width and height *independently*
-        against the model's max-feature size, distorting the aspect ratio so
-        the warmed grid stops matching real traffic. Feeding the raw image
-        straight through processor.apply lets the model's own resize
-        (smart_resize / navit_resize / ...) pick exactly the same grid it
-        would for a real image of that resolution -- including scaling an
-        oversized image down -- so warmup and serving grids are identical by
-        construction.
-        """
-        from PIL import Image
-        from vllm.multimodal.processing.inputs import ProcessorInputs
-
-        images = [Image.new("RGB", (width, height), color=255)] * count
-
-        # vision_chunk (Kimi-K2.5/K2.6) does not accept bare PIL images: its
-        # parser expects VisionChunkImage dicts ({"type": "image", "image":
-        # PIL}). 'image' takes the raw PIL directly. Wrap accordingly so the
-        # raw WxH still flows through the model's own resize (navit_resize) and
-        # the warmed grid matches real serving traffic.
-        mm_items = ([{"type": "image", "image": img} for img in images] if modality == 'vision_chunk' else images)
-
-        dummy_builder = processor.dummy_inputs
-        dummy_text = dummy_builder.get_dummy_text({modality: count})
-        mm_data_items = processor.info.parse_mm_data({modality: mm_items}, validate=False)
-
-        # Upstream vllm#53093 removed the text components (str prompt +
-        # tokenization_kwargs) from ProcessorInputs; the prompt is now a
-        # pre-tokenized list[int] and tokenization happens in the caller.
-        # Mirror get_dummy_processor_inputs' tokenization exactly.
-        tokenizer = processor.info.ctx.tokenizer
-        if tokenizer is None:
-            dummy_prompt: list[int] = []
-        else:
-            dummy_prompt = tokenizer.encode(
-                dummy_text,
-                **processor.info.default_tok_params.get_encode_kwargs(),
-            )
-
-        return ProcessorInputs(
-            prompt=dummy_prompt,
-            mm_data_items=mm_data_items,
-        )
+        """See `build_raw_image_processor_inputs`."""
+        return build_raw_image_processor_inputs(processor, modality, count, width, height)
 
     def _get_mm_warmup_processor(self):
         if self._mm_warmup_processor is None:
