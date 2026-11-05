@@ -175,9 +175,10 @@ def _make_classes():
                                                              return_tensors="pt",
                                                              do_rescale=merged.get("do_rescale", True),
                                                              do_normalize=merged.get("do_normalize", True))
-            # The checkpoint image processor returns float32 patches. Cast them to the model dtype as
-            # call_hf_processor does for images (this direct call bypasses it), which also halves the size of the
-            # tensors sent to the workers. Unrescaled 0..255 pixels are exact in bf16 (8-bit significand).
+            # With device normalization on, the fused processor skips both host steps and returns uint8 0..255
+            # patches, so the cast below does not apply. With it off the processor returns normalized float32
+            # patches; cast those to the model dtype as call_hf_processor/_postprocess_output does for images (this
+            # direct call bypasses it), which also halves the size of the tensors sent to the workers.
             pixel_values = processed["pixel_values"]
             if pixel_values.is_floating_point():
                 pixel_values = pixel_values.to(dtype=self.info.ctx.model_config.dtype)

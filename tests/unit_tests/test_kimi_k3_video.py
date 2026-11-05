@@ -164,8 +164,12 @@ class _Info:
             frame = media["video_chunk"][0]
             grids.append([len(media["video_chunk"]), 36, 62] if frame.size == (IBM_WIDTH, IBM_HEIGHT) else [1, 2, 2])
         grid = torch.tensor(grids)
-        # raw 8-bit pixels as float32, then the HF image processor steps: rescale to 0..1, normalize (mean = std = 0.5)
-        pixels = torch.full((int(grid.prod(-1).sum()), 4), float(RAW_PIXEL))
+        shape = (int(grid.prod(-1).sum()), 4)
+        if not (do_rescale or do_normalize):
+            # the fused processor with both host steps off returns the raw 8-bit patches
+            return {"pixel_values": torch.full(shape, RAW_PIXEL, dtype=torch.uint8), "grid_thws": grid}
+        # otherwise float32 patches: rescale to 0..1, normalize (mean = std = 0.5)
+        pixels = torch.full(shape, float(RAW_PIXEL))
         if do_rescale:
             pixels = pixels / 255
         if do_normalize:
@@ -680,8 +684,9 @@ def test_raw_image_warmup_without_a_tokenizer_has_an_empty_prompt(warmup):
 
 
 def test_video_pixels_are_cast_to_the_model_dtype(video):
-    # The checkpoint image processor returns float32; the vision tower runs in the model dtype (bf16).
+    # With device normalization off the processor returns normalized float32; the tower runs in the model dtype (bf16).
     proc = _processor(video)
+    proc.info.device_normalize = False
     out = proc._call_hf_processor({"videos": [_ibm_video(video.utils)]}, {})
     assert out[video.mod.VIDEO_PIXEL_VALUES].dtype == torch.bfloat16
     assert out[video.mod.VIDEO_GRID_THWS].dtype == torch.long  # integer tensors are left alone
@@ -698,6 +703,7 @@ def test_video_pixels_reach_the_tower_in_the_model_dtype(video):
 
     video.amd_model.vision_tower_forward = tower
     proc = _processor(video)
+    proc.info.device_normalize = False
     out = proc._call_hf_processor({"videos": [_ibm_video(video.utils)]}, {})
     model = video.K3Model()
     model.vision_tower, model.mm_projector, model.use_data_parallel = object(), object(), False
@@ -724,16 +730,23 @@ def test_device_normalize_on_sends_raw_pixels_to_the_tower(video):
     # The vision tower's input norm rescales and normalizes; the host must not do it first (double normalization).
     proc, pixels = _video_pixels(video, device_normalize=True)
     assert proc.info.preprocess_flags == (False, False)
-    assert pixels.dtype == torch.bfloat16
-    assert pixels.float().unique().tolist() == [float(RAW_PIXEL)]  # 0..255 survives the bf16 cast exactly
+    assert pixels.dtype == torch.uint8  # integer patches skip the float cast
+    assert pixels.unique().tolist() == [RAW_PIXEL]
 
 
 def test_device_normalize_off_normalizes_on_the_host(video):
     proc, pixels = _video_pixels(video, device_normalize=False)
     assert proc.info.preprocess_flags == (True, True)
+    assert pixels.dtype == torch.bfloat16  # normalized float32 patches are cast to the model dtype
     assert pixels.float().unique().tolist() == [1.0]  # 255 -> 1.0 -> (1.0 - 0.5) / 0.5
 
 
 def test_device_normalize_ignores_per_request_flags(video):
     proc, _ = _video_pixels(video, device_normalize=True, hf_kwargs={"do_normalize": True, "do_rescale": True})
     assert proc.info.preprocess_flags == (False, False)
+
+
+def test_device_normalize_off_passes_per_request_flags_to_the_processor(video):
+    # hf_kwargs must reach get_merged_mm_kwargs: dropping them would silently restore the defaults (True, True)
+    proc, _ = _video_pixels(video, device_normalize=False, hf_kwargs={"do_normalize": False, "do_rescale": True})
+    assert proc.info.preprocess_flags == (True, False)
