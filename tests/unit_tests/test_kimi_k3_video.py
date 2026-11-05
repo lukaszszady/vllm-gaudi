@@ -27,6 +27,7 @@ K3_CFG = {
     "sample_fps": 8.0,
 }
 IBM_WIDTH, IBM_HEIGHT, IBM_FRAMES, IBM_FPS = 864, 480, 20, 2.0
+RAW_PIXEL = 255
 IBM_CHUNK_TOKENS = 558  # 868x504 padded -> 62 x 36 patches / 2x2 merge
 IBM_VISION_TOKENS = 5 * IBM_CHUNK_TOKENS
 
@@ -131,7 +132,10 @@ class _Info:
     def __init__(self):
         self.image_processor = types.SimpleNamespace(media_proc_cfg=K3_CFG, preprocess=self._preprocess)
         self.preprocess_calls = []
-        self.ctx = types.SimpleNamespace(model_config=types.SimpleNamespace(dtype=torch.bfloat16), tokenizer=None)
+        self.device_normalize = True  # mm_device_do_normalize, on by default for Kimi-K3
+        self.ctx = types.SimpleNamespace(model_config=types.SimpleNamespace(dtype=torch.bfloat16),
+                                         tokenizer=None,
+                                         get_merged_mm_kwargs=self._merge_mm_kwargs)
 
     def _get_expected_hidden_size(self):
         return None
@@ -145,14 +149,28 @@ class _Info:
         frame = media["video_chunk"][0]
         return self.utils.navit_chunk_tokens(frame.size[0], frame.size[1], K3_CFG)
 
-    def _preprocess(self, medias, **kwargs):
+    def _merge_mm_kwargs(self, kwargs):
+        # MultiModalConfig.merge_mm_processor_kwargs: device normalization forces both host flags off
+        merged = dict(kwargs)
+        if self.device_normalize:
+            merged.update(do_rescale=False, do_normalize=False)
+        return merged
+
+    def _preprocess(self, medias, do_rescale, do_normalize, **kwargs):
         self.preprocess_calls.append(medias)
+        self.preprocess_flags = (do_rescale, do_normalize)
         grids = []
         for media in medias:
             frame = media["video_chunk"][0]
             grids.append([len(media["video_chunk"]), 36, 62] if frame.size == (IBM_WIDTH, IBM_HEIGHT) else [1, 2, 2])
         grid = torch.tensor(grids)
-        return {"pixel_values": torch.zeros(int(grid.prod(-1).sum()), 4), "grid_thws": grid}
+        # raw 8-bit pixels as float32, then the HF image processor steps: rescale to 0..1, normalize (mean = std = 0.5)
+        pixels = torch.full((int(grid.prod(-1).sum()), 4), float(RAW_PIXEL))
+        if do_rescale:
+            pixels = pixels / 255
+        if do_normalize:
+            pixels = (pixels - 0.5) / 0.5
+        return {"pixel_values": pixels, "grid_thws": grid}
 
 
 class _FieldConfig:
@@ -690,3 +708,32 @@ def test_video_pixels_reach_the_tower_in_the_model_dtype(video):
             video.mod.VIDEO_NUM_CHUNKS: out[video.mod.VIDEO_NUM_CHUNKS],
         })
     assert seen == [torch.bfloat16] and len(embeds) == 1
+
+
+# ------------------------------------------- host rescale / normalize follow mm_device_do_normalize
+
+
+def _video_pixels(video, device_normalize, hf_kwargs=None):
+    proc = _processor(video)
+    proc.info.device_normalize = device_normalize
+    out = proc._call_hf_processor({"videos": [_ibm_video(video.utils)]}, hf_kwargs or {})
+    return proc, out[video.mod.VIDEO_PIXEL_VALUES]
+
+
+def test_device_normalize_on_sends_raw_pixels_to_the_tower(video):
+    # The vision tower's input norm rescales and normalizes; the host must not do it first (double normalization).
+    proc, pixels = _video_pixels(video, device_normalize=True)
+    assert proc.info.preprocess_flags == (False, False)
+    assert pixels.dtype == torch.bfloat16
+    assert pixels.float().unique().tolist() == [float(RAW_PIXEL)]  # 0..255 survives the bf16 cast exactly
+
+
+def test_device_normalize_off_normalizes_on_the_host(video):
+    proc, pixels = _video_pixels(video, device_normalize=False)
+    assert proc.info.preprocess_flags == (True, True)
+    assert pixels.float().unique().tolist() == [1.0]  # 255 -> 1.0 -> (1.0 - 0.5) / 0.5
+
+
+def test_device_normalize_ignores_per_request_flags(video):
+    proc, _ = _video_pixels(video, device_normalize=True, hf_kwargs={"do_normalize": True, "do_rescale": True})
+    assert proc.info.preprocess_flags == (False, False)

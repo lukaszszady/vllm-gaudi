@@ -149,10 +149,10 @@ def _make_classes():
             if hf_data:  # images (and text): the unchanged image-only path
                 outputs.update(super()._call_hf_processor(hf_data, hf_kwargs))
             if videos:
-                outputs.update(self._process_videos(videos))
+                outputs.update(self._process_videos(videos, hf_kwargs))
             return BatchFeature(data=outputs)
 
-        def _process_videos(self, videos: Sequence[Any]) -> dict[str, torch.Tensor]:
+        def _process_videos(self, videos: Sequence[Any], hf_kwargs: Mapping[str, object]) -> dict[str, torch.Tensor]:
             cfg = self._media_proc_cfg()
             medias: list[dict[str, Any]] = []
             num_chunks: list[int] = []
@@ -166,13 +166,18 @@ def _make_classes():
                         "type": "video_chunk",
                         "video_chunk": [Image.fromarray(np.asarray(frames[i])) for i in chunk],
                     })
+            # Same flags the image path gets from InputProcessingContext.call_hf_processor. With
+            # mm_device_do_normalize (default for Kimi-K3) the merge forces do_rescale=do_normalize=False because
+            # the vision tower's input norm rescales and normalizes on the device; preprocessing on the host as
+            # well would normalize twice. Without it the keys are absent and the host does both.
+            merged = self.info.ctx.get_merged_mm_kwargs(hf_kwargs)
             processed = self.info.image_processor.preprocess(medias,
                                                              return_tensors="pt",
-                                                             do_rescale=True,
-                                                             do_normalize=True)
-            # The checkpoint image processor returns float32 patches. Images get the model dtype from
-            # InputProcessingContext.call_hf_processor (floating tensors are cast to model_config.dtype), which this
-            # direct call bypasses; without the cast the bf16 vision tower fails on a float32 x bf16 matmul.
+                                                             do_rescale=merged.get("do_rescale", True),
+                                                             do_normalize=merged.get("do_normalize", True))
+            # The checkpoint image processor returns float32 patches. Cast them to the model dtype as
+            # call_hf_processor does for images (this direct call bypasses it), which also halves the size of the
+            # tensors sent to the workers. Unrescaled 0..255 pixels are exact in bf16 (8-bit significand).
             pixel_values = processed["pixel_values"]
             if pixel_values.is_floating_point():
                 pixel_values = pixel_values.to(dtype=self.info.ctx.model_config.dtype)
