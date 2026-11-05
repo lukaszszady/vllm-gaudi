@@ -131,6 +131,7 @@ class _Info:
     def __init__(self):
         self.image_processor = types.SimpleNamespace(media_proc_cfg=K3_CFG, preprocess=self._preprocess)
         self.preprocess_calls = []
+        self.ctx = types.SimpleNamespace(model_config=types.SimpleNamespace(dtype=torch.bfloat16), tokenizer=None)
 
     def _get_expected_hidden_size(self):
         return None
@@ -577,7 +578,7 @@ def warmup(video, monkeypatch):
             super().__init__()
             self.dummy_inputs = builder_cls()
             self.info.parse_mm_data = lambda data, validate=False: data
-            self.info.ctx = types.SimpleNamespace(tokenizer=Tokenizer())
+            self.info.ctx.tokenizer = Tokenizer()
             self.info.default_tok_params = types.SimpleNamespace(get_encode_kwargs=lambda: {})
             self.info.get_hf_config = lambda: types.SimpleNamespace(image_placeholder="<|kimi_image_placeholder|>")
             self.calls = []
@@ -653,5 +654,39 @@ def test_raw_image_warmup_keeps_the_requested_size(warmup, modality, wrapped):
 
 def test_raw_image_warmup_without_a_tokenizer_has_an_empty_prompt(warmup):
     proc = warmup.Processor()
-    proc.info.ctx = types.SimpleNamespace(tokenizer=None)
+    proc.info.ctx.tokenizer = None
     assert warmup.mod.build_raw_image_processor_inputs(proc, "image", 1, 64, 64).prompt == []
+
+
+# ------------------------------------------------------- dtype of the video pixels
+
+
+def test_video_pixels_are_cast_to_the_model_dtype(video):
+    # The checkpoint image processor returns float32; the vision tower runs in the model dtype (bf16).
+    proc = _processor(video)
+    out = proc._call_hf_processor({"videos": [_ibm_video(video.utils)]}, {})
+    assert out[video.mod.VIDEO_PIXEL_VALUES].dtype == torch.bfloat16
+    assert out[video.mod.VIDEO_GRID_THWS].dtype == torch.long  # integer tensors are left alone
+    assert out[video.mod.VIDEO_NUM_CHUNKS].dtype == torch.long
+
+
+def test_video_pixels_reach_the_tower_in_the_model_dtype(video):
+    seen = []
+    orig = video.amd_model.vision_tower_forward
+
+    def tower(tower_, pixels, grids, **kw):
+        seen.append(pixels.dtype)
+        return orig(tower_, pixels, grids, **kw)
+
+    video.amd_model.vision_tower_forward = tower
+    proc = _processor(video)
+    out = proc._call_hf_processor({"videos": [_ibm_video(video.utils)]}, {})
+    model = video.K3Model()
+    model.vision_tower, model.mm_projector, model.use_data_parallel = object(), object(), False
+    embeds = model.embed_multimodal(
+        **{
+            video.mod.VIDEO_PIXEL_VALUES: out[video.mod.VIDEO_PIXEL_VALUES],
+            video.mod.VIDEO_GRID_THWS: out[video.mod.VIDEO_GRID_THWS],
+            video.mod.VIDEO_NUM_CHUNKS: out[video.mod.VIDEO_NUM_CHUNKS],
+        })
+    assert seen == [torch.bfloat16] and len(embeds) == 1

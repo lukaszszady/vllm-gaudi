@@ -170,8 +170,14 @@ def _make_classes():
                                                              return_tensors="pt",
                                                              do_rescale=True,
                                                              do_normalize=True)
+            # The checkpoint image processor returns float32 patches. Images get the model dtype from
+            # InputProcessingContext.call_hf_processor (floating tensors are cast to model_config.dtype), which this
+            # direct call bypasses; without the cast the bf16 vision tower fails on a float32 x bf16 matmul.
+            pixel_values = processed["pixel_values"]
+            if pixel_values.is_floating_point():
+                pixel_values = pixel_values.to(dtype=self.info.ctx.model_config.dtype)
             return {
-                VIDEO_PIXEL_VALUES: processed["pixel_values"],
+                VIDEO_PIXEL_VALUES: pixel_values,
                 VIDEO_GRID_THWS: processed["grid_thws"],
                 VIDEO_NUM_CHUNKS: torch.tensor(num_chunks, dtype=torch.long),
             }
