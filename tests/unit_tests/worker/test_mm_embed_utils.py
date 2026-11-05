@@ -40,26 +40,6 @@ def test_select_equals_boolean_mask_indexing(utils, name):
     assert torch.equal(got, rows[mask])
 
 
-@pytest.mark.parametrize("name", MASKS)
-def test_scatter_equals_boolean_mask_assignment(utils, name):
-    mask = _mask(name)
-    output = torch.randn(int(mask.sum()), HIDDEN)
-    expected = output.new_full((mask.shape[0], HIDDEN), torch.nan)
-    expected[mask] = output
-    got = utils.scatter_embed_rows(output, mask, fill_value=torch.nan)
-    assert torch.equal(got.isnan(), expected.isnan())
-    assert torch.equal(got.nan_to_num(), expected.nan_to_num())
-
-
-def test_scatter_then_select_round_trips(utils):
-    mask = _mask("gaps")
-    output = torch.randn(int(mask.sum()), HIDDEN)
-    scattered = utils.scatter_embed_rows(output, mask, fill_value=torch.nan)
-    # the runner slices the cached item and selects with the matching slice of the mask
-    assert torch.equal(utils.select_embed_rows(scattered, mask), output)
-    assert torch.equal(utils.select_embed_rows(scattered[2:7], mask[2:7]), scattered[2:7][mask[2:7]])
-
-
 def test_preserves_dtype_and_never_indexes_with_a_bool_tensor(utils, monkeypatch):
     rows = torch.randn(8, HIDDEN).to(torch.bfloat16)
 
@@ -75,5 +55,4 @@ def test_preserves_dtype_and_never_indexes_with_a_bool_tensor(utils, monkeypatch
     mask = _mask("gaps")
     sel = utils.select_embed_rows(rows, mask)
     assert sel.dtype == torch.bfloat16
-    out = utils.scatter_embed_rows(sel, mask, fill_value=torch.nan)
-    assert out.dtype == torch.bfloat16 and out.shape == rows.shape
+    assert torch.equal(sel.float(), rows.float().index_select(0, torch.nonzero(mask, as_tuple=True)[0]))

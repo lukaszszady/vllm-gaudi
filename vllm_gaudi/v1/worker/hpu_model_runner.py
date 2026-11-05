@@ -39,7 +39,7 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
-from vllm_gaudi.v1.worker.mm_embed_utils import scatter_embed_rows, select_embed_rows
+from vllm_gaudi.v1.worker.mm_embed_utils import select_embed_rows
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.hpu_weight_page_cache import drop_weight_page_cache_during_load
@@ -2231,12 +2231,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 encoder_outputs,
         ):
             is_embed = pos_info.is_embed
+            if is_embed is not None:
+                is_embed = is_embed.to(device=output.device)
 
             if is_embed is None:
                 scattered_output = output
             else:
-                # Same result as placeholders[is_embed] = output, without a boolean mask on the device
-                scattered_output = scatter_embed_rows(output, is_embed, fill_value=torch.nan)
+                placeholders = output.new_full(
+                    (is_embed.shape[0], output.shape[-1]),
+                    fill_value=torch.nan,
+                )
+                placeholders[is_embed] = output
+                scattered_output = placeholders
 
             self.encoder_cache[mm_hash] = scattered_output
 
