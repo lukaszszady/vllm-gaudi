@@ -339,13 +339,8 @@ def _patch_model_class(model_cls, amd_model) -> None:
         if isinstance(num_chunks, list):
             num_chunks = torch.stack(list(num_chunks))
         grid_thws = grid_thws.reshape(-1, grid_thws.shape[-1])
-        # Always the plain (non data-parallel) tower call. With use_data_parallel (the default for K3: 12 vision heads
-        # do not divide TP16, see is_vit_use_data_parallel, vllm/model_executor/models/vision.py:141)
-        # vision_tower_forward (kimi_k25_vit.py:869) goes through run_dp_sharded_mrope_vision_model, which sizes every
-        # output as t*h*w // merge_area patches and so ignores the temporal pooling of tpool_patch_merger
-        # (kimi_k25_vit.py:656-679): a t=4 chunk then yields 4x the 18x31 rows it really has. Images (t=1) are not
-        # affected. In data-parallel mode the tower layers are replicated (disable_tp), so every rank can run the
-        # whole batch itself, or (HPU_KIMI_VIT_DP=1) its share of the chunks.
+        # Plain tower call (use_data_parallel=False): the DP path (is_vit_use_data_parallel ->
+        # run_dp_sharded_mrope_vision_model) skips the temporal pooling of tpool_patch_merger.
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         chunk_rows = [(h // merge_h) * (w // merge_w) for _, h, w in grid_thws.tolist()]
         use_dp = False
