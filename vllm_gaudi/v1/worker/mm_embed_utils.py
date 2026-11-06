@@ -33,7 +33,7 @@ def collect_step_encoder_items(req_ids, requests, scheduled_encoder_inputs, num_
     overlaps the tokens scheduled for the request (the condition of ``_gather_mm_embeddings``); spans fully covered
     by computed tokens, e.g. consumed by an earlier prefill chunk, are never encoded again.
     """
-    payloads = {}
+    payloads: dict = {}
     for req_id, input_ids in scheduled_encoder_inputs.items():
         req_state = requests.get(req_id)
         if req_state is None:
@@ -43,7 +43,7 @@ def collect_step_encoder_items(req_ids, requests, scheduled_encoder_inputs, num_
             if feature.data is not None:
                 payloads.setdefault(feature.identifier, feature)
 
-    items = {}
+    items: dict = {}
     for req_id in req_ids:
         req_state = requests[req_id]
         computed = req_state.num_computed_tokens
