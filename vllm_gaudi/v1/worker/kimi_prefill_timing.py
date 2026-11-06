@@ -3,15 +3,21 @@
 """Wall-time split of a prefill step: multimodal encoder vs language-model forward (``HPU_KIMI_PREFILL_TIMING``).
 
 Off by default. With ``HPU_KIMI_PREFILL_TIMING=N`` (N >= 1) the HPU runner synchronizes the device around the
-multimodal encoder call and around the LM forward of every serving prefill and logs every N-th one::
+parts of the multimodal input preparation and around the LM forward of every serving prefill and logs every N-th one::
 
     Prefill timing: rank=0 prefill=12 reqs=1 tokens=9234 padded_tokens=10240 mm_items=1 video_chunks=5 \
-encoder_ms=812.3 mm_inputs_ms=851.0 lm_forward_ms=3021.7 total_ms=3872.7 | mean of 12: encoder_ms=810.9 \
-mm_inputs_ms=849.6 lm_forward_ms=3018.2 total_ms=3867.8
+encoder_ms=812.3 mm_inputs_ms=851.0 lm_forward_ms=3021.7 total_ms=3872.7 mm_h2d_ms=6.1 scatter_ms=3.2 \
+gather_ms=9.8 embed_ids_ms=12.4 mm_other_ms=7.2 | mean of 12: encoder_ms=810.9 mm_inputs_ms=849.6 \
+lm_forward_ms=3018.2 total_ms=3867.8 mm_h2d_ms=6.0 scatter_ms=3.1 gather_ms=9.7 embed_ids_ms=12.3 mm_other_ms=7.6
 
 ``encoder_ms`` is the ``embed_multimodal`` calls of the step (0 when nothing was encoded), ``mm_inputs_ms`` the whole
 ``_get_model_mm_inputs`` (encoder, embedding gather, ``embed_input_ids``) and ``lm_forward_ms`` the
-``_execute_model_generic`` call of the prefill. Warmup steps are not timed. Only the driver worker logs, unless
+``_execute_model_generic`` call of the prefill. Parts of ``mm_inputs_ms``: ``mm_h2d_ms`` batching and host-to-device
+copy of the mm kwargs (``group_and_batch_mm_kwargs``), ``scatter_ms`` row-count check and encoder-cache scatter,
+``gather_ms`` ``_gather_mm_embeddings``, ``embed_ids_ms`` ``embed_input_ids`` and ``mm_other_ms`` the rest (item
+collection, ``_extract_mm_kwargs``, the syncs themselves).
+
+Warmup steps are not timed. Only the driver worker logs, unless
 ``HPU_KIMI_PREFILL_TIMING_ALL_RANKS=1`` (set ``RAY_DEDUP_LOGS=0`` too, Ray folds lines that differ only in numbers).
 
 The synchronizations remove the host/device overlap of the step, so a timed run is slower than an untimed one: use
@@ -23,7 +29,8 @@ No habana or vllm imports here, so the helper can be tested on a CPU host; the r
 import logging
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
 
 ENV_TIMING = "HPU_KIMI_PREFILL_TIMING"
@@ -32,7 +39,12 @@ ENV_ALL_RANKS = "HPU_KIMI_PREFILL_TIMING_ALL_RANKS"
 # Keyword of the per-video chunk count in the Kimi-K3 video kwargs (kimi_k3_video.VIDEO_NUM_CHUNKS).
 _VIDEO_NUM_CHUNKS = "video_num_chunks"
 
-_FIELDS = ("encoder_ms", "mm_inputs_ms", "lm_forward_ms", "total_ms")
+# Timed parts of _get_model_mm_inputs besides the encoder.
+PHASES = ("mm_h2d", "scatter", "gather", "embed_ids")
+
+_FIELDS = ("encoder_ms", "mm_inputs_ms", "lm_forward_ms", "total_ms", *(f"{p}_ms" for p in PHASES), "mm_other_ms")
+
+_END = object()
 
 # Must stay in the "vllm.*" tree: other loggers are silent in vllm-gaudi.
 logger = logging.getLogger("vllm.gaudi.prefill_timing")
@@ -79,6 +91,7 @@ class PrefillTimer:
         self._encoder_s = 0.0
         self._mm_items = 0
         self._video_chunks = 0
+        self._phase_s = dict.fromkeys(PHASES, 0.0)
 
     @classmethod
     def from_env(cls, *, is_driver_worker: bool, get_rank: Callable[[], int], sync: Callable[[],
@@ -89,7 +102,7 @@ class PrefillTimer:
             period = 0
         rank = get_rank() if period else -1
         if period:
-            logger.info("Prefill timing on (%s=%d, rank %d): device syncs around the encoder and the LM forward",
+            logger.info("Prefill timing on (%s=%d, rank %d): device syncs around the mm input parts and the LM forward",
                         ENV_TIMING, period, rank)
         return cls(period, rank, sync)
 
@@ -106,6 +119,27 @@ class PrefillTimer:
         self._encoder_s = 0.0
         self._mm_items = 0
         self._video_chunks = 0
+        self._phase_s = dict.fromkeys(PHASES, 0.0)
+
+    def add_phase(self, phase: str, seconds: float) -> None:
+        self._phase_s[phase] += seconds
+
+    @contextmanager
+    def phase(self, phase: str) -> Iterator[None]:
+        start = self.now()
+        yield
+        self.add_phase(phase, self.now() - start)
+
+    def timed_iter(self, iterable: Iterable, phase: str) -> Iterator:
+        """Yields the items of ``iterable``; the time spent producing them goes to ``phase``."""
+        it = iter(iterable)
+        while True:
+            start = self.now()
+            item = next(it, _END)
+            self.add_phase(phase, self.now() - start)
+            if item is _END:
+                return
+            yield item
 
     def add_encoder(self, seconds: float, mm_items: int, video_chunks: int) -> None:
         self._encoder_s += seconds
@@ -122,6 +156,9 @@ class PrefillTimer:
             "lm_forward_ms": lm_forward_s * 1e3,
             "total_ms": (mm_inputs_s + lm_forward_s) * 1e3,
         }
+        for phase, seconds in self._phase_s.items():
+            values[f"{phase}_ms"] = seconds * 1e3
+        values["mm_other_ms"] = (mm_inputs_s - self._encoder_s - sum(self._phase_s.values())) * 1e3
         for key, value in values.items():
             self._sums[key] += value
         if self.num_prefills % self.period:

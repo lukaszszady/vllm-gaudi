@@ -488,3 +488,26 @@ class TestMmEmbedMaskCallSites:
 
         assert len(mm_embeds) == 1
         assert torch.equal(mm_embeds[0], rows)
+
+
+def test_execute_mm_encoder_with_prefill_timing_keeps_the_cache_and_times_the_parts(no_bool_mask_on_tensors):
+    from vllm_gaudi.v1.worker.kimi_prefill_timing import PrefillTimer
+
+    ticks = iter(range(1000))
+    rows = _make_encoder_output(int(_VIDEO_IS_EMBED.sum()))
+    requests = {"req_0": _make_request_state("req_0", 40, [_make_video_feature("vid", 3, with_pixels=True)])}
+    runner = _make_mock_runner(requests, encoder_cache={})
+    runner.pin_memory = False
+    runner.model = MagicMock()
+    runner.model.embed_multimodal.return_value = [rows]
+    runner._prefill_timer = PrefillTimer(1, 0, sync=lambda: None, clock=lambda: float(next(ticks)))
+    runner._timing_prefill = True
+    runner._prefill_timer.begin_step()
+
+    HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"req_0": 40}), ["req_0"])
+
+    cached = runner.encoder_cache["vid"]
+    assert torch.equal(cached.index_select(0, torch.nonzero(_VIDEO_IS_EMBED, as_tuple=True)[0]), rows)
+    timer = runner._prefill_timer
+    assert timer._mm_items == 1 and timer._encoder_s > 0
+    assert timer._phase_s["mm_h2d"] > 0 and timer._phase_s["scatter"] > 0
