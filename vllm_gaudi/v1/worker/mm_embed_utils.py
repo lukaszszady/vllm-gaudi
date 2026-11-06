@@ -1,5 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Helpers for the mm encoder step of the HPU model runner."""
+"""Helpers for the mm encoder step of the HPU model runner.
+
+Rows are selected by an ``is_embed`` mask on the host: a device boolean mask has a data-dependent shape that the
+Habana graph compiler cannot build.
+"""
+import torch
+
+
+def embed_positions(is_embed: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """Positions of the True entries of a host mask, as an int64 index tensor on ``device``."""
+    return torch.nonzero(is_embed.cpu(), as_tuple=True)[0].to(device)
+
+
+def select_embed_rows(rows: torch.Tensor, is_embed: torch.Tensor) -> torch.Tensor:
+    """Same result as ``rows[is_embed]`` for a 1D bool mask over dim 0, without a device boolean mask."""
+    return rows.index_select(0, embed_positions(is_embed, rows.device))
+
+
+def scatter_embed_rows(output: torch.Tensor, is_embed: torch.Tensor, fill_value: float) -> torch.Tensor:
+    """Same result as ``t = full(...); t[is_embed] = output`` with ``t`` of shape [len(is_embed), hidden]."""
+    placeholders = output.new_full((is_embed.shape[0], output.shape[-1]), fill_value=fill_value)
+    return placeholders.index_copy_(0, embed_positions(is_embed, output.device), output)
 
 
 def collect_step_encoder_items(req_ids, requests, scheduled_encoder_inputs, num_scheduled_tokens, encoder_cache):

@@ -10,6 +10,7 @@ Also covers _execute_mm_encoder with prefix-cached (stripped) mm items.
 import sys
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 # Stub habana_frameworks so the test can run on CPU (no HPU required).
@@ -40,6 +41,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+from vllm_gaudi.v1.worker import hpu_model_runner
 from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner
 
 HIDDEN_SIZE = 16
@@ -118,6 +120,9 @@ def _make_mock_runner(
     runner.requests = requests
     runner.encoder_cache = encoder_cache
     runner.uses_mrope = False
+    runner.is_kimi_k3 = False
+    runner._prefill_timer = None
+    runner._timing_prefill = False
     runner.device = "cpu"
     runner.is_mm_embed = _FakeCpuGpuBuffer(max_tokens)
     return runner
@@ -332,3 +337,154 @@ class TestExecuteMmEncoderPrefixCached:
 
         assert runner.model.embed_multimodal.call_count == 1
         assert set(runner.encoder_cache) == {"hash_new"}
+
+
+# Video placeholders carry an is_embed mask with gaps (separator/timestamp tokens); images have None.
+_VIDEO_LENGTH = 12
+_VIDEO_IS_EMBED = torch.tensor([1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0], dtype=torch.bool)
+
+
+@pytest.fixture
+def no_bool_mask_on_tensors(monkeypatch):
+    """Make any Tensor get/set item with a boolean tensor key raise: HPU cannot build that data-dependent shape."""
+    get_item, set_item = torch.Tensor.__getitem__, torch.Tensor.__setitem__
+
+    def _check(key):
+        keys = key if isinstance(key, tuple) else (key, )
+        for k in keys:
+            if isinstance(k, torch.Tensor) and k.dtype == torch.bool:
+                raise AssertionError("boolean-mask indexing of a tensor")
+
+    def guarded_get(self, key):
+        _check(key)
+        return get_item(self, key)
+
+    def guarded_set(self, key, value):
+        _check(key)
+        return set_item(self, key, value)
+
+    monkeypatch.setattr(torch.Tensor, "__getitem__", guarded_get)
+    monkeypatch.setattr(torch.Tensor, "__setitem__", guarded_set)
+
+
+def _make_video_feature(identifier: str, offset: int, with_pixels: bool = False) -> MultiModalFeatureSpec:
+    position = PlaceholderRange(offset=offset, length=_VIDEO_LENGTH, is_embed=_VIDEO_IS_EMBED.clone())
+    if with_pixels:
+        feature = _make_pixel_mm_feature(identifier, offset, _VIDEO_LENGTH)
+        return MultiModalFeatureSpec(data=feature.data, modality="video", identifier=identifier, mm_position=position)
+    return MultiModalFeatureSpec(data=None, modality="video", identifier=identifier, mm_position=position)
+
+
+def _scattered_encoder_output(rows: torch.Tensor) -> torch.Tensor:
+    """What the encoder cache holds for an item with is_embed: embedding rows at the True positions, NaN elsewhere."""
+    cached = torch.full((_VIDEO_LENGTH, HIDDEN_SIZE), torch.nan)
+    cached[torch.nonzero(_VIDEO_IS_EMBED, as_tuple=True)[0]] = rows
+    return cached
+
+
+class TestMmEmbedMaskCallSites:
+    """Both runner call sites with a non-None is_embed must avoid boolean-mask indexing of device tensors."""
+
+    @pytest.mark.parametrize("num_computed", [0, 5])
+    def test_gather_selects_the_embedding_rows(self, no_bool_mask_on_tensors, monkeypatch, num_computed):
+        offset = 3
+        rows = _make_encoder_output(int(_VIDEO_IS_EMBED.sum()))
+        encoder_cache = {"vid": _scattered_encoder_output(rows)}
+        requests = {
+            "req_0":
+            _make_request_state("req_0", 40, [_make_video_feature("vid", offset)], num_computed_tokens=num_computed)
+        }
+        runner = _make_mock_runner(requests, encoder_cache)
+        spy = MagicMock(wraps=hpu_model_runner.select_embed_rows)
+        monkeypatch.setattr(hpu_model_runner, "select_embed_rows", spy)
+
+        scheduled = 40 - num_computed
+        mm_embeds, is_mm_embed = HPUModelRunner._gather_mm_embeddings(runner,
+                                                                      _make_scheduler_output({"req_0": scheduled}),
+                                                                      req_ids=["req_0"],
+                                                                      total_num_scheduled_tokens=scheduled)
+
+        # The part of the placeholder not yet computed: [start_idx, _VIDEO_LENGTH)
+        start_idx = max(num_computed - offset, 0)
+        mask = _VIDEO_IS_EMBED[start_idx:]
+        expected = encoder_cache["vid"][start_idx:][torch.nonzero(mask, as_tuple=True)[0]]
+        assert spy.call_count == 1
+        assert len(mm_embeds) == 1 and torch.equal(mm_embeds[0], expected)
+        assert not torch.isnan(mm_embeds[0]).any()
+        expected_mask = torch.zeros(scheduled, dtype=torch.bool)
+        first = offset + start_idx - num_computed
+        expected_mask[first:first + len(mask)] = mask
+        assert torch.equal(is_mm_embed[:scheduled], expected_mask)
+
+    def test_gather_without_is_embed_does_not_use_the_helper(self, monkeypatch):
+        encoder_cache = {"img": _make_encoder_output(4)}
+        requests = {"req_0": _make_request_state("req_0", 10, [_make_mm_feature("img", offset=2, length=4)])}
+        runner = _make_mock_runner(requests, encoder_cache)
+        spy = MagicMock(wraps=hpu_model_runner.select_embed_rows)
+        monkeypatch.setattr(hpu_model_runner, "select_embed_rows", spy)
+
+        mm_embeds, _ = HPUModelRunner._gather_mm_embeddings(runner,
+                                                            _make_scheduler_output({"req_0": 10}),
+                                                            req_ids=["req_0"],
+                                                            total_num_scheduled_tokens=10)
+
+        assert spy.call_count == 0
+        assert torch.equal(mm_embeds[0], encoder_cache["img"])
+
+    def test_execute_mm_encoder_scatters_the_embedding_rows(self, no_bool_mask_on_tensors, monkeypatch):
+        rows = _make_encoder_output(int(_VIDEO_IS_EMBED.sum()))
+        requests = {"req_0": _make_request_state("req_0", 40, [_make_video_feature("vid", 3, with_pixels=True)])}
+        runner = _make_mock_runner(requests, encoder_cache={})
+        runner.pin_memory = False
+        runner.model = MagicMock()
+        runner.model.embed_multimodal.return_value = [rows]
+        spy = MagicMock(wraps=hpu_model_runner.scatter_embed_rows)
+        monkeypatch.setattr(hpu_model_runner, "scatter_embed_rows", spy)
+
+        HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"req_0": 40}), ["req_0"])
+
+        assert spy.call_count == 1
+        cached = runner.encoder_cache["vid"]
+        assert cached.shape == (_VIDEO_LENGTH, HIDDEN_SIZE)
+        embed_idx = torch.nonzero(_VIDEO_IS_EMBED, as_tuple=True)[0]
+        gap_idx = torch.nonzero(~_VIDEO_IS_EMBED, as_tuple=True)[0]
+        assert torch.equal(cached.index_select(0, embed_idx), rows)
+        assert torch.isnan(cached.index_select(0, gap_idx)).all()
+
+    @pytest.mark.parametrize("factor", [4, 0])
+    def test_execute_mm_encoder_rejects_a_row_count_that_differs_from_the_placeholder(
+            self, no_bool_mask_on_tensors, factor):
+        # 4x the rows is what a vision tower that skips the temporal pooling of a video chunk returns.
+        num_embed = int(_VIDEO_IS_EMBED.sum())
+        rows = _make_encoder_output(factor * num_embed)
+        requests = {"req_0": _make_request_state("req_0", 40, [_make_video_feature("vid", 3, with_pixels=True)])}
+        runner = _make_mock_runner(requests, encoder_cache={})
+        runner.pin_memory = False
+        runner.model = MagicMock()
+        runner.model.embed_multimodal.return_value = [rows]
+
+        with pytest.raises(ValueError) as err:
+            HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"req_0": 40}), ["req_0"])
+
+        message = str(err.value)
+        assert "video" in message and "vid" in message
+        assert f"has {factor * num_embed} rows" in message
+        assert f"{num_embed} embedding positions" in message
+        assert "vid" not in runner.encoder_cache
+
+    def test_gather_returns_the_rows_that_execute_mm_encoder_cached(self, no_bool_mask_on_tensors):
+        rows = _make_encoder_output(int(_VIDEO_IS_EMBED.sum()))
+        requests = {"req_0": _make_request_state("req_0", 40, [_make_video_feature("vid", 3, with_pixels=True)])}
+        runner = _make_mock_runner(requests, encoder_cache={})
+        runner.pin_memory = False
+        runner.model = MagicMock()
+        runner.model.embed_multimodal.return_value = [rows]
+        HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"req_0": 40}), ["req_0"])
+
+        mm_embeds, _ = HPUModelRunner._gather_mm_embeddings(runner,
+                                                            _make_scheduler_output({"req_0": 40}),
+                                                            req_ids=["req_0"],
+                                                            total_num_scheduled_tokens=40)
+
+        assert len(mm_embeds) == 1
+        assert torch.equal(mm_embeds[0], rows)

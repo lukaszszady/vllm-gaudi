@@ -31,6 +31,7 @@ import vllm_gaudi.envs as gaudi_envs
 import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.kimi_k3_gate import is_kimi_k3_model_config
 from vllm_gaudi.patches import ensure_kimi_k3_patches, report_kimi_patches, report_kimi_patches_on_load_failure
+from vllm_gaudi.mm_warmup_inputs import build_dummy_processor_inputs, build_raw_image_processor_inputs
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cache_groups
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
@@ -38,10 +39,11 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
+from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.hpu_weight_page_cache import drop_weight_page_cache_during_load
-from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items
+from vllm_gaudi.v1.worker.kimi_prefill_timing import PrefillTimer, count_video_chunks
 from vllm_gaudi.v1.worker.kv_block_layout import attn_pad_ids, contiguous_dummy_decode_layout, pad_slot_cycle
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
@@ -1371,6 +1373,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.is_driver_worker = is_driver_worker
+        # HPU_KIMI_PREFILL_TIMING state; created on the first prefill (TP group not ready here)
+        self._prefill_timer: Optional[PrefillTimer] = None
+        self._timing_prefill = False
         self.use_aux_hidden_state_outputs = False
         self.supports_mm_inputs = False
 
@@ -2150,6 +2155,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return {}
 
+    def _get_prefill_timer(self) -> PrefillTimer:
+        if self._prefill_timer is None:
+
+            def sync() -> None:
+                htorch.core.mark_step()
+                torch.hpu.synchronize()
+
+            self._prefill_timer = PrefillTimer.from_env(is_driver_worker=self.is_driver_worker,
+                                                        get_rank=get_tensor_model_parallel_rank,
+                                                        sync=sync)
+        return self._prefill_timer
+
     # source: vllm/v1/worker/gpu_model_runner.py
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput", req_ids: list[str]):
         # Batch the multi-modal inputs.
@@ -2207,7 +2224,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # 2. A list or tuple (length: num_items) of tensors, each of shape
             # (feature_size, hidden_size) in case the feature size is dynamic
             # depending on the input multimodal items.
-            curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
+            timer = self._prefill_timer
+            if timer is not None and timer.enabled and self._timing_prefill:
+                start = timer.now()
+                curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
+                timer.add_encoder(timer.now() - start, num_items, count_video_chunks(mm_kwargs_group))
+            else:
+                curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -2221,23 +2244,22 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # _gather_mm_embeddings, so reordering is not necessary.
 
         # Cache the encoder outputs.
-        for (mm_hash, pos_info), output in zip(
+        for (modality, _), (mm_hash, pos_info), output in zip(
+                mm_kwargs,
                 mm_hashes_pos,
                 encoder_outputs,
         ):
             is_embed = pos_info.is_embed
-            if is_embed is not None:
-                is_embed = is_embed.to(device=output.device)
 
             if is_embed is None:
                 scattered_output = output
             else:
-                placeholders = output.new_full(
-                    (is_embed.shape[0], output.shape[-1]),
-                    fill_value=torch.nan,
-                )
-                placeholders[is_embed] = output
-                scattered_output = placeholders
+                num_embed = int(is_embed.sum())
+                if output.shape[0] != num_embed:
+                    raise ValueError(f"Encoder output of the {modality} item {mm_hash} has {output.shape[0]} rows, "
+                                     f"but its prompt placeholder has {num_embed} embedding positions "
+                                     f"(placeholder length {is_embed.shape[0]})")
+                scattered_output = scatter_embed_rows(output, is_embed, fill_value=torch.nan)
 
             self.encoder_cache[mm_hash] = scattered_output
 
@@ -2295,12 +2317,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
-                    mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
-                else:
-                    mm_embeds_item = encoder_output[start_idx:end_idx]
 
                 sliced_output = encoder_output[start_idx:end_idx]
-                mm_embeds_item = sliced_output if is_embed is None else sliced_output[is_embed]
+                mm_embeds_item = sliced_output if is_embed is None else select_embed_rows(sliced_output, is_embed)
 
                 # For 2D padded batches, compute position in the
                 # flattened [batch_size * padded_seq_len] layout.
@@ -4660,6 +4679,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
                       logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
 
+                timer = self._get_prefill_timer()
+                self._timing_prefill = timer.enabled and not warmup_mode
+                if self._timing_prefill:
+                    timer.begin_step()
+                    t_start = timer.now()
+
                 # Prepare multimodal inputs if any
                 inputs_embeds, model_mm_kwargs = self._get_model_mm_inputs(
                     token_ids,
@@ -4667,6 +4692,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     scheduler_output,
                     req_id,
                 )
+                if self._timing_prefill:
+                    t_mm_inputs = timer.now()
 
                 lora_mask, lora_logits_mask = self._configure_lora(token_ids, self.requests, req_id, True)
 
@@ -4685,6 +4712,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         model_mm_kwargs=model_mm_kwargs,
                         warmup_mode=warmup_mode)
                 htorch.core.mark_step()
+                if self._timing_prefill:
+                    t_forward = timer.now()
+                    timer.finish_prefill(num_reqs=len(req_id),
+                                         tokens=sum(scheduler_output.num_scheduled_tokens.get(r, 0) for r in req_id),
+                                         padded_tokens=token_ids.numel(),
+                                         mm_inputs_s=t_mm_inputs - t_start,
+                                         lm_forward_s=t_forward - t_mm_inputs)
+                    self._timing_prefill = False
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.
@@ -6078,7 +6113,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # same grid as real traffic, guaranteeing a warmup cache hit.
                 processor_inputs = self._build_raw_image_processor_inputs(processor, modality, count, width, height)
             else:
-                processor_inputs = processor.dummy_inputs.get_dummy_processor_inputs(
+                processor_inputs = build_dummy_processor_inputs(
+                    processor,
                     seq_len=self.model_config_copy.max_model_len,
                     mm_counts={modality: count},
                     mm_options=mm_options,
@@ -6093,53 +6129,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return dummy_mm_inputs
 
     def _build_raw_image_processor_inputs(self, processor, modality, count, width, height):
-        """Build ProcessorInputs from raw WxH images, bypassing the upstream
-        per-dimension clamp in DummyInputsBuilder._get_dummy_images.
-
-        Mirrors get_dummy_processor_inputs (dummy_text + parse_mm_data +
-        ProcessorInputs) but supplies our own solid image at the requested raw
-        WxH. The upstream builder clamps width and height *independently*
-        against the model's max-feature size, distorting the aspect ratio so
-        the warmed grid stops matching real traffic. Feeding the raw image
-        straight through processor.apply lets the model's own resize
-        (smart_resize / navit_resize / ...) pick exactly the same grid it
-        would for a real image of that resolution -- including scaling an
-        oversized image down -- so warmup and serving grids are identical by
-        construction.
-        """
-        from PIL import Image
-        from vllm.multimodal.processing.inputs import ProcessorInputs
-
-        images = [Image.new("RGB", (width, height), color=255)] * count
-
-        # vision_chunk (Kimi-K2.5/K2.6) does not accept bare PIL images: its
-        # parser expects VisionChunkImage dicts ({"type": "image", "image":
-        # PIL}). 'image' takes the raw PIL directly. Wrap accordingly so the
-        # raw WxH still flows through the model's own resize (navit_resize) and
-        # the warmed grid matches real serving traffic.
-        mm_items = ([{"type": "image", "image": img} for img in images] if modality == 'vision_chunk' else images)
-
-        dummy_builder = processor.dummy_inputs
-        dummy_text = dummy_builder.get_dummy_text({modality: count})
-        mm_data_items = processor.info.parse_mm_data({modality: mm_items}, validate=False)
-
-        # Upstream vllm#53093 removed the text components (str prompt +
-        # tokenization_kwargs) from ProcessorInputs; the prompt is now a
-        # pre-tokenized list[int] and tokenization happens in the caller.
-        # Mirror get_dummy_processor_inputs' tokenization exactly.
-        tokenizer = processor.info.ctx.tokenizer
-        if tokenizer is None:
-            dummy_prompt: list[int] = []
-        else:
-            dummy_prompt = tokenizer.encode(
-                dummy_text,
-                **processor.info.default_tok_params.get_encode_kwargs(),
-            )
-
-        return ProcessorInputs(
-            prompt=dummy_prompt,
-            mm_data_items=mm_data_items,
-        )
+        """See `build_raw_image_processor_inputs`."""
+        return build_raw_image_processor_inputs(processor, modality, count, width, height)
 
     def _get_mm_warmup_processor(self):
         if self._mm_warmup_processor is None:
