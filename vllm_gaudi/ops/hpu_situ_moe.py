@@ -46,9 +46,8 @@ def situ_impl_or_exact(value: str | None, log_error: Callable[[str], None] | Non
 def situ_fused_alias() -> str | None:
     """Activation the fused Habana MoE op must use for "situ", read from HPU_KIMI_SITU_IMPL at call time.
 
-    "silu" only with HPU_KIMI_SITU_IMPL=silu (approximate); None otherwise, so that a "situ" reaching the fused
-    op in "exact" mode fails loudly. Evaluated lazily (no import-time work) so that it cannot hit the circular
-    imports of the vLLM plugin load.
+    "silu" only with HPU_KIMI_SITU_IMPL=silu (approximate); None otherwise, so "situ" fails loudly in "exact" mode.
+    Lazy to avoid circular imports at plugin load.
     """
     import vllm_gaudi.envs as gaudi_envs
     return "silu" if situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL) == "silu" else None
@@ -86,8 +85,7 @@ def _luts(dtype: torch.dtype, device: torch.device) -> tuple[torch.Tensor, torch
 def dequant_mxfp4(packed: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """packed uint8 [..., rows, cols // 2] + E8M0 scales uint8 [..., rows, cols // 32] -> [..., rows, cols].
 
-    Two table lookups (a 256 x 2 byte table gives both E2M1 values of a byte, a 256-entry table the E8M0 power of
-    two) and one multiply, all directly in ``dtype``; int32 indices keep the temporaries small.
+    Two table lookups (E2M1 pair per byte, E8M0 power of two) and one multiply in ``dtype``.
     """
     *lead, rows, half = packed.shape
     groups = scales.shape[-1]
@@ -156,8 +154,7 @@ def situ_moe_experts(x: torch.Tensor,
     tile = tokens if token_tile <= 0 or token_tile >= tokens else token_tile
     starts = list(range(0, tokens, tile))
     accs = [torch.zeros(min(tile, tokens - t0), hidden, dtype=torch.float32, device=x.device) for t0 in starts]
-    # Expert chunks are the OUTER loop: the weights of a chunk are dequantized once and reused by every token tile
-    # (tile-outer order repeated the whole dequant per tile: 16x the ops for an 8k prefill).
+    # expert chunks are the outer loop: each chunk is dequantized once and reused by all token tiles
     for c0 in range(0, total, expert_chunk):
         chunk_ids = ids[c0:c0 + expert_chunk]
         w13 = get_w13(chunk_ids)  # [c, 2I, H]
@@ -198,9 +195,7 @@ def maybe_situ_moe(layer,
                    token_tile: int = 512) -> torch.Tensor | None:
     """Exact SiTU experts for a layer holding packed MXFP4 weights, or None when the fused op should be used.
 
-    Handles layers whose ``activation`` is "situ" while ``impl`` is "exact"; reads ``beta`` / ``linear_beta`` from
-    ``layer.moe_config`` and the stacked per-rank tensors ``w13_weight``, ``w13_weight_scale``, ``w2_weight``,
-    ``w2_weight_scale`` (the ones the fused MXFP4 op is built from). Shared by both MXFP4 MoE methods.
+    Applies when ``layer.activation`` is "situ" and ``impl`` is "exact". Shared by both MXFP4 MoE methods.
     """
     activation = getattr(layer.activation, "value", layer.activation)
     if activation != "situ" or impl != "exact":

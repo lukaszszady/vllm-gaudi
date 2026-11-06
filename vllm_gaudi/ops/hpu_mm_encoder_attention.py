@@ -35,9 +35,7 @@ def _varlen_fsdpa(fsdpa_op, query, key, value, cu_seqlens, scale):
     return out.transpose(1, 2)
 
 
-# Kimi-K3 only: the per-sequence loop needs the sequence boundaries on the host. Traced, the .tolist() is a graph
-# break and the resume frame specializes on the boundary values (one recompile per image layout), so it runs
-# eagerly. Other models call the plain function, i.e. the loop is inlined exactly as before.
+# Kimi-K3 only: eager, since tracing the host-side .tolist() recompiles per image layout
 _varlen_fsdpa_eager = torch.compiler.disable(_varlen_fsdpa)
 
 

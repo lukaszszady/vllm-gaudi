@@ -471,12 +471,8 @@ _UPSTREAM_MLA_BIND_KV_CACHE = None
 def _hpu_mla_bind_kv_cache(self, kv_cache) -> None:
     """Store the HPU per-layer KV-cache tuple unchanged; tensors go through the upstream method.
 
-    Gated by data type, not by model: workers call this without a config context.
-
-    Upstream MLAAttention.bind_kv_cache executes `self.kv_cache = kv_cache.squeeze(1)`,
-    assuming a single 4D CUDA tensor [B, 1, N, C]. On HPU, kv_cache is allocated as a
-    tuple (key_cache, value_cache, key_scales, value_scales), which raises
-    `AttributeError: 'tuple' object has no attribute 'squeeze'`.
+    Gated by data type, not by model: workers call this without a config context. Upstream squeezes a single 4D tensor,
+    which fails on the HPU tuple.
     """
     if isinstance(kv_cache, (tuple, list)):
         self.kv_cache = tuple(kv_cache)
@@ -935,16 +931,10 @@ def _kimi_patch_logger():
 
 
 def _kimi_patch_failed(name: str) -> None:
-    """Call from an ``except`` block: remember the failed Kimi-K3 patch.
-
-    The patches are installed in several attempts (plugin apply, then ``load_general_plugins``) and early attempts
-    legitimately hit partially initialised vllm modules, so a failure is only logged at DEBUG (with traceback).
-    ``_kimi_patches_log_failed`` warns about the patches that are still missing after the final attempt.
-    """
+    """Call from an ``except`` block: remember the failed Kimi-K3 patch (logged at DEBUG; attempts may be early)."""
     import sys
     exc = sys.exc_info()[1]
-    # A failed attempt invalidates an earlier "installed": it may have patched a module object that a failed
-    # circular import later dropped from sys.modules, so the summary must not list the patch.
+    # a failure invalidates an earlier "installed" (the patched module object may be stale)
     if name in _KIMI_PATCHES_INSTALLED:
         _KIMI_PATCHES_INSTALLED.remove(name)
     _KIMI_PATCHES_FAILED[name] = f"{type(exc).__name__}: {exc}" if exc is not None else "unknown error"
@@ -987,11 +977,10 @@ def _kimi_patches_log_failed(only=None) -> None:
 _KIMI_PATCHES_REPORTED = False
 _KIMI_CONFIG_REPORTED = False
 _KIMI_PATCHES_WARNED: set[str] = set()
-# vllm.models.kimi_k3 holds all K3 classes (KimiK3ForConditionalGeneration, KimiLinearForCausalLM, MTP, DSpark);
-# Kimi-VL, Kimi-K2.5 and Kimi-Audio live in vllm.model_executor.models.kimi_* and are not K3.
+# all K3 classes live here; Kimi-VL, Kimi-K2.5 and Kimi-Audio do not
 _KIMI_K3_MODULE = "vllm.models.kimi_k3"
 _KIMI_K3_ARCHITECTURES = KIMI_K3_ARCHITECTURES
-# Patches that act in the process which builds the config (APIServer, EngineCore), not only in model workers.
+# patches that must also act in the process that builds the config (APIServer, EngineCore)
 _KIMI_CONFIG_PATCHES = ("hybrid_config", "k3_arch")
 
 
@@ -1009,11 +998,9 @@ def _current_config_is_kimi_k3() -> bool:
 
 
 def _kimi_patches_live() -> dict[str, bool]:
-    """Whether the patches that matter to a model worker are on the objects the model will really use.
+    """Whether the patches that matter to a model worker are on the classes the model will really use.
 
-    The bookkeeping lists say what an attempt did, not what is live: an early attempt can patch a module object that
-    a failed circular import later drops from ``sys.modules`` (``kda_forward`` was then listed as installed and also
-    warned about as not installed, and the upstream KDA forward ran). So look the classes up in ``sys.modules``.
+    The bookkeeping lists can be stale, so the classes are looked up in ``sys.modules``.
     """
     import sys
 
@@ -1038,14 +1025,9 @@ def _kimi_patches_live() -> dict[str, bool]:
 
 
 def ensure_kimi_k3_patches(model_config) -> None:
-    """Retry the failed Kimi-K3 patches right before the model is built, and fail loudly if kda_forward is not live.
+    """Retry failed Kimi-K3 patches before ``get_model``, when the import chain is complete.
 
-    The patches are attempted at plugin load, when ``vllm.models`` may still be partially initialised (circular
-    import: "cannot import name 'kimi_k3' from 'vllm.models'"), and ``load_general_plugins`` is wrapped only once
-    per process, so there can be a single deferred attempt. By the time the model runner builds the model the
-    import chain is complete, so the patches are retried here. The decision uses the live classes (see
-    ``_kimi_patches_live``), not the bookkeeping lists. Without a live ``kda_forward`` the upstream KDA forward would
-    run on HPU and crash in a worker (``assert isinstance(attn_metadata_raw, dict)``), so that case raises.
+    The decision uses the live classes (see ``_kimi_patches_live``). Without a live ``kda_forward`` it raises.
     Non-Kimi-K3 configs are not touched.
     """
     if not _is_kimi_k3_config(model_config):
@@ -1058,8 +1040,7 @@ def ensure_kimi_k3_patches(model_config) -> None:
     except Exception as e:  # reported below through the failed list
         _kimi_patch_logger().debug("Kimi-K3 package import failed before the patch retry: %s", e)
     _patch_kimi_k3_arch()
-    # Idempotent (marked) patches that can have failed in an early attempt. _patch_compressed_tensors_mxfp4 is only
-    # re-run when its class patch failed: re-running it after a success would wrap its own wrappers.
+    # idempotent patches that may have failed early; _patch_compressed_tensors_mxfp4 is re-run only after a failure
     _patch_kimi_k3_hybrid_config()
     _patch_mla_prefill_selector()
     _patch_latent_moe_runner_forward()
@@ -1083,12 +1064,9 @@ def ensure_kimi_k3_patches(model_config) -> None:
 
 
 def report_kimi_patches(model) -> None:
-    """Log the Kimi-K3 patch status once per process, after the model has been built.
+    """Report the Kimi-K3 patch status once, in a process that built a Kimi-K3 model.
 
-    The patches are installed in several attempts, in every process (APIServer, EngineCore, workers), and an
-    attempt cannot tell whether it is the last one, so nothing above DEBUG is logged while installing. The model
-    runner calls this right after ``get_model``: only a process that really built a Kimi-K3 model reports, once,
-    with the INFO summary and one WARNING per patch that is still missing.
+    Nothing above DEBUG is logged while installing; this logs the INFO summary and a WARNING per missing patch.
     """
     global _KIMI_PATCHES_REPORTED
     if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_model(model):
@@ -1108,12 +1086,9 @@ def report_kimi_patches_on_load_failure(model_config) -> None:
 
 
 def _report_kimi_config_patches(model_config) -> None:
-    """Warn once per process about missing config-side patches, right after a Kimi-K3 ModelConfig was built.
+    """Report missing config-level patches (``k3_arch``, ``hybrid_config``) in processes that only build the config.
 
-    APIServer and EngineCore never build the model, but they build the config, which needs ``k3_arch`` (architecture
-    resolution) and ``hybrid_config`` (this hook). The patched ``ModelConfig.__post_init__`` is a definite late
-    point: the patches are installed by then, so a name still in the failed list is really missing. Patches that
-    only matter to model workers (kda_forward, attn_res_*, ...) are left to ``report_kimi_patches``.
+    Worker-only patches are left to ``report_kimi_patches``.
     """
     global _KIMI_CONFIG_REPORTED
     if _KIMI_CONFIG_REPORTED or not _is_kimi_k3_config(model_config):
@@ -1125,13 +1100,11 @@ def _report_kimi_config_patches(model_config) -> None:
 def _patch_kimi_kda() -> None:
     """Pure PyTorch fallback for KDA on HPU (disabling GPU Triton kernels and dict metadata assertion).
 
-    Each target module is imported and patched on its own, so one that fails to import does not skip the others
-    (every failure is recorded under its own name and logged through the ``vllm.*`` kimi_patches logger).
+    Each target module is patched on its own; failures are recorded per patch name.
     """
     import importlib
 
-    # The fused KDA checks query vllm.platforms.rocm (amdsmi), which fails on HPU. They are the only users of
-    # that module in kimi_k3/amd, so answer False where they are defined and where amd.kda imported them by name.
+    # the fused KDA checks import vllm.platforms.rocm, which fails on HPU: answer False
     all_fused_ok = True
     chunk, decode = "is_fused_kda_chunk_supported", "is_fused_kda_decode_supported"
     targets = {"ops.kda_chunk": [chunk], "ops.kda_decode": [decode], "kda": [chunk, decode]}
@@ -1149,8 +1122,7 @@ def _patch_kimi_kda() -> None:
         _kimi_patch_installed("kda_fused_checks")
 
     def _kda_forward(self, hidden_states, positions=None):
-        # Imported on first use: importing vllm_gaudi.models here (plugin-apply time) hits a circular
-        # import with vllm.distributed in processes where it is still being initialised.
+        # imported on first use (circular import at plugin-apply time)
         from vllm_gaudi.models.kimi_k3_kda import hpu_kda_forward
         return hpu_kda_forward(self, hidden_states, positions)
 
@@ -1172,7 +1144,7 @@ def _patch_mla_prefill_selector() -> None:
         import vllm.v1.attention.backends.mla.prefill.selector as sel_mod
         from vllm_gaudi.attention.oot_mla import _DummyPrefillBackend
         orig_fn = getattr(sel_mod, "get_mla_prefill_backend", None)
-        # re-run (retry before get_model): wrap the upstream selector again, not our own wrapper
+        # on re-run wrap the upstream selector, not our own wrapper
         orig_fn = getattr(orig_fn, "_hpu_orig_selector", orig_fn)
 
         def hpu_get_prefill(vllm_config):
@@ -1214,8 +1186,7 @@ def _patch_kimi_k3_hybrid_config() -> None:
                 _report_kimi_config_patches(self)
                 if _is_kimi_k3_config(self):
                     mark_kimi_k3_seen()
-                # Ensure KimiMoE does not pad moe_intermediate_size from 3072 to 4096 under EP
-                # (saves device memory on every card)
+                # keep KimiMoE from padding moe_intermediate_size under EP
                 if _is_kimi_k3_config(self):
                     for cfg_obj in (getattr(self, "hf_text_config", None), getattr(self, "hf_config", None)):
                         if cfg_obj is not None:
@@ -1249,26 +1220,25 @@ _K3_RUNNER_CLASSES: dict[type, type] = {}
 def _kimi_k3_runner_class(base: type) -> type:
     """The Kimi-K3 subclass of a MoE runner class: unknown attributes fall through to ``routed_experts``.
 
-    One subclass per base class (cached), so runners of the same class share a type. The subclass is the only
-    place that has the delegating ``__getattr__``; the upstream runner classes stay untouched.
+    One cached subclass per base class; the upstream runner classes stay untouched.
     """
     cls = _K3_RUNNER_CLASSES.get(base)
     if cls is not None:
         return cls
 
     def __getattr__(self, name: str):
-        # nn.Module.__getattr__ first: parameters, buffers and submodules of the runner itself win
+        # the runner's own parameters, buffers and submodules win
         try:
             return base.__getattr__(self, name)  # type: ignore[attr-defined]
         except AttributeError:
-            # __dict__ lookup (a submodule lives in _modules): no recursion into __getattr__ while the runner is built
+            # __dict__ lookup avoids recursion while the runner is built
             routed = self.__dict__.get("_modules", {}).get("routed_experts", self.__dict__.get("routed_experts"))
             if routed is not None and hasattr(routed, name):
                 return getattr(routed, name)
             raise
 
     def __reduce__(self):
-        # The subclass is created at runtime and cannot be found by name, so pickle/deepcopy rebuild it from the base.
+        # runtime subclass: pickle/deepcopy rebuild it from the base
         return _rebuild_kimi_k3_runner, (base, ), self.__dict__
 
     cls = type(base.__name__ + "KimiK3", (base, ), {
@@ -1288,14 +1258,8 @@ def _rebuild_kimi_k3_runner(base: type):
 def _patch_moe_runner_delegation() -> None:
     """Delegate missing attribute lookups of Kimi-K3 MoE runners to ``routed_experts``, without touching other models.
 
-    The patch is installed for every model (load_general_plugins runs before any ModelConfig exists), so it only
-    wraps ``MoERunner.__init__`` (``ROCmLatentMoERunner`` reaches it through ``super().__init__``). There the runner
-    is swapped to a Kimi-K3-only subclass while a Kimi-K3 model is being built (including its Kimi-Linear language
-    model, which sees a submodel config without the K3 architecture) or when the current vllm config is a Kimi-K3 one.
-    A standalone Kimi-Linear model is not swapped even if its runner class lives in vllm.models.kimi_k3.
-    Any other runner keeps exactly the upstream type, and ``MoERunner`` gets no ``__getattr__``,
-    so ``hasattr(runner, "w13_weight_packed")`` stays False for other models (their ``register_parameter`` on the
-    runner would raise ``KeyError: attribute '...' already exists``) and attribute reads pay no extra cost.
+    Wraps ``MoERunner.__init__`` and swaps the runner to a Kimi-K3-only subclass while a Kimi-K3 model is being built
+    or when the current vllm config is a Kimi-K3 one. Other runners keep the upstream type.
     """
     name = "moe_runner_delegation"
     try:
@@ -1323,11 +1287,9 @@ def _patch_moe_runner_delegation() -> None:
 
 
 def _patch_latent_moe_runner_forward() -> None:
-    """Run the Kimi-K3 latent-MoE runner through the inline HPU MoE path (no opaque custom op).
+    """Run the Kimi-K3 latent-MoE runner through the inline HPU MoE path (no opaque custom op, no graph break).
 
-    ``ROCmLatentMoERunner._fused_forward`` calls ``torch.ops.vllm.moe_forward_shared`` which the HPU compile
-    backend executes eagerly ("Fallback required"), breaking the graph at every MoE layer. Replace it with the
-    dp_size==1 inline implementation used for the other MoE models. Disable with HPU_FUSED_MOE=0.
+    Disable with HPU_FUSED_MOE=0.
     """
     from vllm_gaudi.extension.logger import logger as init_logger
 
@@ -1360,13 +1322,10 @@ def _patch_latent_moe_runner_forward() -> None:
 
 
 def _configure_situ_aliases() -> str:
-    """Validate HPU_KIMI_SITU_IMPL and return the effective implementation (debug note for "silu").
+    """Validate HPU_KIMI_SITU_IMPL and return the effective implementation.
 
-    SiTU (Kimi-K3 routed experts): the fused Habana op only knows silu/gelu. "exact" (default) computes the
-    experts unfused (ops/hpu_situ_moe.py); "silu" maps "situ" to silu in the activation normalizers
-    (situ_fused_alias, evaluated at use time: no module is imported here because the plugin load is circular). An
-    invalid value is logged as an error and treated as "exact"; this runs outside of the broad try/except of
-    the other Kimi patches so that it can neither be skipped by nor skip them.
+    "exact" (default) computes the experts unfused (ops/hpu_situ_moe.py); "silu" aliases "situ" to silu (evaluated at
+    use time, nothing is imported here). An invalid value is logged as an error and treated as "exact".
     """
     import vllm_gaudi.envs as gaudi_envs
     from vllm_gaudi.extension.logger import logger as _ext_logger
@@ -1456,8 +1415,7 @@ def _patch_kimi_attn_res() -> None:
                                       output_norm=None,
                                       block_write_idx=-1,
                                       quant_key=None):
-                # vLLM 28a5fba06+ passes quant_key to fuse an fp8 activation quant into attn_res. The HPU decoder
-                # layer never asks for it (get_input_quant_key() is None), so a value here is a wiring bug.
+                # HPU never requests an activation quant key (get_input_quant_key() is None)
                 if quant_key is not None:
                     raise NotImplementedError(f"Kimi-K3 attn_res on HPU does not support quant_key={quant_key}")
                 return _torch_attn_res(
@@ -1486,8 +1444,7 @@ def _patch_kimi_attn_res() -> None:
 def _mark_kimi_k3_construction(model_cls: type, shared_layer_classes: tuple[type, ...]) -> None:
     """Build ``model_cls`` inside the Kimi-K3 build context and tag its instances of ``shared_layer_classes``.
 
-    The tag (``_hpu_kimi_k3``) lets the patched forward of those classes fall through to upstream for a standalone
-    Kimi-Linear model, which is built outside the context and stays untagged.
+    The tag (``_hpu_kimi_k3``) lets a standalone Kimi-Linear model fall through to upstream.
     """
     if "_hpu_kimi_k3_init" in vars(model_cls):
         return
@@ -1533,13 +1490,11 @@ def _patch_kimi_k3_arch() -> None:
         ModelRegistry.register_model("KimiK3MTP", _amd_mtp.KimiK3MTP)
         _kimi_patch_installed("model_registration")
 
-        # The K3 models build their language model under a submodel config that looks like a standalone Kimi-Linear
-        # one: mark the construction and the Kimi-K3 instances of the classes shared with Kimi-Linear.
+        # K3 builds its language model under a Kimi-Linear submodel config: mark the construction
         for k3_cls in (_amd_model.KimiK3ForConditionalGeneration, _amd_mtp.KimiK3MTP):
             _mark_kimi_k3_construction(k3_cls, (_amd_linear.KimiLinearModel, _amd_linear.KimiMoE))
 
-        # Monkey-patch KimiLinearModel.forward to ensure tokens/positions are 1D/2D
-        # so block_residual is allocated with shape [num_tokens, attn_res_block_num, hidden_size].
+        # KimiLinearModel.forward: 1D tokens / 2D positions so block_residual is [num_tokens, blocks, hidden]
         orig_linear_model_forward = getattr(_amd_linear.KimiLinearModel, "forward", None)
         if orig_linear_model_forward is not None and not getattr(_amd_linear.KimiLinearModel, "_patched_hpu_tokens",
                                                                  False):
@@ -1571,11 +1526,10 @@ def _patch_kimi_k3_arch() -> None:
                 if positions is not None and positions.dim() == 2:
                     positions = positions.view(-1)
 
-                # imported on first use (circular import with vllm.distributed at plugin-apply time)
+                # imported on first use (circular import)
                 from vllm_gaudi.models.kimi_k3_kda import run_with_deferred_kda_state
                 if step is not None:
-                    # vLLM 28a5fba06+ passes `step` (5th positional argument) and reads step.layer(idx) per layer;
-                    # ac7f3e11e has no such parameter, so it is forwarded only when given.
+                    # `step` exists only in vLLM 28a5fba06+
                     kwargs["step"] = step
                 return run_with_deferred_kda_state(
                     self,
@@ -1592,8 +1546,7 @@ def _patch_kimi_k3_arch() -> None:
             _amd_linear.KimiLinearModel._patched_hpu_tokens = True
         _kimi_patch_installed("linear_model_tokens_1d")
 
-        # out-of-place attn_res on the decoder layer (2D inputs, bank shape check): the in-place updates of the
-        # upstream version do not survive the per-layer graph boundaries of torch.compile mode
+        # out-of-place attn_res: in-place updates do not survive per-layer graph boundaries in torch.compile mode
         from vllm_gaudi.extension.logger import logger as _ext_logger
         from vllm_gaudi.ops.hpu_kda_pytorch import KIMI_DECODER_LAYER_CLASSES, install_functional_attn_res
         if install_functional_attn_res(_amd_linear) is None:
@@ -1653,8 +1606,7 @@ def _hpu_mxfp4_routed_apply(layer, x, topk_weights, topk_ids, group_size):
     output = maybe_situ_moe(layer, x, topk_ids, topk_weights, situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL),
                             group_size, gaudi_envs.VLLM_MINIMAX_M3_MOE_TOKEN_TILE)
     if output is None:
-        # the layer's own activation (was hard-coded "silu"); a name the fused op does not know fails
-        # loudly. "situ" only gets here with HPU_KIMI_SITU_IMPL=silu, where the alias maps it to silu.
+        # "situ" gets here only with HPU_KIMI_SITU_IMPL=silu (aliased to silu)
         output = layer.moe_op(
             x,
             topk_ids,
@@ -1683,7 +1635,7 @@ def _patch_compressed_tensors_mxfp4() -> None:
 
         def hpu_init(self, moe):
             orig_init(self, moe)
-            # only Kimi-K3 takes the HPU kernel; other compressed-tensors MXFP4 models (e.g. Kimi-K2.6) keep upstream
+            # only Kimi-K3 takes the HPU kernel
             self._hpu_kimi_k3 = current_config_is_kimi_k3()
             if self._hpu_kimi_k3 and getattr(current_platform, "device_type", None) == "hpu":
                 self.mxfp4_backend = None
@@ -1838,11 +1790,7 @@ def _patch_engine_core_sleep_host_guard() -> None:
 
 
 class _RemoteTokenizerNoticeFilter:
-    """Drop the 'Calling super().encode with ...' notice of the Kimi remote tokenizer (tokenization_kimi.py).
-
-    The remote module logs through a ``transformers_modules.*`` logger that has no handler, so the record reaches
-    ``logging.lastResort`` (stderr) once per tokenization. Only this message of that namespace is dropped.
-    """
+    """Drop the 'Calling super().encode with ...' notice of the Kimi remote tokenizer (tokenization_kimi.py)."""
 
     _PREFIX = "Calling super().encode with"
 
@@ -1894,7 +1842,7 @@ def apply() -> None:
     import vllm.plugins as _plugins_mod
 
     if getattr(_plugins_mod.load_general_plugins, "_hpu_patches_wrapper", False):
-        # apply() ran before in this process: wrapping again would run every deferred patch twice per call
+        # already wrapped in this process
         return
 
     _original_load_general = _plugins_mod.load_general_plugins

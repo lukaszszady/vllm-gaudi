@@ -85,9 +85,7 @@ class HPUBucketingManager():
         # range instead of clamping to 3x physical (see
         # ExponentialBucketingStrategy.get_decode_cfgs).
         self.skip_decode_block_clamp = False
-        # Set by the model runner when contiguous PA runs without the
-        # defragmenter (hybrid models): the highest block id of a decode batch
-        # can then reach num_hpu_blocks at any batch size.
+        # set by the runner for contiguous PA without the defragmenter (hybrids)
         self.decode_full_block_range = False
         self.num_hpu_blocks = None
         self._fallback_max_ctx = 0
@@ -555,11 +553,10 @@ def generate_buckets(bs_range,
 
 
 def cap_contiguous_pa_decode_buckets(buckets, max_blocks):
-    """Contiguous PA decode reads cache[:max_block_id + 1]. Without the
-    defragmenter that id is bounded only by the pool, so a batch of any size can
-    need max_blocks blocks. Cap larger ctx buckets at max_blocks and give every
-    (bs, query) a max_blocks bucket, so runtime lookups stay in the warmed set
-    instead of falling through to a larger bs or an unwarmed shape."""
+    """Without the defragmenter, contiguous PA decode can need max_blocks blocks at any batch size.
+
+    Cap larger ctx buckets at max_blocks and give every (bs, query) a max_blocks bucket, so lookups stay in the warmed set.
+    """
     capped = {(bs, query, min(ctx, max_blocks)) for bs, query, ctx in buckets}
     capped.update((bs, query, max_blocks) for bs, query, _ in buckets)
     return sorted(capped)

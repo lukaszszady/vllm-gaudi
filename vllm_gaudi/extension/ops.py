@@ -1844,8 +1844,7 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
         return final_hidden_states
 
 
-# MXFP4 MoE op calls of VllmMixtureOfExpertsOpMXFP4. The ops only run in graph mode: an eager caller wraps them in
-# torch.compile, a caller inside a compiled region traces them into its graph (see _get_compiled_forward).
+# MXFP4 MoE op calls; graph mode only (see _get_compiled_forward).
 def _mxfp4_bias_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list, w12_bias, w3_bias,
                           d_scale_w12, d_scale_w3, block_size, experts_min, experts_max, chunk_size, total_experts,
                           alpha, limit):
@@ -1996,10 +1995,8 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         return ret
 
     def _get_compiled_forward(self):
-        # Kimi-K3 (in_graph_call): inside a compiled region call the op directly. Building the nested torch.compile
-        # wrapper there is a graph break ('torch.compile call with > 1 args'), and Dynamo keeps the frames split at
-        # that break for every layer traced before the wrapper existed, even after it is cached. Other models keep
-        # the upstream behaviour (nested wrapper), which is faster for them.
+        # Kimi-K3 (in_graph_call): inside a compiled region call the op directly; a nested torch.compile wrapper
+        # there is a graph break. Other models keep the nested wrapper.
         if self.in_graph_call and torch.compiler.is_compiling():
             return _mxfp4_bias_fused_fwd if self.has_bias else _mxfp4_fused_fwd
         if self._compiled_forward is None:

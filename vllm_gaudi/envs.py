@@ -116,9 +116,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_COMPACT_GDN":
     lambda: os.environ.get("VLLM_COMPACT_GDN", "0").strip().lower() in ("1", "true"),
 
-    # Kimi-K3 routed experts use the SiTU activation (beta*tanh(gate/beta)*sigmoid(gate)*up, soft-clipped up), which
-    # the Habana fused MoE op does not have. "exact" computes the experts unfused with the real activation (MXFP4
-    # weights dequantized per expert chunk); "silu" maps SiTU to silu in the fused kernel (fast, APPROXIMATE).
+    # Kimi-K3 SiTU experts: "exact" runs them unfused; "silu" maps SiTU to silu in the fused kernel (approximate)
     "HPU_KIMI_SITU_IMPL":
     lambda: os.environ.get("HPU_KIMI_SITU_IMPL", "exact").strip().lower(),
 }

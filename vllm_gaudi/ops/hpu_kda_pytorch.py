@@ -127,12 +127,9 @@ def kda_recurrent_steps(state: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v
 def _unit_lower_inverse(a: torch.Tensor) -> torch.Tensor:
     """(I + A)^-1 for a strictly lower triangular A [..., C, C] by recursive block doubling.
 
-    The 1x1 diagonal blocks of I + A are 1; neighbouring blocks are merged level by level with the exact block
-    formula ``[[T, 0], [-B (C T), B]]`` (T, B the inverses of the two diagonal blocks, C the coupling block), all
-    pairs of a level in one batched matmul: log2(C) levels instead of C sequential substitution steps, no in-place
-    writes. It is algebraically the same as forward substitution and as accurate (checked against a float64
-    inverse, including nearly parallel keys with beta ~ 1), whereas a Neumann / repeated-squaring expansion loses
-    all precision there. A size that is not a power of two is padded with identity rows.
+    Neighbouring diagonal blocks are merged level by level with the exact block formula ``[[T, 0], [-B (C T), B]]``,
+    all pairs of a level in one batched matmul: log2(C) levels, no in-place writes. Algebraically equal to forward
+    substitution. A size that is not a power of two is padded with identity rows.
     """
     size = a.shape[-1]
     padded = 1
@@ -159,12 +156,8 @@ def _unit_lower_inverse(a: torch.Tensor) -> torch.Tensor:
 def _unit_lower_inverse_dense(a: torch.Tensor) -> torch.Tensor:
     """``_unit_lower_inverse`` for a [N, C, C] batch using only dense ops (same arithmetic, same values).
 
-    The HPU compiler rejects the strided view chains of the original (``torch.diagonal`` of a stepped slice,
-    ``inv[..., 0::2]``), and the ``index_select`` gathers that replaced them ran as thousands of small gather
-    kernels per layer. Here the coupling blocks come from a top-down pyramid: the quadrants of every diagonal
-    block of size 2b are moved to a leading axis by one transposing copy, so the diagonal blocks of size b and
-    the couplings are plain leading-dim selects of a contiguous tensor; the even / odd blocks of ``inv`` are
-    picked the same way. Every tensor is contiguous and no tensor has rank above 5.
+    The coupling blocks come from a top-down pyramid of transposing copies, so every selection is a plain leading-dim
+    select of a contiguous tensor (the HPU compiler rejects strided view chains) and no tensor has rank above 5.
     """
     size = a.shape[-1]
     padded = 1
@@ -281,8 +274,7 @@ def _intra_chunk_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor, vc
     ``Uv = (I + A)^-1 (beta V)``, ``Wk = (I + A)^-1 (beta K exp(G))``, so that the chunk output is
     ``O = q_eff S_0^T + o_intra`` (``q_eff = Q exp(G) - Aqk Wk``, ``o_intra = Aqk Uv``).
     """
-    # Fold B, H and the chunk group into one batch dimension: the HPU compiler rejects (strided_view, Invalid
-    # argument) the rank 6/7 views that the pairwise tensors and the block inverse would otherwise create.
+    # fold B, H and the chunk group into one batch dim: the HPU compiler rejects rank 6/7 views
     lead = cum.shape[:3]
 
     def fold(x):  # [B,H,G,C,D] -> [B*H*G,C,D]; reshape copies the non-contiguous slices of a chunk group
@@ -329,10 +321,7 @@ def kda_chunked_steps_vec(state: torch.Tensor,
     bsz, seq_len, heads, kdim = q.shape
     vdim = v.shape[-1]
     chunk = chunk_size
-    # num_chunks is one floor division of the (dynamic) sequence length by a constant, and the padded length is
-    # written as num_chunks * chunk (not seq_len + (-seq_len % chunk)): the traced shapes then stay products of
-    # plain dynamic dims and ints, with no Mod and no division by a symbolic size, which the HPU compiler's
-    # symbolic-size evaluation does not handle
+    # padded length as num_chunks * chunk (no Mod / symbolic division, which the HPU compiler cannot evaluate)
     num_chunks = (seq_len + chunk - 1) // chunk
     pad = num_chunks * chunk - seq_len
     # always padded (also by 0): the padded length must be the product num_chunks * chunk, not seq_len
@@ -581,10 +570,7 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
     if num_blocks == 0:
         mixed = updated
     else:
-        # The stored blocks are read in their own dtype (no fp32 copy of the [M, S, D] bank, no cat with the
-        # prefix): every value of the reference fp32 mix is exactly representable in that dtype anyway. The
-        # updated prefix is a separate [M, D] term; reductions accumulate in fp32 and the weighted sum of the
-        # blocks is one batched matmul ([M, 1, S] x [M, S, D]) on the matrix engine.
+        # stored blocks are read in their own dtype (no fp32 copy of the bank); reductions accumulate in fp32
         bank = new_blocks[:, :num_blocks]  # [M, S, D]
         qk = norm_weight.float() * qk_weight.float()  # [D]
         bank_rstd = torch.rsqrt(torch.square(bank.float()).sum(dim=-1) / hidden + eps)  # [M, S]
@@ -614,14 +600,13 @@ def attn_res_torch(prefix: torch.Tensor,
     """Same results AND side effects as the Triton ``attn_res`` kernel.
 
     Per row, in this order:
-      1. with a delta: ``prefix <- round_to_prefix_dtype(prefix + delta)`` is stored back INTO ``prefix`` (the
-         callers return that tensor as the running prefix sum and rely on it);
+      1. with a delta: ``prefix <- round_to_prefix_dtype(prefix + delta)`` is stored back INTO ``prefix``;
       2. ``block_write_idx >= 0``: the updated prefix is stored into ``blocks[:, block_write_idx]``;
       3. softmax-weighted mix (fp32) of the ``num_blocks`` stored blocks and the updated prefix, with logits
          ``sum(v * norm_weight * qk_weight) * rsqrt(mean(v^2) + eps)``; no sources -> the prefix itself;
       4. optional RMSNorm of the mix with ``output_norm_weight``; the result has the dtype of ``prefix``.
-    ``prefix`` [M, D] and ``blocks`` [M, R, D] are mutated in place; a shape mismatch raises (the old fallback
-    silently replaced the block bank with zeros). Compiled code should use ``attn_res_functional`` instead.
+    ``prefix`` [M, D] and ``blocks`` [M, R, D] are mutated in place; a shape mismatch raises. Compiled code should use
+    ``attn_res_functional`` instead.
     """
     del quant_dtype
     if prefix.dim() == 3:  # [B, S, D]: flatten with views so that the in-place update reaches the caller's tensor
@@ -644,10 +629,8 @@ def attn_res_torch(prefix: torch.Tensor,
 def forward_attn_residual_functional(self, positions, hidden_states, block_residual, prefix_delta):
     """``KimiLinearDecoderLayer.forward_attn_residual`` without in-place updates of its inputs.
 
-    Upstream relies on ``attn_res`` mutating ``prefix_sum`` and ``block_residual`` across layer boundaries; with
-    one compiled graph per decoder layer those are graph inputs. Here the updated tensors are rebound and returned:
-    ``(prefix_sum, block_residual, mlp_out)`` like upstream, but ``block_residual`` is a new tensor in block-write
-    layers (the bank copy costs ``tokens * bank * hidden`` elements per write layer).
+    Returns ``(prefix_sum, block_residual, mlp_out)`` like upstream; ``block_residual`` is a new tensor in block-write
+    layers (a bank copy per write layer).
     """
     prefix_sum = hidden_states
     write_idx = self.block_write_idx if self.is_block_write_layer else -1
@@ -673,7 +656,7 @@ def forward_attn_residual_functional(self, positions, hidden_states, block_resid
     return prefix_sum, block_residual, hidden_states
 
 
-# upstream vllm/models/kimi_k3/amd/linear.py names it KimiDecoderLayer; KimiLinearDecoderLayer is the older name
+# KimiLinearDecoderLayer is the older upstream name
 KIMI_DECODER_LAYER_CLASSES = ("KimiDecoderLayer", "KimiLinearDecoderLayer")
 
 
@@ -724,8 +707,7 @@ def install_functional_attn_res(linear_mod) -> type | None:
 def attn_res_layer_variants(modules) -> int:
     """Distinct (is_block_write_layer, block_write_idx, prev_valid_blocks) of the attn_res decoder layers, >= 1.
 
-    dynamo specializes these python ints, so with regional compilation every variant is its own cache entry of the
-    shared forward code object, per bucket shape (Kimi-K3: 93 layers, block 12 -> 16 variants).
+    dynamo specializes these python ints: with regional compilation each variant is its own cache entry per bucket.
     """
     variants = {(m.is_block_write_layer, m.block_write_idx, m.prev_valid_blocks)
                 for m in modules if getattr(m, "use_attn_residuals", False) and hasattr(m, "prev_valid_blocks")}

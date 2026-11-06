@@ -59,9 +59,7 @@ class OnlineDefragmenter:
         self.bwd_mapping_table = []
         self.enabled = config.defrag
         if self.enabled and hybrid:
-            # Hybrid (mamba/GDN/KDA) caches: swaps would also hit the state tensors, and the
-            # tracked scheduler block ids differ from the attention kernel block ids under
-            # virtual block splitting. Contiguous PA still works, just without compaction.
+            # swaps would also hit the state tensors; contiguous PA still works without compaction
             logger.warning("KV cache defragmentation is not supported for hybrid models, disabling it")
             self.enabled = False
         self.graphed = with_default(config.VLLM_DEFRAG_WITH_GRAPHS, config.bridge_mode == 'eager')

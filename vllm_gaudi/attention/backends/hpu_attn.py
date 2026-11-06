@@ -194,7 +194,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
     ) -> None:
         torch.nn.Module.__init__(self)
 
-        # Kimi-K3 only: id-based fetch of the prefix blocks (see _set_fetch_by_id); other models keep upstream.
+        # Kimi-K3 only: id-based fetch of the prefix blocks (see _set_fetch_by_id)
         self.fetch_by_id_toggle = current_config_is_kimi_k3()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -281,8 +281,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             # Patch for vllm-gaudi kv_cache tuple format.
             if isinstance(k_cache, tuple):
                 k_cache = k_cache[0]  # Use only key_cache for MLA
-            # Prefix blocks are raw scattered ids, so the
-            # contiguous-PA fetch must gather by id (cache[:n] would read wrong rows).
+            # prefix blocks are scattered ids: gather by id under contiguous PA
             if self.fetch_by_id_toggle:
                 _set_fetch_by_id(self.latent_cache_k, True)
             past = self.latent_cache_k.fetch_from_cache(k_cache.unflatten(0, (-1, attn_metadata.block_size)),
@@ -350,8 +349,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
         query = torch.cat([q_nope, q_pe], dim=-1)
         key_cache = k_cache.unsqueeze(1) if k_cache is not None else None
         value_cache = None
-        # Decode block_list is the contiguous-identity layout under contiguous PA:
-        # keep the zero-copy slice fetch instead of an index_select gather.
+        # decode block_list is the identity layout under contiguous PA: keep the slice fetch
         if self.fetch_by_id_toggle:
             _set_fetch_by_id(self.latent_cache_k, False)
         output = HPUPagedAttention.forward_decode(query=query,

@@ -16,9 +16,7 @@ from vllm_gaudi.ops.hpu_kda_pytorch import (gated_rmsnorm_sigmoid, kda_decode_st
                                             write_kda_decode_state)
 
 
-# The state update mutates the cache tensors in place: HPU compile silently drops in-place index_copy_ on aliased
-# tensors (see qwen3_5.py), so the two cache writes run outside of the compiled graph; the step itself is out of
-# place and traced with the layer.
+# HPU compile drops in-place index_copy_ on aliased tensors (see qwen3_5.py): the cache writes run outside the graph.
 @torch.compiler.disable
 def _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows):
     """Stores the decode / prefill state rows and passes ``core`` through, so the write is ordered before its
@@ -27,14 +25,9 @@ def _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows):
     return core
 
 
-# Decode state writes are deferred: a decode layer stores its new state rows in its own ``_kda_pending`` attribute
-# instead of writing them (an inline write is a graph break per KDA layer), and run_with_deferred_kda_state() writes
-# the rows of all KDA layers eagerly once the decoder layers of the step are done. The rows live on the layer module
-# (not in a shared container): all decoder layers share one dynamo code object under regional compilation, and a
-# shared list would make dynamo guard on its length, i.e. one cache entry per layer index. _DEFER_ACTIVE keeps
-# layers that run outside of a wrapped model forward (and prefill layers) on the inline write. Prefill stays inline on
-# purpose: deferring it as well (one graph per decoder layer, rows of all KDA layers alive until the end of the
-# forward) ran the device out of memory in the warmup of the large prompt buckets.
+# Decode state writes are deferred to run_with_deferred_kda_state() (an inline write is a graph break per layer).
+# Rows are kept on the layer module: a shared list would be guarded on its length (one cache entry per layer).
+# Prefill and layers outside a wrapped forward write inline (deferring prefill costs too much device memory).
 _DEFER_ACTIVE: list = [False]
 
 
@@ -162,8 +155,7 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                 if mask is not None:
                     mask = mask.reshape(num_seqs, seq_len)
                 chunk_size, vec_chunks = _prefill_settings()
-                # gate_proj is a strided slice of ``projected`` and is used after the graph break below; the resume
-                # graph would receive it as a view with storage offset (strided_view fails in Synapse)
+                # a strided view would cross the graph break below (strided_view fails in Synapse)
                 gate_proj = gate_proj.contiguous()
                 core, slots, conv_rows, ssm_rows = kda_prefill_step(mixed_qkv.reshape(num_seqs, seq_len, -1),
                                                                     raw_g.reshape(num_seqs, seq_len, -1),
@@ -176,9 +168,7 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                                                                     vec_chunks=vec_chunks,
                                                                     **common)
                 core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
-                # Keep post-processing out of the statement that calls the disabled write: ops chained on its last
-                # line end up in the dynamo resume frame without a source line, and the HPU compile backend then
-                # fails on the unparsable FX stack_trace ("'NoneType' object has no attribute 'file'").
+                # separate statement: ops chained on the disabled call break the HPU backend (unparsable stack_trace)
                 core = core.reshape(num_tokens, heads, head_dim)
             else:
                 core, slots, conv_rows, ssm_rows = kda_decode_step(mixed_qkv,

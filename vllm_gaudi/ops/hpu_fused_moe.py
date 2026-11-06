@@ -689,20 +689,12 @@ def _hpu_apply_moe_dp1(
     ``torch.ops.vllm.moe_forward_shared`` custom op (``_forward_entry``), so that
     ``torch.ops.hpu.mixture_of_experts`` is traced into the compiled graph.
     """
-    # Bypass _forward_impl entirely for dp_size==1 to eliminate
-    # graph breaks from _sequence_parallel_context() (which calls
-    # get_forward_context()), skip the no-op _maybe_dispatch(), and
-    # avoid double gate / stream-sync calls that _forward_impl
-    # would redundantly repeat.
+    # bypasses _forward_impl: no graph breaks from _sequence_parallel_context(), no redundant gate / stream sync
     if self.moe_config.pcp_size > 1:
         raise RuntimeError("dp_size==1 fast path does not support pcp_size > 1")
-    # Mirror MoERunner._forward_impl's pre-dispatch setup: the quant config
-    # is initialized on routed_experts (which the runner holds directly), so
-    # unlike the old FusedMoE-layer-based init we do NOT need the layer here.
+    # mirrors MoERunner._forward_impl's pre-dispatch setup
     self.routed_experts._ensure_moe_quant_config_init()
-    # Start the shared-expert aux stream before routed dispatch, mirroring
-    # upstream MoERunner._forward_impl. Version-tolerant: see
-    # _launch_shared_experts_overlap.
+    # start the shared-expert aux stream before routed dispatch (see _launch_shared_experts_overlap)
     shared_experts_overlapping = _launch_shared_experts_overlap(self, shared_experts_input)
     # Apply the gate if the runner holds it (mirrors _forward_impl).
     if self.gate is not None:
@@ -711,11 +703,7 @@ def _hpu_apply_moe_dp1(
             router_logits = torch.nn.functional.linear(hidden_states, self._combined_gate_weight)
         else:
             router_logits, _ = self.gate(hidden_states)
-    # Core MoERunner._apply_quant_method takes no layer argument — it reads
-    # everything it needs off the runner (self.routed_experts / self.router).
-    # Call it exactly as upstream _forward_impl does. Only pass
-    # shared_experts_overlapping when an async launch actually happened: that
-    # is the only case in which the kwarg is guaranteed to exist upstream.
+    # shared_experts_overlapping is passed only after an async launch (the kwarg may not exist upstream otherwise)
     extra_quant_kwargs = {"shared_experts_overlapping": True} if shared_experts_overlapping else {}
     shared_output, fused_hidden = self._apply_quant_method(
         hidden_states=hidden_states,
@@ -808,12 +796,9 @@ def patched_latent_moe_fused_forward(
     input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
 ) -> torch.Tensor:
-    """HPU ``_fused_forward`` of the Kimi-K3 latent-MoE runner without the opaque custom op.
+    """HPU ``_fused_forward`` of the Kimi-K3 latent-MoE runner without the opaque ``_forward_entry`` custom op.
 
-    Upstream ``ROCmLatentMoERunner._fused_forward`` calls ``self._forward_entry``
-    (``torch.ops.vllm.moe_forward_shared``). The HPU compile backend cannot trace that op, so it falls
-    back to eager for every MoE layer. For dp_size==1 this runs the same sequence as the patched
-    ``MoERunnerBase.forward`` (``_hpu_apply_moe_dp1``) and keeps the runner's sharded up-projection tail.
+    For dp_size==1 it runs ``_hpu_apply_moe_dp1`` and keeps the runner's sharded up-projection tail.
     """
     if shared_experts_input is None:
         hidden_states, shared_experts_input = self.apply_routed_input_transform(hidden_states)
@@ -847,10 +832,8 @@ def _make_inline_forward_entry(runner):
 def install_inline_moe_forward_entry(model: torch.nn.Module) -> int:
     """Replace ``_forward_entry`` (``torch.ops.vllm.moe_forward[_shared]``) of every MoE runner of ``model``.
 
-    The HPU compile backend cannot trace these opaque custom ops and runs them eagerly ("Fallback required"),
-    which breaks the graph at every MoE layer. Doing it on the instances covers every call site of the entry
-    (``MoERunner.forward`` as well as runner subclasses such as the Kimi-K3 latent runner) in the process that
-    owns the model. Only dp_size==1 / pcp_size==1 runners are replaced. Returns the number of runners changed.
+    The HPU compile backend cannot trace these custom ops (graph break per MoE layer). Only dp_size==1 / pcp_size==1
+    runners are replaced. Returns the number of runners changed.
     """
     if not _MOE_COMPILE:
         return 0
@@ -877,11 +860,8 @@ def install_inline_moe_forward_entry(model: torch.nn.Module) -> int:
 def prime_moe_runners_for_compile(model: torch.nn.Module) -> int:
     """Run the one-time first-forward work of the MoE runners of ``model`` before it is compiled.
 
-    The first traced call of a decoder layer must see the steady state. Otherwise Dynamo breaks the graph at the
-    one-time branch (the lazy ``moe_quant_config`` init of ``_hpu_apply_moe_dp1``, the ``info_once`` of the Kimi-K3
-    latent runner's ``_shard_up_proj_tail``) and keeps the layer split into nested frames at that call stack
-    even after the branch is no longer taken: one extra cache lookup and graph launch per frame and layer.
-    Call after the weights are processed. Returns the number of runners primed.
+    Otherwise Dynamo splits the first traced layer at the one-time branch. Call after the weights are processed.
+    Returns the number of runners primed.
     """
     primed = 0
     logged_tail = False

@@ -1,24 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Release the host page cache of checkpoint shards while the model weights are loaded.
 
-The default loader reads every *.safetensors shard through mmap, so the page cache keeps all pages that were read
-(for a 1.5 TB checkpoint ~700 GB per node with EP). That memory is reclaimable, but MemFree stays low until the
-kernel needs it, and the Habana PyTorch bridge treats MemTotal - MemFree above
-PT_HPU_HOST_MEMORY_THRESHOLD_PERCENT (90 by default) as host memory pressure and evicts its recipe cache, so every
-graph is recompiled afterwards. The weights live on the HPU after loading and the shards are not read again, so
-their cached pages are dropped with posix_fadvise(POSIX_FADV_DONTNEED) as soon as the loader is done with them.
+The default loader mmaps every *.safetensors shard and the page cache keeps what was read. That memory is
+reclaimable, but the Habana bridge treats low MemFree (PT_HPU_HOST_MEMORY_THRESHOLD_PERCENT) as host memory pressure
+and evicts its recipe cache. The cached pages of a shard are dropped with posix_fadvise(POSIX_FADV_DONTNEED) once the
+loader is done with it.
 
-Only vLLM's DefaultModelLoader safetensors path is covered (not the torchao / prefetch load strategies,
+Only vLLM's DefaultModelLoader safetensors path is covered (not the torchao / prefetch strategies,
 enable_multithread_load, fastsafetensors, instanttensor or .pt checkpoints).
 
 Environment:
-  VLLM_HPU_DROP_WEIGHT_PAGE_CACHE      unset/auto: active only for Kimi-K3 configs, and then only when the
-                                       safetensors shards together are larger than 25% of MemTotal (small
-                                       checkpoints keep the upstream iterator, including its auto-prefetch);
-                                       1 forces it on for any model, 0 keeps the upstream loader
+  VLLM_HPU_DROP_WEIGHT_PAGE_CACHE      unset/auto: Kimi-K3 configs only, and only when the shards are larger than 25%
+                                       of MemTotal; 1 forces it on for any model, 0 keeps the upstream loader
 
-The fadvise calls run in one daemon thread per process, so a slow call (all ranks of a node advise the same shard
-at once, on network file systems that takes seconds) does not delay the loading of the next shard.
+The fadvise calls run in one daemon thread per process so a slow call does not delay loading the next shard.
 """
 import contextlib
 import functools
@@ -41,9 +36,7 @@ _ENV_DROP = "VLLM_HPU_DROP_WEIGHT_PAGE_CACHE"
 _LAG = 4
 _WAIT_S = 600.0  # the end of loading waits this long for the background drops
 _AUTO_MIN_FRACTION = 0.25  # auto mode: active when the shards are larger than this fraction of MemTotal
-# Strategies whose iteration state does not cross shard boundaries, so the iterator can be called once per shard.
-# Kept on the upstream iterator: "torchao" (carries leftover tensors from one shard to the next) and "prefetch"
-# (its background thread warms the cache of all shards at once, which is the opposite of this module).
+# Strategies that can be called once per shard; "torchao" and "prefetch" stay on the upstream iterator.
 _PER_SHARD_STRATEGIES = (None, "lazy", "eager")
 
 
@@ -79,10 +72,7 @@ def _files_size_bytes(files: list[str]) -> int:
 
 
 def drop_file_page_cache(path: str) -> bool:
-    """Ask the kernel to forget the cached, unmapped pages of a file. Pages still mapped elsewhere stay.
-
-    Does nothing (returns False) where os.posix_fadvise does not exist.
-    """
+    """Ask the kernel to drop the cached, unmapped pages of a file; returns False without os.posix_fadvise."""
     if not hasattr(os, "posix_fadvise"):
         return False
     try:
@@ -195,10 +185,11 @@ def _submit_quietly(path: str, batch: "_DropBatch") -> None:
 def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.Tensor]]],
                               seen: list[str] | None = None,
                               force: bool = True):
-    """Return a drop-in replacement of safetensors_weights_iterator that drops the cache of consumed shards.
+    """Return a drop-in safetensors_weights_iterator that drops the page cache of consumed shards.
 
-    Shards handled by the replacement are appended to ``seen``. Unless ``force`` is set, checkpoints not larger than
-    _AUTO_MIN_FRACTION of MemTotal are passed to the upstream iterator untouched."""
+    Handled shards are appended to ``seen``. Unless ``force`` is set, small checkpoints
+    (<= _AUTO_MIN_FRACTION of MemTotal) go to the upstream iterator.
+    """
     from vllm.model_executor.model_loader import weight_utils
 
     sort_key = getattr(weight_utils, "_natural_sort_key", None)
@@ -248,13 +239,13 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
                          disable=not use_tqdm(use_tqdm_on_load),
                          bar_format=bar_format)):
                 started = i + 1
-                # One shard per call: the shard's safe_open handle (and its mmap) is closed when the call ends.
+                # one shard per call: its mmap is closed when the call ends
                 if not yielded:
                     try:  # the call itself may fail too (signature mismatch), not only the iteration
                         shard = original([st_file], False, safetensors_load_strategy, *args, **kwargs)
                         first: Any = next(shard, _EXHAUSTED)
                     except Exception as exc:
-                        # Nothing reached the loader yet, so the upstream iterator can still take over everything.
+                        # nothing reached the loader yet: the upstream iterator can still take over
                         logger.warning(
                             "Weight page cache: per-shard loading failed before the first tensor (%s: %s), "
                             "falling back to the upstream iterator for all %d shards",
@@ -271,8 +262,7 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
                     _submit_quietly(files[next_drop], batch)
                     next_drop += 1
         finally:
-            # Also runs when loading stops early, so no opened shard stays cached because of this process.
-            # Nothing here may raise: it would replace the error of the loader, or fail an otherwise good load.
+            # also runs when loading stops early; must not raise (it would mask the loader's error)
             try:
                 for st_file in files[next_drop:started]:
                     _submit_quietly(st_file, batch)
@@ -293,11 +283,9 @@ def wrap_safetensors_iterator(original: Callable[..., Iterator[tuple[str, torch.
 def drop_weight_page_cache_during_load(model_config=None):
     """Use the page-cache-dropping iterator in vLLM's default loader for the duration of the block.
 
-    In auto mode this is done for Kimi-K3 configs only (then further gated by the checkpoint size); any other model
-    keeps the upstream loader unless the env var is 1.
-
-    DONTNEED skips pages that are still mapped, so the shards seen are advised once more when the block ends, i.e.
-    after the loader's post-processing released its mappings and CPU tensors."""
+    Auto mode covers Kimi-K3 configs only; other models need the env var set to 1. The shards seen are advised again
+    at the end, once the loader released its mappings.
+    """
     mode = drop_mode()
     if mode == "auto":
         from vllm_gaudi.patches import _is_kimi_k3_config

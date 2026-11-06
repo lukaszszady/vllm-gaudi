@@ -320,24 +320,12 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
-        # vllm#50000 (Kimi K3) added `self.g_proj = mla_modules.g_proj`, which
-        # the base MultiHeadLatentAttentionWrapper.forward (reached through
-        # super().forward() for non-fused models) reads to gate the attention output.
-        # Because we bypass super().__init__(), replicate the assignment. It defaults
-        # to None for DeepSeek-V2/R1 (no gate proj), leaving the HPU path unchanged.
+        # read by the base forward (super().__init__() is bypassed); None for DeepSeek-V2/R1
         self.g_proj = mla_modules.g_proj
         self.skip_topk = skip_topk
-        # vllm#53906 added `self.fuse_qkv_rmsnorm`, which the base
-        # MultiHeadLatentAttentionWrapper.forward (reached through super().forward()
-        # for non-fused models) reads to pick the fused RMSNorm path. Because we bypass
-        # super().__init__(), replicate the assignment - pinned False because the
-        # fused kernel is Triton/CUDA-only.
+        # read by the base forward (super().__init__() is bypassed); False: the fused kernel is Triton/CUDA-only
         self.fuse_qkv_rmsnorm = False
-        # vllm#45964 (DCP query replication) added `self.dcp_q_replicate`, which
-        # the base MultiHeadLatentAttentionWrapper.forward (reached through
-        # super().forward() for non-fused models) reads and forwards to mla_attn. Because we
-        # bypass super().__init__(), replicate the upstream assignment. DCP is
-        # not enabled on HPU, so `qrep_active` is absent and this stays False.
+        # read by the base forward (super().__init__() is bypassed); DCP is not enabled on HPU
         q_proj_layer = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
         self.dcp_q_replicate = getattr(q_proj_layer, "qrep_active", False)
         if self.indexer is not None:
@@ -367,14 +355,12 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             topk_indices_buffer=mla_modules.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
-        # vLLM 28a5fba06+ (Kimi-K3) fuses the output-gate projection into fused_qkv_a_proj
-        # (KimiK3MergedQKVGateLinear, per-rank layout [q_a | kv_a | gate]) and passes no g_proj. The class does not
-        # exist in ac7f3e11e, so the import is guarded.
+        # vLLM 28a5fba06+ fuses the output gate into fused_qkv_a_proj ([q_a | kv_a | gate]); the class is absent in
+        # ac7f3e11e
         self._qkv_gate_fused = _KimiK3MergedQKVGateLinear is not None and isinstance(
             self.fused_qkv_a_proj, _KimiK3MergedQKVGateLinear)
         if self._qkv_gate_fused:
-            # The fused-gate forward below covers the plain Kimi-K3 MLA only. Explicit errors, not asserts: these
-            # must hold under ``python -O`` too.
+            # the fused-gate forward below covers the plain Kimi-K3 MLA only
             if self.g_proj is not None:
                 raise ValueError("KimiK3MergedQKVGateLinear and g_proj are mutually exclusive, but the MLA has both")
             if self.indexer is not None or self.is_sparse:
@@ -386,13 +372,11 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             logger.info_once("HPU MLA wrapper forward: fused QKV-gate (Kimi-K3)")
 
     def get_input_quant_key(self):
-        # The quantized-activation fusion (QuantizedActivation) is a ROCm/CUDA optimization; HPU always gets
-        # plain tensors.
+        # activation quant fusion is ROCm/CUDA only
         return None
 
     def process_weights_after_loading(self) -> None:
-        # Called by KimiLinearForCausalLM.process_weights_after_loading() for every MLA wrapper (28a5fba06+).
-        # The upstream Kimi wrapper builds an AITER weight fold there; HPU has none.
+        # called for every MLA wrapper (28a5fba06+); nothing to fold on HPU
         pass
 
     def forward(
@@ -404,7 +388,7 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if not self._qkv_gate_fused:
             return super().forward(positions, hidden_states, llama_4_scaling)
 
-        # Same math as amd/mla.py of 28a5fba06 without the AITER paths: split the gate off the fused A projection.
+        # as amd/mla.py of 28a5fba06 without AITER: split the gate off the fused A projection
         assert self.q_lora_rank is not None and self.q_a_layernorm is not None and self.q_b_proj is not None
         qkv_lora, gate = self.fused_qkv_a_proj(hidden_states)[0].split(
             [
