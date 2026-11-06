@@ -76,6 +76,53 @@ def test_log_line_rate_limit_and_means(timing, caplog):
         timer.begin_step()
         line = timer.finish_prefill(num_reqs=2, tokens=100, padded_tokens=128, mm_inputs_s=0.05, lm_forward_s=1.0)
     assert line == ("Prefill timing: rank=0 prefill=2 reqs=2 tokens=100 padded_tokens=128 mm_items=0 video_chunks=0 "
-                    "encoder_ms=0.0 mm_inputs_ms=50.0 lm_forward_ms=1000.0 total_ms=1050.0 | mean of 2: "
-                    "encoder_ms=400.0 mm_inputs_ms=450.0 lm_forward_ms=2000.0 total_ms=2450.0")
+                    "encoder_ms=0.0 mm_inputs_ms=50.0 lm_forward_ms=1000.0 total_ms=1050.0 mm_h2d_ms=0.0 "
+                    "scatter_ms=0.0 gather_ms=0.0 embed_ids_ms=0.0 mm_other_ms=50.0 | mean of 2: "
+                    "encoder_ms=400.0 mm_inputs_ms=450.0 lm_forward_ms=2000.0 total_ms=2450.0 mm_h2d_ms=0.0 "
+                    "scatter_ms=0.0 gather_ms=0.0 embed_ids_ms=0.0 mm_other_ms=50.0")
     assert caplog.text.count("Prefill timing: rank=") == 1
+
+
+class _StepClock:
+    """Clock that advances by ``step`` seconds per read."""
+
+    def __init__(self, step: float):
+        self.t = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        self.t += self.step
+        return self.t
+
+
+def test_mm_phases_split_and_rest(timing):
+    timer = timing.PrefillTimer(1, 0, sync=lambda: None, clock=_StepClock(0.001))
+    timer.begin_step()
+    timer.add_encoder(0.1, 1, 2)
+    for phase in ("scatter", "scatter", "gather", "embed_ids"):
+        with timer.phase(phase):
+            pass
+    timer.add_phase("mm_h2d", 0.004)
+    line = timer.finish_prefill(num_reqs=1, tokens=10, padded_tokens=16, mm_inputs_s=0.2, lm_forward_s=1.0)
+    current = line.split(" | ")[0]
+    assert ("encoder_ms=100.0 mm_inputs_ms=200.0 lm_forward_ms=1000.0 total_ms=1200.0 mm_h2d_ms=4.0 scatter_ms=2.0 "
+            "gather_ms=1.0 embed_ids_ms=1.0 mm_other_ms=92.0") in current
+
+
+def test_begin_step_resets_phases(timing):
+    timer = timing.PrefillTimer(1, 0, sync=lambda: None)
+    timer.add_phase("gather", 1.0)
+    timer.begin_step()
+    line = timer.finish_prefill(num_reqs=1, tokens=1, padded_tokens=1, mm_inputs_s=0.0, lm_forward_s=0.0)
+    assert "gather_ms=0.0" in line and "mm_other_ms=0.0" in line
+
+
+def test_timed_iter_yields_all_items_and_times_production(timing):
+    syncs: list[int] = []
+    timer = timing.PrefillTimer(1, 0, sync=lambda: syncs.append(1), clock=_StepClock(0.001))
+    timer.begin_step()
+    items = [("video", 1, {"a": 1}), ("image", 2, {"b": 2})]
+    assert list(timer.timed_iter(iter(items), "mm_h2d")) == items
+    # two clock reads per item plus the final exhausted next()
+    assert len(syncs) == 6
+    assert timer._phase_s["mm_h2d"] == pytest.approx(0.003)

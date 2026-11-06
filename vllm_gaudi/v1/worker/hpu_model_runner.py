@@ -2212,11 +2212,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
-        for _, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
-                mm_kwargs,
-                device=self.device,
-                pin_memory=self.pin_memory,
-        ):
+        timer = self._prefill_timer if self._timing_prefill else None
+        mm_groups = group_and_batch_mm_kwargs(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        if timer is not None:
+            mm_groups = timer.timed_iter(mm_groups, "mm_h2d")
+        for _, num_items, mm_kwargs_group in mm_groups:
             # Run the encoder.
             # `curr_group_outputs` is either of the following:
             # 1. A tensor of shape (num_items, feature_size, hidden_size)
@@ -2224,8 +2228,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # 2. A list or tuple (length: num_items) of tensors, each of shape
             # (feature_size, hidden_size) in case the feature size is dynamic
             # depending on the input multimodal items.
-            timer = self._prefill_timer
-            if timer is not None and timer.enabled and self._timing_prefill:
+            if timer is not None:
                 start = timer.now()
                 curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
                 timer.add_encoder(timer.now() - start, num_items, count_video_chunks(mm_kwargs_group))
@@ -2243,6 +2246,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # NOTE: Encoder outputs are cached by mm_hash and fetched in
         # _gather_mm_embeddings, so reordering is not necessary.
 
+        if timer is not None:
+            start = timer.now()
         # Cache the encoder outputs.
         for (modality, _), (mm_hash, pos_info), output in zip(
                 mm_kwargs,
@@ -2262,6 +2267,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 scattered_output = scatter_embed_rows(output, is_embed, fill_value=torch.nan)
 
             self.encoder_cache[mm_hash] = scattered_output
+        if timer is not None:
+            timer.add_phase("scatter", timer.now() - start)
 
     # modified from: vllm/v1/worker/gpu_model_runner.py
     def _gather_mm_embeddings(
@@ -2411,10 +2418,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 padded_seq_len = token_ids.shape[-1]
                 effective_total_tokens = (token_ids.shape[0] * token_ids.shape[1])
 
-            mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output,
-                                                                req_ids,
-                                                                total_num_scheduled_tokens=effective_total_tokens,
-                                                                padded_seq_len=padded_seq_len)
+            timer = self._prefill_timer if self._timing_prefill else None
+            with timer.phase("gather") if timer is not None else contextlib.nullcontext():
+                mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output,
+                                                                    req_ids,
+                                                                    total_num_scheduled_tokens=effective_total_tokens,
+                                                                    padded_seq_len=padded_seq_len)
             # TODO: Only get embeddings for valid token_ids. Ignore token_ids[<pad_idxs>] # noqa
             # This may require moving multimodal input preps into _prepare_inputs,        # noqa
             # to avoid padding issues.
@@ -2422,11 +2431,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if (self.is_kimi_k3 or self.attn_backend_name == 'HPUAttentionBackendV1') and \
                 token_ids.ndim == 2 and token_ids.shape[0] == 1:
                 token_ids = token_ids.squeeze(0)
-            inputs_embeds = self.model.embed_input_ids(
-                token_ids,
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+            with timer.phase("embed_ids") if timer is not None else contextlib.nullcontext():
+                inputs_embeds = self.model.embed_input_ids(
+                    token_ids,
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
 
             model_mm_kwargs = self._extract_mm_kwargs(scheduler_output)
 
