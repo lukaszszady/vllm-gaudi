@@ -24,7 +24,7 @@ LONG = 2000
 MIN_CHUNK = 400
 
 
-def _scheduler(cls, max_num_batched_tokens=MNBT, max_model_len=2048):
+def _scheduler(cls, max_num_batched_tokens=MNBT, max_model_len=2048, long_prefill_token_threshold=0):
     model_config = ModelConfig(model="facebook/opt-125m",
                                dtype="float16",
                                seed=42,
@@ -33,6 +33,7 @@ def _scheduler(cls, max_num_batched_tokens=MNBT, max_model_len=2048):
     scheduler_config = SchedulerConfig(max_num_seqs=64,
                                        max_num_batched_tokens=max_num_batched_tokens,
                                        max_model_len=max_model_len,
+                                       long_prefill_token_threshold=long_prefill_token_threshold,
                                        enable_chunked_prefill=True,
                                        async_scheduling=True,
                                        is_encoder_decoder=False,
@@ -131,11 +132,37 @@ def test_lone_prefill_started_with_small_chunk(min_chunk):
 
 
 def test_lone_prefill_after_decodes_not_deferred(min_chunk):
+    min_chunk(MNBT + MIN_CHUNK)
+    sched = _scheduler(HPUAsyncScheduler)
+    assert _run(sched, (30, 40), steps=2) == [{"r0": 30, "r1": 40}, {"r0": 1, "r1": 1}]
+    for req in _requests(LONG, prefix="late"):
+        sched.add_request(req)
+    # Decodes and prefills of earlier steps do not count as a prefill in this step.
+    assert dict(sched.schedule().num_scheduled_tokens) == {"r0": 1, "r1": 1, "late0": MNBT - 2}
+
+
+def test_running_continuation_not_deferred_after_prefill(min_chunk):
+    min_chunk(None)
+    sched = _scheduler(HPUAsyncScheduler, long_prefill_token_threshold=600)
+    assert _run(sched, (LONG, LONG), steps=1) == [{"r0": 600, "r1": MNBT - 600}]
+    sched._min_prefill_chunk = MNBT
+    # r1 is RUNNING: its continuation chunk follows r0's prefill and is kept.
+    assert dict(sched.schedule().num_scheduled_tokens) == {"r0": 600, "r1": MNBT - 600}
+
+
+def test_only_prefills_still_running_count(min_chunk):
     min_chunk(MIN_CHUNK)
     sched = _scheduler(HPUAsyncScheduler)
-    steps = _run(sched, (30, 40), steps=1)
-    assert steps[0] == {"r0": 30, "r1": 40}
-    for req in _requests(PROMPT, prefix="late"):
-        sched.add_request(req)
-    out = dict(sched.schedule().num_scheduled_tokens)
-    assert out == {"r0": 1, "r1": 1, "late0": PROMPT}
+    sched._step_prefill_req_ids = {"dropped"}
+    req = _requests(PROMPT)[0]
+    sched.add_request(req)
+    # A prefill id that never reached self.running must not defer others.
+    assert sched._reserve_prefill_lookahead(req, 0, 10) == 10
+
+
+@pytest.mark.parametrize("value", ["abc", "4k", "1.5"])
+def test_invalid_value_disables_rule(min_chunk, value):
+    min_chunk(value)
+    hpu = _run(_scheduler(HPUAsyncScheduler), (PROMPT, PROMPT), steps=2)
+    base = _run(_scheduler(AsyncScheduler), (PROMPT, PROMPT), steps=2)
+    assert hpu == base

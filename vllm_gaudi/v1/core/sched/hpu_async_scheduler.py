@@ -3,8 +3,11 @@ import os
 from collections.abc import Iterable
 from functools import cached_property
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.request import Request, RequestStatus
+
+logger = init_logger("vllm.gaudi.hpu_async_scheduler")
 
 
 class HPUAsyncScheduler(AsyncScheduler):
@@ -47,7 +50,13 @@ class HPUAsyncScheduler(AsyncScheduler):
         """``VLLM_HPU_MIN_PREFILL_CHUNK``: smallest first chunk of a new prefill
         that may join a step already carrying another prefill (0 = off)."""
         value = os.environ.get("VLLM_HPU_MIN_PREFILL_CHUNK", "").strip()
-        return max(int(value), 0) if value else 0
+        if not value:
+            return 0
+        try:
+            return max(int(value), 0)
+        except ValueError:
+            logger.warning("Ignoring non-integer VLLM_HPU_MIN_PREFILL_CHUNK=%r; rule disabled.", value)
+            return 0
 
     def _reserve_prefill_lookahead(self, request: Request, num_computed_tokens: int, num_new_tokens: int) -> int:
         """HPU override: with ``VLLM_HPU_MIN_PREFILL_CHUNK`` set, defer a waiting
