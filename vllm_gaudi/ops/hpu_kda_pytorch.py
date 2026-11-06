@@ -549,11 +549,36 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
     compile can silently drop in-place writes to them. ``new_prefix`` is ``prefix`` itself without a delta and
     ``new_blocks`` is ``blocks`` itself without a block write (no copy in those cases). All shapes are static.
     """
+    new_prefix, new_blocks, _, mixed = attn_res_functional_cached(prefix, delta, blocks, None, norm_weight, qk_weight,
+                                                                  output_norm_weight, num_blocks, block_write_idx, eps,
+                                                                  output_norm_eps)
+    return new_prefix, new_blocks, mixed
+
+
+def attn_res_bank_mean_square(blocks: torch.Tensor, num_valid_blocks: int) -> torch.Tensor:
+    """fp32 ``mean(v^2)`` of the first ``num_valid_blocks`` stored blocks of ``blocks`` [M, R, D]; zeros after."""
+    num_tokens, num_bank, hidden = blocks.shape
+    valid = torch.square(blocks[:, :num_valid_blocks].float()).sum(dim=-1) / hidden
+    return torch.cat((valid, valid.new_zeros(num_tokens, num_bank - num_valid_blocks)), dim=1)
+
+
+def attn_res_functional_cached(
+        prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor, bank_ms: torch.Tensor | None,
+        norm_weight: torch.Tensor, qk_weight: torch.Tensor, output_norm_weight: torch.Tensor | None, num_blocks: int,
+        block_write_idx: int, eps: float,
+        output_norm_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """``attn_res_functional`` that also takes and returns ``bank_ms`` [M, R], the fp32 ``mean(v^2)`` per stored block.
+
+    The bank read uses ``bank_ms`` instead of a pass over the bank; a block write also writes its mean square.
+    Same numbers as recomputing it from the stored (rounded) block. ``bank_ms=None``: recomputed per read.
+    """
     num_tokens, hidden = prefix.shape
     if delta is not None and delta.shape != prefix.shape:
         raise ValueError(f"delta {tuple(delta.shape)} does not match prefix {tuple(prefix.shape)}")
     if blocks.dim() != 3 or blocks.shape[0] != num_tokens or blocks.shape[-1] != hidden:
         raise ValueError(f"block bank {tuple(blocks.shape)} does not match prefix {tuple(prefix.shape)}")
+    if bank_ms is not None and bank_ms.shape != blocks.shape[:2]:
+        raise ValueError(f"bank mean squares {tuple(bank_ms.shape)} do not match the bank {tuple(blocks.shape)}")
 
     if delta is not None:
         new_prefix = (prefix.float() + delta.float()).to(prefix.dtype)
@@ -561,11 +586,17 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
     else:
         new_prefix = prefix
         updated = prefix.float()
-    new_blocks = blocks
+    own_ms = None
+    new_blocks, new_ms = blocks, bank_ms
     if block_write_idx >= 0:
-        new_blocks = torch.cat(
-            (blocks[:, :block_write_idx], updated.to(blocks.dtype).unsqueeze(1), blocks[:, block_write_idx + 1:]),
-            dim=1)
+        written = updated.to(blocks.dtype)
+        new_blocks = torch.cat((blocks[:, :block_write_idx], written.unsqueeze(1), blocks[:, block_write_idx + 1:]),
+                               dim=1)
+        if bank_ms is not None:
+            own_ms = torch.square(updated).sum(dim=-1, keepdim=True) / hidden  # [M, 1]
+            written_ms = own_ms if blocks.dtype == prefix.dtype else torch.square(written.float()).sum(
+                dim=-1, keepdim=True) / hidden
+            new_ms = torch.cat((bank_ms[:, :block_write_idx], written_ms, bank_ms[:, block_write_idx + 1:]), dim=1)
 
     if num_blocks == 0:
         mixed = updated
@@ -573,9 +604,12 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
         # stored blocks are read in their own dtype (no fp32 copy of the bank); reductions accumulate in fp32
         bank = new_blocks[:, :num_blocks]  # [M, S, D]
         qk = norm_weight.float() * qk_weight.float()  # [D]
-        bank_rstd = torch.rsqrt(torch.square(bank.float()).sum(dim=-1) / hidden + eps)  # [M, S]
+        bank_sq = torch.square(bank.float()).sum(dim=-1) / hidden if new_ms is None else new_ms[:, :num_blocks]
+        bank_rstd = torch.rsqrt(bank_sq + eps)  # [M, S]
         bank_logits = (bank.float() * qk).sum(dim=-1) * bank_rstd
-        own_rstd = torch.rsqrt(torch.square(updated).sum(dim=-1, keepdim=True) / hidden + eps)  # [M, 1]
+        if own_ms is None:
+            own_ms = torch.square(updated).sum(dim=-1, keepdim=True) / hidden
+        own_rstd = torch.rsqrt(own_ms + eps)  # [M, 1]
         own_logit = (updated * qk).sum(dim=-1, keepdim=True) * own_rstd
         probs = torch.softmax(torch.cat((bank_logits, own_logit), dim=-1), dim=-1)  # [M, S + 1]
         bank_probs = probs[:, :num_blocks].to(bank.dtype).unsqueeze(1)  # [M, 1, S]
@@ -583,7 +617,7 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
     if output_norm_weight is not None:
         mixed = mixed * torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps)
         mixed = mixed * output_norm_weight.float()
-    return new_prefix, new_blocks, mixed.to(prefix.dtype)
+    return new_prefix, new_blocks, new_ms, mixed.to(prefix.dtype)
 
 
 def attn_res_torch(prefix: torch.Tensor,
@@ -626,18 +660,28 @@ def attn_res_torch(prefix: torch.Tensor,
     return mixed
 
 
-def forward_attn_residual_functional(self, positions, hidden_states, block_residual, prefix_delta):
+def forward_attn_residual_functional(self,
+                                     positions,
+                                     hidden_states,
+                                     block_residual,
+                                     prefix_delta,
+                                     cache_bank_norm: bool = False):
     """``KimiLinearDecoderLayer.forward_attn_residual`` without in-place updates of its inputs.
 
     Returns ``(prefix_sum, block_residual, mlp_out)`` like upstream; ``block_residual`` is a new tensor in block-write
-    layers (a bank copy per write layer).
+    layers (a bank copy per write layer). A ``(bank, bank_ms)`` tuple as ``block_residual`` (see
+    ``attn_res_functional_cached``) is threaded through and returned as such; ``cache_bank_norm`` turns a plain
+    bank (first layer, pipeline-parallel input) into one.
     """
+    blocks, bank_ms = block_residual if isinstance(block_residual, tuple) else (block_residual, None)
+    if cache_bank_norm and bank_ms is None:
+        bank_ms = attn_res_bank_mean_square(blocks, self.prev_valid_blocks)
     prefix_sum = hidden_states
     write_idx = self.block_write_idx if self.is_block_write_layer else -1
-    new_prefix, block_residual, hidden_states = _layer_attn_res(prefix_sum, block_residual,
-                                                                self.self_attention_res_proj,
-                                                                self.self_attention_res_norm, self.prev_valid_blocks,
-                                                                prefix_delta, self.input_layernorm, write_idx)
+    new_prefix, blocks, bank_ms, hidden_states = _layer_attn_res(prefix_sum, blocks, bank_ms,
+                                                                 self.self_attention_res_proj,
+                                                                 self.self_attention_res_norm, self.prev_valid_blocks,
+                                                                 prefix_delta, self.input_layernorm, write_idx)
     # in a block-write layer the updated prefix lives in the bank and the attention output starts the new prefix
     prefix_sum = None if self.is_block_write_layer else new_prefix
 
@@ -649,11 +693,11 @@ def forward_attn_residual_functional(self, positions, hidden_states, block_resid
         prefix_delta = hidden_states
 
     mlp_valid_blocks = self.prev_valid_blocks + (1 if self.is_block_write_layer else 0)
-    prefix_sum, block_residual, hidden_states = _layer_attn_res(prefix_sum, block_residual, self.mlp_res_proj,
-                                                                self.mlp_res_norm, mlp_valid_blocks, prefix_delta,
-                                                                self.post_attention_layernorm, -1)
+    prefix_sum, blocks, bank_ms, hidden_states = _layer_attn_res(prefix_sum, blocks, bank_ms, self.mlp_res_proj,
+                                                                 self.mlp_res_norm, mlp_valid_blocks, prefix_delta,
+                                                                 self.post_attention_layernorm, -1)
     hidden_states = self.mlp(hidden_states)
-    return prefix_sum, block_residual, hidden_states
+    return prefix_sum, blocks if bank_ms is None else (blocks, bank_ms), hidden_states
 
 
 # KimiLinearDecoderLayer is the older upstream name
@@ -674,11 +718,12 @@ def kimi_decoder_layer_class(linear_mod) -> type | None:
     return None
 
 
-def install_functional_attn_res(linear_mod) -> type | None:
+def install_functional_attn_res(linear_mod, cache_bank_norm: bool = False) -> type | None:
     """Replace ``forward_attn_residual`` of the Kimi-K3 decoder layer with the out-of-place version.
 
     Returns the patched class (idempotent), or None when ``linear_mod`` has no such class; the caller must report
     that loudly: without the patch the in-place upstream version runs inside the per-layer compiled graphs.
+    ``cache_bank_norm``: the layers pass the block bank on as ``(bank, bank_ms)`` (see ``attn_res_functional_cached``).
     """
     cls: Any = kimi_decoder_layer_class(linear_mod)
     if cls is None or getattr(cls.forward_attn_residual, "_hpu_functional_attn_res", False):
@@ -691,17 +736,24 @@ def install_functional_attn_res(linear_mod) -> type | None:
             prefix_delta = prefix_delta.reshape(-1, prefix_delta.shape[-1])
         if positions is not None and positions.dim() == 2:
             positions = positions.reshape(-1)
-        if block_residual.dim() == 3 and (block_residual.shape[0] != hidden_states.shape[0]
-                                          or block_residual.shape[-1] != hidden_states.shape[-1]):
+        blocks = attn_res_bank(block_residual)
+        if blocks.dim() == 3 and (blocks.shape[0] != hidden_states.shape[0]
+                                  or blocks.shape[-1] != hidden_states.shape[-1]):
             # Silently replacing the block bank with zeros would drop the stored blocks and corrupt every
             # later attn_res mix, so fail loudly instead.
-            raise RuntimeError(f"Kimi-K3 block residual bank {tuple(block_residual.shape)} does not match "
+            raise RuntimeError(f"Kimi-K3 block residual bank {tuple(blocks.shape)} does not match "
                                f"the hidden states {tuple(hidden_states.shape)}")
-        return forward_attn_residual_functional(self, positions, hidden_states, block_residual, prefix_delta)
+        return forward_attn_residual_functional(self, positions, hidden_states, block_residual, prefix_delta,
+                                                cache_bank_norm)
 
     forward_attn_residual._hpu_functional_attn_res = True  # type: ignore[attr-defined]
     cls.forward_attn_residual = forward_attn_residual
     return cls
+
+
+def attn_res_bank(block_residual) -> torch.Tensor:
+    """The block bank of a decoder-layer ``block_residual`` output: a plain bank or a ``(bank, bank_ms)`` tuple."""
+    return block_residual[0] if isinstance(block_residual, tuple) else block_residual
 
 
 def attn_res_layer_variants(modules) -> int:
@@ -714,7 +766,8 @@ def attn_res_layer_variants(modules) -> int:
     return max(1, len(variants))
 
 
-def _layer_attn_res(prefix_sum, block_residual, proj, norm, num_valid_blocks, delta, output_norm, block_write_idx):
-    return attn_res_functional(prefix_sum, delta, block_residual, norm.weight, proj.weight.squeeze(0),
-                               None if output_norm is None else output_norm.weight, num_valid_blocks, block_write_idx,
-                               norm.variance_epsilon, 0.0 if output_norm is None else output_norm.variance_epsilon)
+def _layer_attn_res(prefix_sum, blocks, bank_ms, proj, norm, num_valid_blocks, delta, output_norm, block_write_idx):
+    return attn_res_functional_cached(prefix_sum, delta, blocks, bank_ms, norm.weight, proj.weight.squeeze(0),
+                                      None if output_norm is None else output_norm.weight, num_valid_blocks,
+                                      block_write_idx, norm.variance_epsilon,
+                                      0.0 if output_norm is None else output_norm.variance_epsilon)
