@@ -152,8 +152,7 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         topk_ids = topk_ids.view(-1, topk_ids.shape[-1])
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
-        # The fused kernel has no SiTU: exact unfused routed experts (see ops/hpu_situ_moe.py).
-        # Env reads and the SiTU helper run only for SiTU layers; every other model calls the fused op directly.
+        # the fused kernel has no SiTU: exact unfused experts (ops/hpu_situ_moe.py), SiTU layers only
         output = None
         if getattr(layer.activation, "value", layer.activation) == "situ":
             output = maybe_situ_moe(layer, x, topk_ids, topk_weights, situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL),
@@ -179,20 +178,16 @@ mxfp4_module.GptOssMxfp4MoEMethod = HPUGptOssMxfp4MoEMethod
 class HPUKimiK3Mxfp4MoEMethod(Mxfp4MoEMethod):
     """HPU method for the routed experts of a Kimi-K3 checkpoint that vLLM maps to ``Mxfp4Config``.
 
-    The base ``Mxfp4MoEMethod`` selects a CUDA/ROCm backend in ``__init__`` (``select_deepseek_v4_mxfp4_moe_backend``
-    raises on HPU) and builds a kernel after loading. This keeps the upstream ``create_weights`` (uint8 ``w13_weight``,
-    ``w2_weight`` and their ``*_scale``) and runs the same HPU MXFP4 op and exact SiTU path as the compressed-tensors
-    Kimi-K3 method, through the routed ``apply`` (not monolithic).
+    Skips the CUDA/ROCm backend selection of ``Mxfp4MoEMethod.__init__``, keeps the upstream ``create_weights`` and
+    runs the HPU MXFP4 op and exact SiTU path through the routed ``apply``.
     """
 
     MXFP4_BLOCK_SIZE = HPUGptOssMxfp4MoEMethod.MXFP4_BLOCK_SIZE
-    # The upstream class sets this to True (loader hands over pre-processed weights); the HPU path loads the raw
-    # checkpoint tensors and repacks them in process_weights_after_loading.
+    # HPU loads the raw checkpoint tensors and repacks them in process_weights_after_loading
     supports_pre_processed_weights = False
 
     def __init__(self, moe, activation_key=None):
-        # Deliberately skips Mxfp4MoEMethod.__init__ (calls the next class in the MRO): that __init__ selects a
-        # CUDA/ROCm MXFP4 backend and raises on HPU. This class sets the attributes the rest of the code needs below.
+        # skips Mxfp4MoEMethod.__init__ (selects a CUDA/ROCm backend, raises on HPU)
         super(Mxfp4MoEMethod, self).__init__(moe)
         self.weight_dtype = "mxfp4"
         self.activation_key = activation_key
@@ -227,8 +222,7 @@ class HPUKimiK3Mxfp4MoEMethod(Mxfp4MoEMethod):
         return False
 
     def maybe_roundup_sizes(self, hidden_size, intermediate_size_per_partition, act_dtype, moe_parallel_config):
-        # Skip Mxfp4MoEMethod's own step: its rounding is keyed on ``mxfp4_backend``, which HPU does not have. The
-        # FusedMoEMethodBase contract (the next class in the MRO) still applies.
+        # skips Mxfp4MoEMethod's step (keyed on ``mxfp4_backend``, absent on HPU)
         return super(Mxfp4MoEMethod, self).maybe_roundup_sizes(
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
@@ -249,12 +243,9 @@ class HPUKimiK3Mxfp4MoEMethod(Mxfp4MoEMethod):
 
 
 def _route_kimi_k3_moe_method() -> None:
-    """Make ``Mxfp4Config`` build the HPU method for Kimi-K3 (and only Kimi-K3).
+    """Make ``Mxfp4Config`` build the HPU method for Kimi-K3 only.
 
-    ``Mxfp4Config._make_moe_method`` returns ``Mxfp4MoEMethod``, whose ``__init__`` fails on HPU. The wrapper is
-    active from the moment this module is imported, i.e. before any model is built, so it does not depend on the
-    Kimi-K3 patches having been installed. Other models, and ``GptOssMxfp4Config`` (which overrides the method),
-    keep the upstream behaviour.
+    Active from import, independent of the Kimi-K3 patches. Other models and ``GptOssMxfp4Config`` keep upstream.
     """
     from vllm_gaudi.patches import _current_config_is_kimi_k3
     config_cls = mxfp4_module.Mxfp4Config

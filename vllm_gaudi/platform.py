@@ -78,8 +78,7 @@ class HpuPlatform(Platform):
     dispatch_key: str = "HPU"
     ray_device_key: str = "HPU"
     device_control_env_var: str = "HABANA_VISIBLE_MODULES"
-    # Kimi-K3 only (TP16 Ray: every worker must see the node's HABANA_VISIBLE_MODULES); empty, i.e. the upstream
-    # Platform default, for every other model.
+    # Kimi-K3 only (Ray workers must see the node's HABANA_VISIBLE_MODULES); empty for other models
     ray_noset_device_env_vars = _KimiK3OnlyList([
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
         "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
@@ -90,10 +89,8 @@ class HpuPlatform(Platform):
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
 
-    # VLLM_* variables read by vllm-gaudi itself. Only used by the fallback below, when the vLLM Platform has no
-    # validate_environ. vLLM calls it in EngineArgs.create_engine_config before any ModelConfig exists, so it cannot
-    # be gated per model: every model takes the upstream check, and a Kimi-K3 run may log 'Unknown vLLM environment
-    # variable' warnings for these names (log only).
+    # VLLM_* variables read by vllm-gaudi itself; used by the fallback below when the Platform has no validate_environ
+    # (not gated per model: the check runs before any ModelConfig exists)
     gaudi_env_vars: tuple[str, ...] = (
         "VLLM_BUCKETING_FROM_FILE",
         "VLLM_EXPONENTIAL_BUCKETING",

@@ -380,9 +380,7 @@ class HPUWorker(WorkerBase):
         init_worker_distributed_environment(self.vllm_config, self.rank, self.distributed_init_method, self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
-        # The device is open now (the opened /dev/accel node identifies the card); threads created from here on
-        # inherit the mask and the ones that already exist are pinned explicitly.
-        # Kimi-K3 only; other models keep the upstream behaviour (no affinity handling).
+        # needs the open device to identify the card; Kimi-K3 only
         if is_kimi_k3_vllm_config(self.vllm_config):
             apply_affinity(self.rank, self.local_rank)
         with set_current_vllm_config(self.vllm_config):

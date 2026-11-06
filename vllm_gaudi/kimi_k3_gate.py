@@ -27,10 +27,8 @@ def is_kimi_k3_vllm_config(vllm_config) -> bool:
     return vllm_config is not None and is_kimi_k3_model_config(getattr(vllm_config, "model_config", None))
 
 
-# Construction of a Kimi-K3 model is in progress in this thread. KimiK3ForConditionalGeneration builds its language
-# model through init_vllm_registered_model(..., architectures=['KimiLinearForCausalLM']), i.e. under a deep-copied
-# submodel config whose architectures are those of a standalone Kimi-Linear model, so the current vllm config alone
-# cannot tell a K3 layer from a Kimi-Linear one. The wrapper around the K3 model __init__ marks the span instead.
+# The K3 language model is built under a Kimi-Linear submodel config, so the vllm config cannot identify K3 layers;
+# the K3 model __init__ marks the construction span instead.
 _build_state = threading.local()
 
 
@@ -67,8 +65,7 @@ _kimi_k3_seen = False
 def mark_kimi_k3_seen() -> None:
     global _kimi_k3_seen
     _kimi_k3_seen = True
-    # Spawned EngineCore / Ray worker processes inherit the environment, not module globals. No VLLM_ prefix, so
-    # vLLM's unknown-variable check does not flag it.
+    # spawned processes inherit the environment, not module globals (no VLLM_ prefix: avoids the unknown-var check)
     os.environ.setdefault(SEEN_ENV, "1")
 
 
