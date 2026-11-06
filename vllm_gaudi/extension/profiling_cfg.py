@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import logging
 import os
 import random
 import shutil
 import time
-from typing import Callable, Iterable, Mapping, Optional
+from collections.abc import Callable, Iterable, Mapping
 
 # under the 'vllm' logger tree: vLLM attaches its handler there, other names would drop the INFO lines
 _logger = logging.getLogger('vllm.gaudi.profiling')
@@ -44,7 +45,7 @@ def bucketing_max_batched_tokens(tokens: int, mamba_chunk_size: int, profiling: 
     return -(-tokens // mamba_chunk_size) * mamba_chunk_size
 
 
-def profile_blocks_scattered(environ: Optional[Mapping[str, str]] = None) -> bool:
+def profile_blocks_scattered(environ: Mapping[str, str] | None = None) -> bool:
     """VLLM_PROFILE_BLOCKS: 'repeat' (default) gives every dummy block id 0, so the paged-attention KV gather
     re-reads one cached block; 'scatter' gives each dummy request its own blocks spread over the KV pool."""
     environ = os.environ if environ is None else environ
@@ -105,7 +106,7 @@ _SAMPLING_FIELDS = {
 }
 
 
-def profile_sampling_kwargs(spec: Optional[str], model_defaults: Optional[Mapping] = None) -> Optional[dict]:
+def profile_sampling_kwargs(spec: str | None, model_defaults: Mapping | None = None) -> dict | None:
     """SamplingParams kwargs for the dummy requests from VLLM_PROFILE_SAMPLING (None = unset: greedy as before).
 
     'default' takes the model's generation-config defaults (``model_defaults``) on top of the SamplingParams
@@ -136,7 +137,7 @@ def profile_sampling_kwargs(spec: Optional[str], model_defaults: Optional[Mappin
 WRITTEN_TRACES: list = []
 
 
-def profile_exit_delay_s(environ: Optional[Mapping[str, str]] = None) -> float:
+def profile_exit_delay_s(environ: Mapping[str, str] | None = None) -> float:
     """VLLM_PROFILE_EXIT_DELAY_S: seconds every rank holds after the traces are written, before the run ends with
     'Finished profiling' (0 = no hold). Gives time to copy the traces off the pod; invalid/negative values mean 0."""
     environ = os.environ if environ is None else environ
@@ -153,16 +154,14 @@ def hold_before_exit(delay_s: float, sleep: Callable[[float], None] = time.sleep
     """
     if delay_s <= 0:
         return
-    _logger.warning("Profiling traces ready: %s; holding %g s before exit",
-                    ", ".join(WRITTEN_TRACES) or "none written on this rank", delay_s)
+    _logger.warning("Profiling traces ready: %s; holding %g s before exit", ", ".join(WRITTEN_TRACES)
+                    or "none written on this rank", delay_s)
     sleep(delay_s)
 
 
 def _remove_if_exists(path: str) -> None:
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.remove(path)
-    except FileNotFoundError:
-        pass
 
 
 def _export_trace(prof, path: str) -> None:

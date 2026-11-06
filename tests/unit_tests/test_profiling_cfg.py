@@ -56,7 +56,8 @@ def test_trace_handler_writes_gzip_with_single_arg_export(tmp_path):
     cfg.make_trace_handler(str(tmp_path / "out"), 8)(_OneArgProf())
     files = list((tmp_path / "out").iterdir())
     assert len(files) == 1 and files[0].name.startswith("8_") and files[0].name.endswith(".pt.trace.json.gz")
-    assert gzip.open(files[0]).read() == b'{"traceEvents": []}'
+    with gzip.open(files[0]) as f:
+        assert f.read() == b'{"traceEvents": []}'
 
 
 def test_trace_handler_plain_json_without_gzip(tmp_path):
@@ -142,7 +143,8 @@ def test_trace_handler_calls_inner_profiler_when_outer_forwards_extra_arg(tmp_pa
     cfg.make_trace_handler(str(tmp_path), 0)(_TorchProfLikeHabana())
     files = list(tmp_path.iterdir())
     assert len(files) == 1 and files[0].name.endswith(".pt.trace.json.gz")
-    assert gzip.open(files[0]).read() == b'{"traceEvents": [1]}'
+    with gzip.open(files[0]) as f:
+        assert f.read() == b'{"traceEvents": [1]}'
 
 
 def test_trace_handler_falls_back_to_kineto_results_save(tmp_path):

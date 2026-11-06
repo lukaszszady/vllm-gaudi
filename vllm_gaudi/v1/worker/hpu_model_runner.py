@@ -6046,10 +6046,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         for i in range(steps):
             step_start = time.perf_counter()
             block_alloc = ScatteredBlockAllocator(*scatter_cfg) if scatter_cfg else None
-            self._prepare_dummy_scenario(prompt_cfg, decode_cfg, block_alloc=block_alloc, sampling_params=sampling_params)
+            self._prepare_dummy_scenario(prompt_cfg,
+                                         decode_cfg,
+                                         block_alloc=block_alloc,
+                                         sampling_params=sampling_params)
             if block_alloc is not None and block_alloc.wrapped:
-                logger.warning("VLLM_PROFILE_BLOCKS=scatter: the dummy batch needs more than the %d free KV blocks, "
-                               "block ids repeat", block_alloc.pool_size)
+                logger.warning(
+                    "VLLM_PROFILE_BLOCKS=scatter: the dummy batch needs more than the %d free KV blocks, "
+                    "block ids repeat", block_alloc.pool_size)
             torch.hpu.synchronize()
             logger.info("Profiling dummy step %d/%d took %.1f s on rank %d", i + 1, steps,
                         time.perf_counter() - step_start, rank)
@@ -6538,13 +6542,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.defragmenter = OnlineDefragmenter(self.kv_caches,
                                                    self.block_size,
                                                    hybrid=self.is_kimi_k3 and self.num_mamba_like_layers > 0)
-        # Profiling
-        prompt_profile_cfg, decode_profile_cfg = self._read_profiling_cfg()
-        if prompt_profile_cfg or decode_profile_cfg:
-            self._generate_profiling(prompt_profile_cfg, decode_profile_cfg)
-            raise AssertionError("Finished profiling")
-        kv_caches = self.kv_caches
-
+        # before the profiling run too: past the limit dynamo silently runs the frame eagerly
         if not htorch.utils.internal.is_lazy() and not self.model_config.enforce_eager:
             multiplier = 5 if self.compile_config.regional_compilation else 1
             if self.compile_config.regional_compilation and self.is_kimi_k3:
@@ -6560,6 +6558,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # the cache_size_limit and accumulated_cache_size_limit
             torch._dynamo.config.accumulated_cache_size_limit = max(cache_size_limit * 8,
                                                                     torch._dynamo.config.accumulated_cache_size_limit)
+
+        # Profiling
+        prompt_profile_cfg, decode_profile_cfg = self._read_profiling_cfg()
+        if prompt_profile_cfg or decode_profile_cfg:
+            self._generate_profiling(prompt_profile_cfg, decode_profile_cfg)
+            raise AssertionError("Finished profiling")
+        kv_caches = self.kv_caches
 
         if self.skip_warmup:
             logger.info("Skipping warmup...")
