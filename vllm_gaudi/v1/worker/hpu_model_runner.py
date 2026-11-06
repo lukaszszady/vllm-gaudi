@@ -39,7 +39,7 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
-from vllm_gaudi.v1.worker.mm_embed_utils import scatter_embed_rows, select_embed_rows
+from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.hpu_weight_page_cache import drop_weight_page_cache_during_load
@@ -2158,31 +2158,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # List of tuple (mm_hash, pos_info)
         mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
         if self.is_kimi_k3:
-            # Encode only the items the scheduler placed in this step. Encoding every
-            # item of the request that is missing from the encoder cache would
-            # re-encode items already consumed by earlier prefill chunks (the scheduler
-            # frees their cache entries) and would change the number of items per
-            # encoder call from step to step.
-            scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
-            for req_id in req_ids:
-                encoder_input_ids = scheduled_encoder_inputs.get(req_id)
-                if not encoder_input_ids:
-                    continue
-                req_state = self.requests[req_id]
-
-                for mm_input_id in encoder_input_ids:
-                    mm_feature = req_state.mm_features[mm_input_id]
-                    mm_hash = mm_feature.identifier
-                    if mm_feature.data is None or mm_hash in self.encoder_cache:
-                        continue
-                    # A span fully covered by computed (e.g. prefix-cached) tokens is
-                    # never gathered, and the scheduler strips its pixel payload
-                    # (strip_covered_mm_data), so there is nothing to encode.
-                    pos_info = mm_feature.mm_position
-                    if pos_info.offset + pos_info.length <= req_state.num_computed_tokens:
-                        continue
-                    mm_kwargs.append((mm_feature.modality, mm_feature.data))
-                    mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
+            # Encode only what this step needs. Encoding every item of the request that is missing from the
+            # encoder cache would re-encode items already consumed by earlier prefill chunks (the scheduler
+            # frees their cache entries) and would change the number of items per encoder call from step to
+            # step. The scheduler also dedups identical mm_hash values within a step and schedules the encoder
+            # for one request only, while prefills run one request at a time in any order, so the payload may
+            # come from another request of the step.
+            for mm_hash, mm_feature in collect_step_encoder_items(req_ids, self.requests,
+                                                                  scheduler_output.scheduled_encoder_inputs,
+                                                                  scheduler_output.num_scheduled_tokens,
+                                                                  self.encoder_cache):
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
+                mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
         else:
             for req_id in req_ids:
                 req_state = self.requests[req_id]
