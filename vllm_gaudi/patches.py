@@ -1395,7 +1395,7 @@ def _patch_kimi_linear_weights() -> None:
 def _patch_kimi_attn_res() -> None:
     """Pure PyTorch fallback for Kimi-K3 attn_res when Triton is disabled on HPU."""
     try:
-        from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_torch as _torch_attn_res
+        from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_bank, attn_res_torch as _torch_attn_res
 
         try:
             import vllm.models.kimi_k3.amd.ops.attn_res as _attn_res_mod
@@ -1422,7 +1422,7 @@ def _patch_kimi_attn_res() -> None:
                 return _torch_attn_res(
                     prefix_sum,
                     delta,
-                    block_residual,
+                    attn_res_bank(block_residual),
                     norm.weight,
                     proj.weight.squeeze(0),
                     None if output_norm is None else output_norm.weight,
@@ -1532,7 +1532,7 @@ def _patch_kimi_k3_arch() -> None:
                 if step is not None:
                     # `step` exists only in vLLM 28a5fba06+
                     kwargs["step"] = step
-                return run_with_deferred_kda_state(
+                output = run_with_deferred_kda_state(
                     self,
                     orig_linear_model_forward,
                     self,
@@ -1542,6 +1542,11 @@ def _patch_kimi_k3_arch() -> None:
                     inputs_embeds=inputs_embeds,
                     **kwargs,
                 )
+                # pipeline parallel: send the plain block bank, not the (bank, bank_ms) layer state
+                residual = output.tensors.get("residual") if hasattr(output, "tensors") else None
+                if isinstance(residual, tuple):
+                    output["residual"] = residual[0]
+                return output
 
             _amd_linear.KimiLinearModel.forward = _safe_kimi_linear_model_forward
             _amd_linear.KimiLinearModel._patched_hpu_tokens = True
@@ -1549,8 +1554,9 @@ def _patch_kimi_k3_arch() -> None:
 
         # out-of-place attn_res: in-place updates do not survive per-layer graph boundaries in torch.compile mode
         from vllm_gaudi.extension.logger import logger as _ext_logger
+        import vllm_gaudi.envs as gaudi_envs
         from vllm_gaudi.ops.hpu_kda_pytorch import KIMI_DECODER_LAYER_CLASSES, install_functional_attn_res
-        if install_functional_attn_res(_amd_linear) is None:
+        if install_functional_attn_res(_amd_linear, cache_bank_norm=gaudi_envs.HPU_KIMI_ATTN_RES_RSTD_CACHE) is None:
             _ext_logger().warning(
                 "Kimi-K3: none of %s with forward_attn_residual in %s, the in-place upstream "
                 "attn_res stays active", KIMI_DECODER_LAYER_CLASSES, _amd_linear.__name__)

@@ -2051,3 +2051,143 @@ def test_prefill_settings_reject_invalid_values(monkeypatch, value):
     module = _load_layer_module(monkeypatch, {"value": None})
     with pytest.raises(ValueError, match="HPU_KIMI_KDA_PREFILL_CHUNK"):
         module.parse_prefill_settings(value)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# attn_res with the bank mean squares cached next to the bank (HPU_KIMI_ATTN_RES_RSTD_CACHE)
+# ---------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(0, -1), (0, 0), (1, -1), (6, -1), (6, 3), (7, 6), (12, -1)])
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("output_norm", [True, False])
+def test_attn_res_cached_bank_norm_matches_the_recomputed_one(dtype, num_blocks, block_write_idx, has_delta,
+                                                              output_norm):
+    g = torch.Generator().manual_seed(400 + num_blocks)
+    tokens, hidden, bank = 64, 512, 13
+    prefix = (torch.randn(tokens, hidden, generator=g) * 3).to(dtype)
+    delta = torch.randn(tokens, hidden, generator=g).to(dtype) if has_delta else None
+    blocks = (torch.randn(tokens, bank, hidden, generator=g) * torch.rand(1, bank, 1, generator=g) * 4).to(dtype)
+    norm_w = torch.rand(hidden, generator=g) + 0.5
+    qk_w = torch.randn(hidden, generator=g) * 0.2
+    out_w = torch.rand(hidden, generator=g) + 0.5 if output_norm else None
+    bank_ms = kda.attn_res_bank_mean_square(blocks, bank)
+    inputs = (prefix.clone(), blocks.clone(), bank_ms.clone())
+
+    new_prefix, new_blocks, new_ms, out = kda.attn_res_functional_cached(prefix, delta, blocks, bank_ms, norm_w, qk_w,
+                                                                         out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+    ref_prefix, ref_blocks, ref = kda.attn_res_functional(prefix, delta, blocks, norm_w, qk_w, out_w, num_blocks,
+                                                          block_write_idx, 1e-6, 1e-6)
+
+    assert all(torch.equal(a, b) for a, b in zip((prefix, blocks, bank_ms), inputs))
+    assert torch.equal(new_prefix, ref_prefix) and torch.equal(new_blocks, ref_blocks)
+    torch.testing.assert_close(new_ms, kda.attn_res_bank_mean_square(new_blocks, bank), rtol=1e-6, atol=0)
+    if dtype == torch.float32:
+        torch.testing.assert_close(out, ref, rtol=1e-6, atol=1e-6)
+    else:
+        torch.testing.assert_close(out, ref)  # bf16 rounding at most
+        assert (out != ref).float().mean() <= 1e-3
+
+
+def test_attn_res_bank_mean_square_ignores_unwritten_blocks():
+    blocks = torch.full((3, 4, 8), float("nan"))
+    blocks[:, :2] = torch.randn(3, 2, 8)
+    ms = kda.attn_res_bank_mean_square(blocks, 2)
+    torch.testing.assert_close(ms[:, :2], blocks[:, :2].pow(2).mean(dim=-1))
+    assert torch.equal(ms[:, 2:], torch.zeros(3, 2))
+    assert torch.equal(kda.attn_res_bank_mean_square(blocks, 0), torch.zeros(3, 4))
+
+
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(0, -1), (0, 0), (3, -1), (3, 2)])
+def test_attn_res_functional_cached_compiles_to_one_graph(has_delta, num_blocks, block_write_idx):
+    import torch._dynamo as dynamo
+    prefix, delta, blocks, norm_w, qk_w, out_w = _attn_res_case(190 + num_blocks, torch.bfloat16)
+    delta = delta if has_delta else None
+
+    def fn(p, d, b):
+        ms = kda.attn_res_bank_mean_square(b, num_blocks)
+        return kda.attn_res_functional_cached(p, d, b, ms, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+
+    dynamo.reset()
+    try:
+        compiled = torch.compile(fn, backend="aot_eager", fullgraph=True, dynamic=False)
+        with dynamo.config.patch(error_on_recompile=True):
+            for p, d, b in ((prefix, delta, blocks), (prefix * 2, None if delta is None else delta * 2, blocks + 1)):
+                for x, y in zip(compiled(p, d, b), fn(p, d, b)):
+                    torch.testing.assert_close(x, y, rtol=1e-2, atol=1e-2)
+    finally:
+        dynamo.reset()
+
+
+def _run_installed_layers(cache_bank_norm,
+                          wrap=lambda layer: layer,
+                          num_layers=14,
+                          block_size=4,
+                          tokens=5,
+                          hidden=16,
+                          seed=140):
+    """The upstream model loop over decoder layers patched by ``install_functional_attn_res``."""
+    _, cls = _upstream_linear_module()
+    mod = types.ModuleType("vllm.models.kimi_k3.amd.linear")
+    mod.KimiLinearDecoderLayer = cls
+    kda.install_functional_attn_res(mod, cache_bank_norm=cache_bank_norm)
+    g, mk, params = _toy_params(num_layers, hidden, seed)
+    mk(hidden), torch.randn(hidden, generator=g)
+    hidden_states = torch.randn(tokens, hidden, generator=g)
+    residual = torch.full((tokens, -(-num_layers // block_size), hidden), float("nan"))  # like new_empty
+    prefix_delta = None
+    for layer in [wrap(cls(i, block_size, p)) for i, p in enumerate(params)]:
+        hidden_states, residual, prefix_delta = layer(None, hidden_states, residual, prefix_delta)
+    return hidden_states, residual, prefix_delta
+
+
+def test_installed_layers_with_cached_bank_norm_match_the_plain_bank():
+    prefix, (bank, bank_ms), delta = _run_installed_layers(True)
+    ref_prefix, ref_bank, ref_delta = _run_installed_layers(False)
+    torch.testing.assert_close(prefix, ref_prefix, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(delta, ref_delta, rtol=1e-6, atol=1e-6)
+    assert torch.equal(bank, ref_bank)
+    torch.testing.assert_close(bank_ms, kda.attn_res_bank_mean_square(bank, bank.shape[1]))
+    assert kda.attn_res_bank(ref_bank) is ref_bank and kda.attn_res_bank((bank, bank_ms)) is bank
+
+
+def test_installed_layers_with_cached_bank_norm_compile_per_layer_without_extra_breaks_or_input_mutations():
+    """Regional compilation: only the deliberate attention break, no mutated graph inputs, eager results."""
+    import torch._dynamo as dynamo
+    expected = _run_installed_layers(True)
+    dynamo.reset()
+    try:
+        got = _run_installed_layers(True, wrap=lambda layer: torch.compile(layer, backend="aot_eager"))
+    finally:
+        dynamo.reset()
+    for a, b in zip(got, expected):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+
+    _, _, params = _toy_params(2, 16, 140)
+    g = torch.Generator().manual_seed(2)
+    hidden_states, blocks = torch.randn(5, 16, generator=g), torch.randn(5, 3, 16, generator=g)
+    delta = torch.randn(5, 16, generator=g)
+
+    def breaks_and_mutations(cache_bank_norm, idx):
+        _, cls = _upstream_linear_module()
+        mod = types.ModuleType("vllm.models.kimi_k3.amd.linear")
+        mod.KimiLinearDecoderLayer = cls
+        kda.install_functional_attn_res(mod, cache_bank_norm=cache_bank_norm)
+        layer = cls(idx, 4, params[idx])
+        # the first layer gets a plain bank, later layers the (bank, bank_ms) tuple
+        residual = blocks if idx == 0 or not cache_bank_norm else (blocks, kda.attn_res_bank_mean_square(blocks, 3))
+        inputs = (None, hidden_states, residual, None if idx == 0 else delta)
+        dynamo.reset()
+        try:
+            explained = dynamo.explain(layer)(*inputs)
+        finally:
+            dynamo.reset()
+        reasons = sorted({r.reason.splitlines()[0] for r in explained.break_reasons})
+        mutated = _mutated_placeholders(lambda backend: torch.compile(layer, backend=backend), inputs)
+        return explained.graph_break_count, reasons, mutated
+
+    for idx in (0, 1):
+        count, reasons, mutated = breaks_and_mutations(True, idx)
+        assert (count, reasons) == breaks_and_mutations(False, idx)[:2]
+        assert all("_run_self_attn" in r or "disable" in r for r in reasons), reasons
+        assert mutated == []

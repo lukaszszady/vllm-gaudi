@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
     VLLM_COMPACT_GDN: bool = False
     HPU_KIMI_SITU_IMPL: str = "exact"
+    HPU_KIMI_ATTN_RES_RSTD_CACHE: bool = True
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -123,6 +124,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 KDA prefill "<chunk_size>,<vec_chunks>" (see kda_chunked_steps_vec)
     "HPU_KIMI_KDA_PREFILL_CHUNK":
     lambda: os.environ.get("HPU_KIMI_KDA_PREFILL_CHUNK", "64,16"),
+
+    # Kimi-K3 attn_res: keep the mean square of each stored block next to the bank instead of recomputing it per read
+    "HPU_KIMI_ATTN_RES_RSTD_CACHE":
+    lambda: os.environ.get("HPU_KIMI_ATTN_RES_RSTD_CACHE", "1").strip().lower() in ("1", "true"),
 }
 
 # end-env-vars-definition
