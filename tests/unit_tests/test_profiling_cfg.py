@@ -29,6 +29,13 @@ def test_decode_only_never_shrinks_the_budget_below_the_batch():
     assert cfg.profiling_max_batched_tokens(None, (16384, 1, 64), 8192) == 16384
 
 
+def test_mixed_profile_needs_slots_for_prompt_and_decode_requests():
+    assert cfg.profiling_max_reqs((1, 6400, 0), (64, 1, 3600), 64) == 65
+    assert cfg.profiling_max_reqs((1, 6400, 0), None, 64) == 64
+    assert cfg.profiling_max_reqs(None, (16, 1, 64), 1) == 16
+    assert cfg.profiling_max_reqs(None, None, 64) == 64
+
+
 def test_bucketing_budget_is_a_multiple_of_the_mamba_chunk_in_profile_mode():
     # build #859: 8192 + 1 = 8193 is not divisible by the default KDA/GDN chunk size 128 -> bucketing init raised
     budget = cfg.profiling_max_batched_tokens((1, 8192, 0), (1, 1, 53), 8192)

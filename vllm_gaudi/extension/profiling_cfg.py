@@ -32,6 +32,12 @@ def profiling_max_batched_tokens(prompt_cfg: tuple | None, decode_cfg: tuple | N
     return tokens
 
 
+def profiling_max_reqs(prompt_cfg: tuple | None, decode_cfg: tuple | None, current: int) -> int:
+    """Request slots (e.g. the compact GDN state pool) the dummy batch needs: a mixed step holds both batches."""
+    reqs = (prompt_cfg[0] if prompt_cfg else 0) + (decode_cfg[0] if decode_cfg else 0)
+    return max(current, reqs)
+
+
 def bucketing_max_batched_tokens(tokens: int, mamba_chunk_size: int, profiling: bool) -> int:
     """Token budget handed to the bucketing manager.
 

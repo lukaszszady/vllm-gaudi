@@ -40,7 +40,8 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.profiling_cfg import (ScatteredBlockAllocator, bucketing_max_batched_tokens, hold_before_exit,
                                                 pad_owner_block, profile_blocks_scattered, profile_exit_delay_s,
-                                                profile_sampling_kwargs, profiling_max_batched_tokens)
+                                                profile_sampling_kwargs, profiling_max_batched_tokens,
+                                                profiling_max_reqs)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
@@ -6950,12 +6951,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Profiling may request more sequences than max_num_seqs
         # (e.g. VLLM_PROFILE_DECODE=16,64 with max_num_seqs=1).
         # Ensure GDN compact tensors and free-list are large enough.
-        profile_bs = self._original_max_num_seqs
-        for env_key in ("VLLM_PROFILE_PROMPT", "VLLM_PROFILE_DECODE"):
-            cfg = os.environ.get(env_key)
-            if cfg:
-                profile_bs = max(profile_bs, int(cfg.split(",")[0]))
-        self._gdn_max_reqs = max(self._original_max_num_seqs, profile_bs)
+        self._gdn_max_reqs = profiling_max_reqs(*self._read_profiling_cfg(), self._original_max_num_seqs)
 
         # Mamba/GDN state tensors, keyed by (spec, position within the group).
         # Before vLLM #51718 a KVCacheTensor.shared_by listed at most one layer
