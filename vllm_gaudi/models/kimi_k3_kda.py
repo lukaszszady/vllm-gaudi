@@ -81,11 +81,24 @@ def run_with_deferred_kda_state(model, forward, *args, **kwargs):
     return out
 
 
+def parse_prefill_settings(value: str) -> tuple[int, int]:
+    """Parse HPU_KIMI_KDA_PREFILL_CHUNK ``"<chunk_size>,<vec_chunks>"``."""
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ValueError(f"HPU_KIMI_KDA_PREFILL_CHUNK must be '<chunk_size>,<vec_chunks>', got {value!r}")
+    chunk_size, vec_chunks = int(parts[0]), int(parts[1])
+    if chunk_size <= 0 or (chunk_size > 16 and chunk_size % 16 != 0):
+        raise ValueError(f"HPU_KIMI_KDA_PREFILL_CHUNK chunk_size must be positive and, above 16, a multiple of 16, "
+                         f"got {chunk_size}")
+    return chunk_size, vec_chunks
+
+
 # Chunk length of the chunk-parallel KDA prefill and the number of chunks whose intra-chunk terms are computed
 # together. assume_constant_result makes dynamo treat the result as a constant without a graph break.
 @torch.compiler.assume_constant_result
 def _prefill_settings() -> tuple[int, int]:
-    return 64, 16
+    from vllm_gaudi import envs as gaudi_envs
+    return parse_prefill_settings(gaudi_envs.HPU_KIMI_KDA_PREFILL_CHUNK)
 
 
 def _state_indices(self, attn_metadata) -> torch.Tensor:

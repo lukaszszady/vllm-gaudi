@@ -119,6 +119,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 SiTU experts: "exact" runs them unfused; "silu" maps SiTU to silu in the fused kernel (approximate)
     "HPU_KIMI_SITU_IMPL":
     lambda: os.environ.get("HPU_KIMI_SITU_IMPL", "exact").strip().lower(),
+
+    # Kimi-K3 KDA prefill "<chunk_size>,<vec_chunks>" (see kda_chunked_steps_vec)
+    "HPU_KIMI_KDA_PREFILL_CHUNK":
+    lambda: os.environ.get("HPU_KIMI_KDA_PREFILL_CHUNK", "64,16"),
 }
 
 # end-env-vars-definition
