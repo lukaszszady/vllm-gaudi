@@ -165,3 +165,36 @@ def video_vision_tokens(
     max_fps = float(media_proc_cfg.get("sample_fps", DEFAULT_MAX_SAMPLE_FPS))  # type: ignore[arg-type]
     chunks, _ = plan_video_chunks(num_frames, num_frames, source_fps, None, max_fps, chunk_size)
     return len(chunks) * chunk_tokens_fn(width, height, media_proc_cfg)
+
+
+def split_chunks_across_ranks(num_chunks: int, world_size: int) -> list[tuple[int, int]]:
+    """Contiguous ``[start, end)`` chunk range of every rank for the data-parallel vision tower (``HPU_KIMI_VIT_DP``).
+
+    Balanced: the first ``num_chunks % world_size`` ranks get one chunk more. Ranks beyond ``num_chunks`` get an empty
+    range. Contiguous ranges keep the chunk order when the per-rank outputs are concatenated in rank order.
+    """
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if num_chunks < 0:
+        raise ValueError(f"num_chunks must be >= 0, got {num_chunks}")
+    base, extra = divmod(num_chunks, world_size)
+    ranges = []
+    start = 0
+    for rank in range(world_size):
+        end = start + base + (1 if rank < extra else 0)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def rank_row_counts(chunk_rows: Sequence[int], ranges: Sequence[tuple[int, int]]) -> list[int]:
+    """Embedding rows each rank produces for its chunk range (``chunk_rows[i]`` rows for chunk ``i``)."""
+    return [sum(chunk_rows[start:end]) for start, end in ranges]
+
+
+def chunk_patch_offsets(grid_thws: Sequence[Sequence[int]]) -> list[int]:
+    """Start row of every chunk in the flattened ``pixel_values`` (``t * h * w`` patches per chunk), plus the total."""
+    offsets = [0]
+    for t, h, w in grid_thws:
+        offsets.append(offsets[-1] + t * h * w)
+    return offsets

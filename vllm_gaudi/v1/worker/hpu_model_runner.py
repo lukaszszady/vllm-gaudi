@@ -43,6 +43,7 @@ from vllm_gaudi.v1.worker.mm_embed_utils import scatter_embed_rows, select_embed
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.hpu_weight_page_cache import drop_weight_page_cache_during_load
+from vllm_gaudi.v1.worker.kimi_prefill_timing import PrefillTimer, count_video_chunks
 from vllm_gaudi.v1.worker.kv_block_layout import attn_pad_ids, contiguous_dummy_decode_layout, pad_slot_cycle
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
@@ -1357,6 +1358,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
         self.is_driver_worker = is_driver_worker
+        # HPU_KIMI_PREFILL_TIMING state, created on the first prefill (the TP group does not exist yet here).
+        self._prefill_timer: Optional[PrefillTimer] = None
+        self._timing_prefill = False
         self.use_aux_hidden_state_outputs = False
         self.supports_mm_inputs = False
 
@@ -2135,6 +2139,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return {}
 
+    def _get_prefill_timer(self) -> PrefillTimer:
+        if self._prefill_timer is None:
+
+            def sync() -> None:
+                htorch.core.mark_step()
+                torch.hpu.synchronize()
+
+            self._prefill_timer = PrefillTimer.from_env(is_driver_worker=self.is_driver_worker,
+                                                        get_rank=get_tensor_model_parallel_rank,
+                                                        sync=sync)
+        return self._prefill_timer
+
     # source: vllm/v1/worker/gpu_model_runner.py
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput", req_ids: list[str]):
         # Batch the multi-modal inputs.
@@ -2212,7 +2228,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # 2. A list or tuple (length: num_items) of tensors, each of shape
             # (feature_size, hidden_size) in case the feature size is dynamic
             # depending on the input multimodal items.
-            curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
+            timer = self._prefill_timer
+            if timer is not None and timer.enabled and self._timing_prefill:
+                start = timer.now()
+                curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
+                timer.add_encoder(timer.now() - start, num_items, count_video_chunks(mm_kwargs_group))
+            else:
+                curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
 
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
@@ -4660,6 +4682,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
                       logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
 
+                timer = self._get_prefill_timer()
+                self._timing_prefill = timer.enabled and not warmup_mode
+                if self._timing_prefill:
+                    timer.begin_step()
+                    t_start = timer.now()
+
                 # Prepare multimodal inputs if any
                 inputs_embeds, model_mm_kwargs = self._get_model_mm_inputs(
                     token_ids,
@@ -4667,6 +4695,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     scheduler_output,
                     req_id,
                 )
+                if self._timing_prefill:
+                    t_mm_inputs = timer.now()
 
                 lora_mask, lora_logits_mask = self._configure_lora(token_ids, self.requests, req_id, True)
 
@@ -4685,6 +4715,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         model_mm_kwargs=model_mm_kwargs,
                         warmup_mode=warmup_mode)
                 htorch.core.mark_step()
+                if self._timing_prefill:
+                    t_forward = timer.now()
+                    timer.finish_prefill(num_reqs=len(req_id),
+                                         tokens=sum(scheduler_output.num_scheduled_tokens.get(r, 0) for r in req_id),
+                                         padded_tokens=token_ids.numel(),
+                                         mm_inputs_s=t_mm_inputs - t_start,
+                                         lm_forward_s=t_forward - t_mm_inputs)
+                    self._timing_prefill = False
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.

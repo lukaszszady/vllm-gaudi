@@ -28,6 +28,7 @@ The K3 classes cannot be imported while the plugin loads, so everything that sub
 """
 
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -42,13 +43,19 @@ from vllm_gaudi.models.kimi_k3_video_utils import (
     K3_VIDEO_LOADER_MAX_FRAMES,
     K3_VIDEO_PLACEHOLDER,
     build_video_prompt,
+    chunk_patch_offsets,
     plan_video_chunks,
+    rank_row_counts,
+    split_chunks_across_ranks,
 )
 
 # Names of the video keyword arguments of the model (see the module docstring).
 VIDEO_PIXEL_VALUES = "video_pixel_values"
 VIDEO_GRID_THWS = "video_grid_thws"
 VIDEO_NUM_CHUNKS = "video_num_chunks"
+
+# Opt-in data-parallel vision tower for video (see _encode_chunks_data_parallel). Read once at install time.
+ENV_VIT_DP = "HPU_KIMI_VIT_DP"
 
 # Marker set on the patched model class; makes the installation idempotent.
 _INSTALLED_FLAG = "_hpu_kimi_k3_video"
@@ -241,9 +248,65 @@ def _make_classes():
     return (HpuKimiK3VideoProcessingInfo, HpuKimiK3VideoDummyInputsBuilder, KimiK3VideoProcessor)
 
 
+def _vit_dp_requested() -> bool:
+    return os.environ.get(ENV_VIT_DP, "0").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _encode_chunks_data_parallel(amd_model, model, pixel_values, grid_thws, chunk_rows: list[int]):
+    """Per-chunk embeddings of a video group, with the chunks split across the TP ranks (``HPU_KIMI_VIT_DP=1``).
+
+    Each rank runs the plain tower on a contiguous chunk range (``split_chunks_across_ranks``), so the temporal pooling
+    and the 2x2 merge are the same as on the single-rank path; every chunk is an independent varlen sequence of the
+    tower, so the split does not change the math. The local outputs are padded to the largest per-rank row count,
+    all-gathered over the TP group and cut back in rank order, which is the chunk order. Requires replicated tower
+    weights (``use_data_parallel``) and that every TP rank calls ``embed_multimodal`` with the same inputs, which
+    holds for the SPMD HPU runner (serving and multimodal warmup). The all-gather runs here, in eager code: only
+    ``vision_tower.encoder.blocks`` is compiled, and the blocks see one rank's chunk range.
+    """
+    import torch
+    from vllm.distributed import (get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
+                                  tensor_model_parallel_all_gather)
+
+    world_size = get_tensor_model_parallel_world_size()
+    rank = get_tensor_model_parallel_rank()
+    grid_list = grid_thws.tolist()
+    ranges = split_chunks_across_ranks(len(grid_list), world_size)
+    rows = rank_row_counts(chunk_rows, ranges)
+    max_rows = max(rows)
+    start, end = ranges[rank]
+    out_dim = model.mm_projector.linear_2.output_size
+    dtype = next(model.mm_projector.parameters()).dtype
+    if start < end:
+        offsets = chunk_patch_offsets(grid_list)
+        local = amd_model.vision_tower_forward(
+            model.vision_tower,
+            pixel_values[offsets[start]:offsets[end]],
+            grid_thws[start:end],
+            mm_projector=model.mm_projector,
+            use_data_parallel=False,
+        )
+        local = torch.cat(list(local), dim=0)
+        if tuple(local.shape) != (rows[rank], out_dim):
+            raise ValueError(f"Kimi-K3 video DP: rank {rank} encoded chunks [{start}, {end}) into "
+                             f"{tuple(local.shape)}, expected ({rows[rank]}, {out_dim})")
+        if local.shape[0] < max_rows:
+            pad = local.new_zeros(max_rows - local.shape[0], out_dim)
+            local = torch.cat([local, pad], dim=0)
+    else:
+        local = torch.zeros(max_rows, out_dim, dtype=dtype, device=pixel_values.device)
+    gathered = tensor_model_parallel_all_gather(local.contiguous(), dim=0).view(world_size, max_rows, out_dim)
+    merged = torch.cat([gathered[r, :rows[r]] for r in range(world_size) if rows[r]], dim=0)
+    if merged.shape[0] != sum(chunk_rows):
+        raise ValueError(f"Kimi-K3 video DP: gathered {merged.shape[0]} rows, expected {sum(chunk_rows)}")
+    return list(torch.split(merged, chunk_rows))
+
+
 def _patch_model_class(model_cls, amd_model) -> None:
     """Video-aware ``get_placeholder_str``, ``_mark_tower_model`` and ``embed_multimodal`` on the K3 model class."""
     import torch
+
+    vit_dp = _vit_dp_requested()
+    dp_fallback_logged = []
 
     orig_placeholder = model_cls.get_placeholder_str.__func__
     orig_mark_tower = model_cls._mark_tower_model
@@ -282,21 +345,34 @@ def _patch_model_class(model_cls, amd_model) -> None:
         # output as t*h*w // merge_area patches and so ignores the temporal pooling of tpool_patch_merger
         # (kimi_k25_vit.py:656-679): a t=4 chunk then yields 4x the 18x31 rows it really has. Images (t=1) are not
         # affected. In data-parallel mode the tower layers are replicated (disable_tp), so every rank can run the
-        # whole batch itself.
-        per_chunk = amd_model.vision_tower_forward(
-            self.vision_tower,
-            pixel_values,
-            grid_thws,
-            mm_projector=self.mm_projector,
-            use_data_parallel=False,
-        )
+        # whole batch itself, or (HPU_KIMI_VIT_DP=1) its share of the chunks.
+        merge_h, merge_w = self.vision_tower.merge_kernel_size
+        chunk_rows = [(h // merge_h) * (w // merge_w) for _, h, w in grid_thws.tolist()]
+        use_dp = False
+        if vit_dp:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+            use_dp = bool(getattr(self, "use_data_parallel", False)) and get_tensor_model_parallel_world_size() > 1
+            if not use_dp and not dp_fallback_logged:
+                dp_fallback_logged.append(True)
+                logger.warning(
+                    "%s=1 ignored: the vision tower is not replicated (use_data_parallel=%s) or TP world size is 1; "
+                    "every rank encodes all video chunks", ENV_VIT_DP, getattr(self, "use_data_parallel", None))
+        if use_dp:
+            per_chunk = _encode_chunks_data_parallel(amd_model, self, pixel_values, grid_thws, chunk_rows)
+        else:
+            per_chunk = amd_model.vision_tower_forward(
+                self.vision_tower,
+                pixel_values,
+                grid_thws,
+                mm_projector=self.mm_projector,
+                use_data_parallel=False,
+            )
         chunks_per_video = num_chunks.reshape(-1).tolist()
         if len(per_chunk) != sum(chunks_per_video):
             raise ValueError(f"Kimi-K3 video: the vision tower returned {len(per_chunk)} chunk embeddings for "
                              f"{sum(chunks_per_video)} chunks")
-        merge_h, merge_w = self.vision_tower.merge_kernel_size
         for i, (_, h, w) in enumerate(grid_thws.tolist()):
-            expected = (h // merge_h) * (w // merge_w)
+            expected = chunk_rows[i]
             if per_chunk[i].shape[0] != expected:
                 raise ValueError(f"Kimi-K3 video: chunk {i} has {per_chunk[i].shape[0]} embedding rows, expected "
                                  f"{expected} ((h={h})//{merge_h} * (w={w})//{merge_w})")
@@ -335,5 +411,5 @@ def install_kimi_k3_video() -> None:
         "fps": K3_VIDEO_LOADER_FPS,
     })
     setattr(model_cls, _INSTALLED_FLAG, True)
-    logger.info("Kimi-K3 video input enabled (loader fps=%s, max frames=%s)", K3_VIDEO_LOADER_FPS,
-                K3_VIDEO_LOADER_MAX_FRAMES)
+    logger.info("Kimi-K3 video input enabled (loader fps=%s, max frames=%s, %s=%d)", K3_VIDEO_LOADER_FPS,
+                K3_VIDEO_LOADER_MAX_FRAMES, ENV_VIT_DP, int(_vit_dp_requested()))
