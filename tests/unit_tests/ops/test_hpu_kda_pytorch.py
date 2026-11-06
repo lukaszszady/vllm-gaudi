@@ -2033,3 +2033,21 @@ def test_size_probe_detects_mod_and_symbolic_division():
         return x.reshape(1, (x.shape[1]) // 16, 16, -1).sum()
 
     assert _unsupported_size_exprs(fn, (torch.randn(1, 150, 4), ), 1)
+
+
+@pytest.mark.parametrize("value,expected", [(None, (64, 16)), ("128,8", (128, 8)), (" 32 , 0 ", (32, 0))])
+def test_prefill_settings_come_from_env(monkeypatch, value, expected):
+    monkeypatch.delenv("KDA_TEST_PREFILL_SETTINGS", raising=False)
+    if value is None:
+        monkeypatch.delenv("HPU_KIMI_KDA_PREFILL_CHUNK", raising=False)
+    else:
+        monkeypatch.setenv("HPU_KIMI_KDA_PREFILL_CHUNK", value)
+    module = _load_layer_module(monkeypatch, {"value": None})
+    assert module._prefill_settings() == expected
+
+
+@pytest.mark.parametrize("value", ["64", "64,16,1", "0,16", "40,16", "64,-1", "a,b"])
+def test_prefill_settings_reject_invalid_values(monkeypatch, value):
+    module = _load_layer_module(monkeypatch, {"value": None})
+    with pytest.raises(ValueError, match="HPU_KIMI_KDA_PREFILL_CHUNK"):
+        module.parse_prefill_settings(value)
