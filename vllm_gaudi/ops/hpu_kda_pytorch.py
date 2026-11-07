@@ -386,8 +386,8 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
     """Chunk-initial states [N,B,H,K,V] and the final state of ``s <- s * gl + Tu - Tw s`` from s_t [B,H,K,V].
 
     ``scan_block`` <= 1 steps through the chunks. Otherwise the affine chunk maps ``s -> A s + Tu`` with
-    ``A = diag(gl) - Tw`` are composed by an inclusive scan (log2 levels of batched matmuls) within blocks of
-    ``scan_block`` chunks, so only the block-initial states are stepped sequentially.
+    ``A = diag(gl) - Tw`` are composed within blocks of ``scan_block`` chunks, batched over the blocks, so only
+    the block-initial states are stepped sequentially; the carries are added by ``baddbmm``.
     """
     num_chunks, bsz, heads, kdim, vdim = tu.shape
     if scan_block <= 1:
@@ -403,31 +403,37 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
     else:
         block, num_blocks = num_chunks, 1
     pad = num_blocks * block - num_chunks
+    rows = num_blocks * bsz * heads  # explicit sizes: no reshape(-1) divisions in the traced shapes
+
+    # [block, num_blocks, B*H, K, D]: the position in the block leads, so every step reads a leading-dim slice
+    def to_blocks(x, value=0.0):
+        if pad:  # identity maps
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 0, 0, pad), value=value)
+        return x.reshape(num_blocks, block, bsz * heads, kdim, x.shape[-1]).transpose(0, 1).contiguous()
+
     eye = torch.eye(kdim, dtype=tw.dtype, device=tw.device)
-    a = eye * gamma_last - tw  # [N,B,H,K,K]
-    b = tu
-    if pad:  # identity maps
-        a = torch.cat([a, eye.expand(pad, bsz, heads, kdim, kdim)])
-        b = torch.cat([b, torch.zeros(pad, bsz, heads, kdim, vdim, dtype=b.dtype, device=b.device)])
-
-    # [block, num_blocks, B*H, K, D]: the position in the block leads, so every scan level is leading-dim slices
-    def to_blocks(x):
-        return x.reshape(num_blocks, block, bsz * heads, kdim, -1).permute(1, 0, 2, 3, 4).contiguous()
-
-    a, b = to_blocks(a), to_blocks(b)
-    shift = 1
-    while shift < block:
-        a, b = (torch.cat([a[:shift], torch.matmul(a[shift:], a[:-shift])]),
-                torch.cat([b[:shift], torch.matmul(a[shift:], b[:-shift]) + b[shift:]]))
-        shift *= 2
+    a = eye * to_blocks(gamma_last, 1.0) - to_blocks(tw)
+    b = to_blocks(tu)
+    # prefix maps within the blocks: P_i = A_i P_{i-1}, c_i = A_i c_{i-1} + b_i
+    p, c = [a[0].reshape(rows, kdim, kdim)], [b[0].reshape(rows, kdim, vdim)]
+    for a_i, b_i in zip(a[1:], b[1:]):
+        a_i = a_i.reshape(rows, kdim, kdim)
+        p.append(torch.bmm(a_i, p[-1]))
+        c.append(torch.baddbmm(b_i.reshape(rows, kdim, vdim), a_i, c[-1]))
     x = s_t.reshape(bsz * heads, kdim, vdim)
     xs = []
-    for a_j, b_j in zip(a[-1], b[-1]):
+    for p_j, c_j in zip(p[-1].reshape(num_blocks, bsz * heads, kdim, kdim),
+                        c[-1].reshape(num_blocks, bsz * heads, kdim, vdim)):
         xs.append(x)
-        x = torch.matmul(a_j, x) + b_j
-    xs = torch.stack(xs).unsqueeze(0)  # [1, num_blocks, B*H, K, V]
-    starts = torch.cat([xs, torch.matmul(a[:-1], xs.expand(block - 1, -1, -1, -1, -1)) + b[:-1]])
-    starts = starts.permute(1, 0, 2, 3, 4).reshape(num_blocks * block, bsz, heads, kdim, vdim)
+        x = torch.baddbmm(c_j, p_j, x)
+    xs = torch.stack(xs)  # [num_blocks, B*H, K, V]
+    xs_rows = xs.flatten(0, 1)
+    starts = [xs] + [
+        torch.baddbmm(c_i, p_i, xs_rows).reshape(num_blocks, bsz * heads, kdim, vdim)
+        for p_i, c_i in zip(p[:-1], c[:-1])
+    ]
+    starts = torch.stack(starts, 1)
+    starts = starts.reshape(num_blocks * block, bsz, heads, kdim, vdim)
     return starts[:num_chunks], x.reshape(bsz, heads, kdim, vdim)
 
 

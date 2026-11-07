@@ -1318,9 +1318,39 @@ def test_chunked_vec_scanned_recurrence_with_slow_gates_and_near_parallel_keys(g
 
 def test_chunked_vec_scanned_recurrence_steps_once_per_block():
     _, loop_compute = _ops_per_chunk(kda.kda_chunked_steps_vec, vec_chunks=0, scan_block=0)
-    # lengths 256 / 512 are 4 / 8 chunks: one block of 4 / 8 chunks, one more scan level
+    # lengths 256 / 512 are 4 / 8 chunks: one block of 4 / 8 chunks, four more in-block steps
     _, scan_compute = _ops_per_chunk(kda.kda_chunked_steps_vec, vec_chunks=0, scan_block=8)
     assert scan_compute < loop_compute, (scan_compute, loop_compute)
+
+
+def _chunk_maps(seed, num_chunks, dtype=torch.float32):
+    g = torch.Generator().manual_seed(seed)
+    rnd = lambda *shape: torch.randn(*shape, generator=g, dtype=dtype)  # noqa: E731
+    tw, tu = rnd(num_chunks, 2, 3, D, D) * 0.02, rnd(num_chunks, 2, 3, D, D)
+    gamma_last = torch.rand(num_chunks, 2, 3, D, 1, generator=g, dtype=dtype) * 0.5 + 0.5
+    return rnd(2, 3, D, D).transpose(-1, -2), tw, tu, gamma_last
+
+
+@pytest.mark.parametrize("num_chunks", [1, 3, 8, 13, 100])
+@pytest.mark.parametrize("scan_block", [2, 3, 8, 16])
+def test_chunk_start_states_scan_matches_the_fp64_loop(num_chunks, scan_block):
+    s, tw, tu, gl = _chunk_maps(400 + num_chunks, num_chunks)
+    starts_ref, last_ref = kda._chunk_start_states(s.double(), tw.double(), tu.double(), gl.double(), 0)
+    starts, last = kda._chunk_start_states(s, tw, tu, gl, scan_block)
+    assert starts.shape == starts_ref.shape and last.shape == last_ref.shape
+    scale = starts_ref.abs().max()
+    assert (starts.double() - starts_ref).abs().max() <= 1e-6 * scale
+    assert (last.double() - last_ref).abs().max() <= 1e-6 * scale
+    starts64, last64 = kda._chunk_start_states(s.double(), tw.double(), tu.double(), gl.double(), scan_block)
+    torch.testing.assert_close(starts64, starts_ref, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(last64, last_ref, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("scan_block", [8, 16])
+def test_chunk_start_states_scan_adds_inside_the_matmuls_and_does_not_concatenate(scan_block):
+    ops = _aten_ops(kda._chunk_start_states, *_chunk_maps(410, 21), scan_block)
+    assert "baddbmm" in ops
+    assert not {"add", "cat"} & set(ops), sorted(set(ops))
 
 
 def test_prefill_step_only_reads_the_caches_and_write_completes_it():
