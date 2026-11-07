@@ -385,9 +385,10 @@ def kda_chunked_steps_vec(state: torch.Tensor,
     Same arguments and result. The pairwise decay, A, Aqk, the exact (I + A)^-1 and the terms derived from it
     (``_intra_chunk_terms``) are computed for ``vec_chunks`` chunks at a time (0 = all at once; the pairwise
     tensor is [vec_chunks, C, C, K] per head), so only the state recurrence stays sequential, kept in the
-    transposed layout s = S^T [K, V] (5 ops per chunk)::
+    transposed layout s = S^T [K, V] with its state-independent products batched over all chunks (one matmul
+    per chunk)::
 
-        U   = Uv - Wk s                  s <- s * exp(G_C)^T + (K exp(G_C - G))^T U
+        Tw = (K exp(G_C - G))^T Wk      Tu = (K exp(G_C - G))^T Uv      s <- s * exp(G_C)^T + Tu - Tw s
 
     and the outputs of all chunks come from the stacked chunk-initial states in one matmul at the end.
     ``sub_chunk`` > 0 computes A and Aqk blockwise (see ``_intra_chunk_terms``).
@@ -428,13 +429,17 @@ def kda_chunked_steps_vec(state: torch.Tensor,
                                q_gamma[:, :, sl], strict, lower, sub_chunk))
     uv, wk, q_eff, o_intra = (torch.cat(parts, dim=2) if len(parts) > 1 else parts[0] for parts in zip(*terms))
 
+    tw = torch.matmul(k_tail_t, wk)  # [B,H,N,K,K]
+    tu = torch.matmul(k_tail_t, uv)  # [B,H,N,K,V]
+
     s_t = state.transpose(-1, -2)  # [B,H,K,V]
     starts = []
     # chunk axis first and contiguous, so the loop only selects dense slices (no strided views of permuted tensors)
-    uv_c, wk_c, tail_c, gl_c = (x.movedim(2, 0).contiguous() for x in (uv, wk, k_tail_t, gamma_last))
-    for uv_n, wk_n, tail_n, gl_n in zip(uv_c, wk_c, tail_c, gl_c):
+    tw_c, tu_c, gl_c = (x.movedim(2, 0).contiguous() for x in (tw, tu, gamma_last))
+    for tw_n, tu_n, gl_n in zip(tw_c, tu_c, gl_c):
         starts.append(s_t)
-        s_t = s_t * gl_n + torch.matmul(tail_n, uv_n - torch.matmul(wk_n, s_t))
+        # the decay stays elementwise; only the delta-rule correction goes through the matmul
+        s_t = s_t * gl_n + tu_n - torch.matmul(tw_n, s_t)
     out = torch.matmul(q_eff, torch.stack(starts, dim=2)) + o_intra  # [B,H,N,C,V]
     out = out.permute(0, 2, 3, 1, 4).reshape(bsz, num_chunks * chunk, heads, vdim)
     # exact shape and a dense layout: this output crosses a graph break (storage offset 0, no padded tail)
