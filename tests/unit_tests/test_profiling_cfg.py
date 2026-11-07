@@ -252,6 +252,51 @@ def test_trace_handler_records_written_paths(tmp_path, monkeypatch):
     assert len(cfg.WRITTEN_TRACES) == 1 and cfg.WRITTEN_TRACES[0].endswith(".pt.trace.json")
 
 
+def test_rank_tag_has_no_digits():
+    assert cfg.rank_tag(0) == "zero"
+    assert cfg.rank_tag(15) == "one-five"
+    assert cfg.rank_tag(1) != cfg.rank_tag(5)
+
+
+def test_profile_copy_dir_env():
+    assert cfg.profile_copy_dir({}) is None
+    assert cfg.profile_copy_dir({"VLLM_PROFILE_COPY_DIR": ""}) is None
+    assert cfg.profile_copy_dir({"VLLM_PROFILE_COPY_DIR": "/root/results"}) == "/root/results"
+
+
+def test_copy_trace_parts_single_file(tmp_path):
+    src = tmp_path / "7_1_2.pt.trace.json.gz"
+    src.write_bytes(b"abc")
+    names = cfg.copy_trace_parts(str(src), str(tmp_path / "copy"), 7, part_bytes=10)
+    assert names == [str(tmp_path / "copy" / "trace_rank7.pt.trace.json.gz.log")]
+    assert (tmp_path / "copy" / "trace_rank7.pt.trace.json.gz.log").read_bytes() == b"abc"
+
+
+def test_copy_trace_parts_splits_and_reassembles(tmp_path):
+    data = bytes(range(256)) * 3
+    src = tmp_path / "15_1_2.pt.trace.json.gz"
+    src.write_bytes(data)
+    names = cfg.copy_trace_parts(str(src), str(tmp_path), 15, part_bytes=300)
+    assert [os.path.basename(n) for n in names] == [f"trace_rank15.pt.trace.json.gz.part{i:02d}.log" for i in range(3)]
+    assert all(os.path.getsize(n) <= 300 for n in names)
+    assert b"".join(pathlib.Path(n).read_bytes() for n in names) == data
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_copy_part_size_is_below_70_mb():
+    assert cfg.COPY_PART_BYTES < 70 * 10**6
+
+
+def test_trace_handler_copies_to_copy_dir_and_logs_per_rank(tmp_path, caplog):
+    import gzip
+    with caplog.at_level("WARNING", logger="vllm.gaudi.profiling"):
+        cfg.make_trace_handler(str(tmp_path / "out"), 12, copy_dir=str(tmp_path / "res"))(_OneArgProf())
+    copied = tmp_path / "res" / "trace_rank12.pt.trace.json.gz.log"
+    assert gzip.decompress(copied.read_bytes()) == b'{"traceEvents": []}'
+    assert "Profiler trace written on rank 12 (one-two)" in caplog.text
+    assert "Profiler trace copied on rank 12 (one-two)" in caplog.text
+
+
 def test_profile_blocks_mode_env():
     assert cfg.profile_blocks_scattered({}) is False
     assert cfg.profile_blocks_scattered({"VLLM_PROFILE_BLOCKS": "repeat"}) is False

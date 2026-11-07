@@ -201,27 +201,86 @@ def _export_trace(prof, path: str) -> None:
     raise RuntimeError("; ".join(errors))
 
 
-def make_trace_handler(output_dir: str, rank: int, use_gzip: bool = True) -> Callable:
+# Below 70 MB so every part stays a Jenkins artifact (< 75 MB).
+COPY_PART_BYTES = 64 * 1024 * 1024
+_DIGIT_WORDS = ('zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine')
+
+
+def rank_tag(rank: int) -> str:
+    """Rank spelled in words ('one-five' for 15): Ray log dedup ignores digits, so numbers alone collapse lines."""
+    return '-'.join(_DIGIT_WORDS[int(d)] for d in str(rank))
+
+
+def profile_copy_dir(environ: Mapping[str, str] | None = None) -> str | None:
+    """VLLM_PROFILE_COPY_DIR: directory receiving a copy of every written trace as ``*.log`` parts (unset = off)."""
+    environ = os.environ if environ is None else environ
+    return environ.get('VLLM_PROFILE_COPY_DIR') or None
+
+
+def copy_trace_parts(path: str, copy_dir: str, rank: int, part_bytes: int = COPY_PART_BYTES) -> list[str]:
+    """Copy ``path`` to ``<copy_dir>/trace_rank<R>.<suffix>.log``, split into ``.partNN.log`` pieces if larger
+    than ``part_bytes``. Each piece is written as ``*.tmp`` and renamed when complete. Returns the pieces."""
+    os.makedirs(copy_dir, exist_ok=True)
+    base = os.path.join(copy_dir, f"trace_rank{rank}." + os.path.basename(path).split('.', 1)[1])
+    size = os.path.getsize(path)
+    count = max(1, -(-size // part_bytes))
+    names = [base + ".log"] if count == 1 else [f"{base}.part{i:02d}.log" for i in range(count)]
+    with open(path, "rb") as src:
+        for name in names:
+            with open(name + ".tmp", "wb") as dst:
+                left = part_bytes
+                while left > 0:
+                    chunk = src.read(min(left, 1 << 20))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    left -= len(chunk)
+            os.replace(name + ".tmp", name)
+    return names
+
+
+def _mem_available_mb() -> int:
+    with contextlib.suppress(OSError, ValueError, IndexError), open('/proc/meminfo') as f:
+        for line in f:
+            if line.startswith('MemAvailable:'):
+                return int(line.split()[1]) // 1024
+    return -1
+
+
+def make_trace_handler(output_dir: str, rank: int, use_gzip: bool = True, copy_dir: str | None = None) -> Callable:
     """``on_trace_ready`` callback writing ``<output_dir>/<rank>_<pid>_<ms>.pt.trace.json[.gz]``.
 
     ``torch.profiler.tensorboard_trace_handler`` goes through ``prof.export_chrome_trace``, which passes extra
     arguments the Habana profiler wrapper does not accept (see ``_export_trace``). This handler writes the plain
-    trace through ``_export_trace`` and gzips in Python. Failures are logged, never raised.
+    trace through ``_export_trace`` and gzips in Python; with ``copy_dir`` (default VLLM_PROFILE_COPY_DIR) it also
+    copies the result via ``copy_trace_parts``. Failures are logged, never raised.
     """
+    copy_dir = profile_copy_dir() if copy_dir is None else copy_dir
+    tag = rank_tag(rank)
 
     def handler(prof) -> None:
         path = os.path.join(output_dir, f"{rank}_{os.getpid()}_{int(time.time() * 1000)}.pt.trace.json")
         try:
+            _logger.warning("Exporting profiler trace on rank %d (%s), host MemAvailable %d MB", rank, tag,
+                            _mem_available_mb())
             os.makedirs(output_dir, exist_ok=True)
             _export_trace(prof, path)
             if use_gzip:
-                with open(path, "rb") as src, gzip.open(path + ".gz", "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+                with open(path, "rb") as src, gzip.open(path + ".gz", "wb", compresslevel=1) as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
                 os.remove(path)
                 path += ".gz"
             WRITTEN_TRACES.append(path)
-            _logger.info("Profiler trace written on rank %d: %s (%d bytes)", rank, path, os.path.getsize(path))
+            _logger.warning("Profiler trace written on rank %d (%s): %s (%d bytes)", rank, tag, path,
+                            os.path.getsize(path))
         except Exception as exc:
-            _logger.warning("Cannot write the profiler trace on rank %d (%s): %r", rank, path, exc)
+            _logger.warning("Cannot write the profiler trace on rank %d (%s, %s): %r", rank, tag, path, exc)
+            return
+        if copy_dir:
+            try:
+                parts = copy_trace_parts(path, copy_dir, rank)
+                _logger.warning("Profiler trace copied on rank %d (%s): %s", rank, tag, ", ".join(parts))
+            except Exception as exc:
+                _logger.warning("Cannot copy the profiler trace on rank %d (%s) to %s: %r", rank, tag, copy_dir, exc)
 
     return handler

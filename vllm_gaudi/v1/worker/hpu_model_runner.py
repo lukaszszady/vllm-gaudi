@@ -41,7 +41,7 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
 from vllm_gaudi.extension.profiling_cfg import (ScatteredBlockAllocator, bucketing_max_batched_tokens, hold_before_exit,
                                                 pad_owner_block, profile_blocks_scattered, profile_exit_delay_s,
                                                 profile_sampling_kwargs, profiling_max_batched_tokens,
-                                                profiling_max_reqs)
+                                                profiling_max_reqs, rank_tag)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
@@ -102,7 +102,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.utils import bind_kv_cache, add_kv_sharing_layers_to_kv_cache_groups
 from vllm.v1.utils import CpuGpuBuffer
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch, CachedRequestState
-from vllm.distributed.parallel_state import get_pp_group, get_dp_group
+from vllm.distributed.parallel_state import get_pp_group, get_dp_group, get_world_group
 from vllm.model_executor.models.interfaces import (supports_eagle3, supports_transcription)
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -6105,17 +6105,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     @staticmethod
     def _barrier_after_profiling(rank: int) -> None:
-        """Wait until every rank finished exporting its trace (stop() writes it synchronously).
+        """Block the host until every rank has written its trace (the last profiler step exports it).
 
         All ranks run the same dummy steps, also those not listed in VLLM_PROFILE_RANKS, so every rank reaches
-        this barrier. Without it a rank still compressing a large trace is killed by the Ray teardown that
-        follows the 'Finished profiling' assertion on the first rank to get there. Never raises.
+        this barrier. It runs on the gloo world group: an HCCL barrier only enqueues device work and lets a
+        rank raise 'Finished profiling', whose teardown kills ranks still writing. Never raises.
         """
+        if not (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1):
+            return
+        tag = rank_tag(rank)
         try:
-            if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-                torch.distributed.barrier()
+            torch.distributed.barrier(group=get_world_group().cpu_group)
+            logger.warning("Barrier after profiling passed on rank %d (%s)", rank, tag)
         except Exception as exc:
-            logger.warning("Barrier after profiling failed on rank %d: %r", rank, exc)
+            logger.warning("Barrier after profiling failed on rank %d (%s): %r", rank, tag, exc)
 
     @staticmethod
     def _profiler_call(profiler, method: str, rank: int):
