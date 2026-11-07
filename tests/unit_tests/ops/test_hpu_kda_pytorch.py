@@ -2332,7 +2332,8 @@ def test_chunked_vec_with_sub_chunk_traced_sizes_are_plain_dynamic_dims(seq_len,
     assert _unsupported_size_exprs(fn, (x, state), 1) == []
 
 
-@pytest.mark.parametrize("value,expected", [(None, 0), ("16", 16), (" 32 ", 32), ("0", 0)])
+@pytest.mark.parametrize("value,expected", [(None, 0), ("16", 16), (" 32 ", 32), ("0", 0), ("", 0), (" ", 0), ("24", 0),
+                                            ("64", 0)])
 def test_intra_sub_chunk_comes_from_env(monkeypatch, value, expected):
     if value is None:
         monkeypatch.delenv("HPU_KIMI_KDA_INTRA_SUB_CHUNK", raising=False)
@@ -2342,8 +2343,83 @@ def test_intra_sub_chunk_comes_from_env(monkeypatch, value, expected):
     assert module._intra_sub_chunk() == expected
 
 
-@pytest.mark.parametrize("value", ["-16", "a", "16,4", ""])
+@pytest.mark.parametrize("value", ["-16", "a", "16,4", "1.5"])
 def test_intra_sub_chunk_rejects_invalid_values(monkeypatch, value):
     module = _load_layer_module(monkeypatch, {"value": None})
     with pytest.raises(ValueError, match="HPU_KIMI_KDA_INTRA_SUB_CHUNK"):
         module.parse_intra_sub_chunk(value)
+
+
+@pytest.mark.parametrize("chunk,sub_chunk,expected", [(64, 16, 16), (64, 32, 32), (64, 24, 0), (64, 64, 0),
+                                                      (64, 128, 0), (64, 0, 0), (16, 8, 8)])
+def test_effective_intra_sub_chunk(chunk, sub_chunk, expected):
+    assert kda.effective_intra_sub_chunk(chunk, sub_chunk) == expected
+
+
+def test_intra_sub_chunk_follows_the_prefill_chunk(monkeypatch):
+    monkeypatch.setenv("HPU_KIMI_KDA_PREFILL_CHUNK", "32,4")
+    monkeypatch.setenv("HPU_KIMI_KDA_INTRA_SUB_CHUNK", "32")
+    assert _load_layer_module(monkeypatch, {"value": None})._intra_sub_chunk() == 0
+    monkeypatch.setenv("HPU_KIMI_KDA_INTRA_SUB_CHUNK", "16")
+    assert _load_layer_module(monkeypatch, {"value": None})._intra_sub_chunk() == 16
+
+
+@pytest.mark.parametrize("sub_chunk", [24, 64, 100])
+def test_chunked_vec_with_non_divisor_sub_chunk_falls_back_to_the_full_pairwise_path(sub_chunk):
+    q, k, v, log_gate, beta, state = _random_delta_inputs(360, 2, 150)
+    args = (state, q, k, v, log_gate, beta)
+    out_ref, state_ref = kda.kda_chunked_steps_vec(*args, chunk_size=64, vec_chunks=2)
+    out, state_out = kda.kda_chunked_steps_vec(*args, chunk_size=64, vec_chunks=2, sub_chunk=sub_chunk)
+    assert torch.equal(out, out_ref) and torch.equal(state_out, state_ref)
+
+
+@pytest.mark.parametrize("chunk,sub_chunk", [(64, 16), (32, 8)])
+def test_blocked_pairwise_terms_are_zero_above_the_diagonal_blocks(chunk, sub_chunk):
+    cum, k, q = _pairwise_inputs(370, 3, chunk, 32, 5.0)
+    blocks = torch.ones(chunk // sub_chunk, chunk // sub_chunk).tril().repeat_interleave(sub_chunk, 0)
+    keep = blocks.repeat_interleave(sub_chunk, 1)
+    for x in kda._pairwise_terms_blocked(cum, k, q, sub_chunk):
+        assert x.shape == (3, chunk, chunk)
+        assert torch.equal(x * (1 - keep), torch.zeros_like(x))
+
+
+def test_blocked_pairwise_terms_compile_fullgraph_dynamic_once_for_any_batch():
+    import torch._dynamo as dynamo
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    counter = CompileCounterWithBackend("aot_eager")
+    dynamo.reset()
+    try:
+        fn = torch.compile(lambda c, k, q: kda._pairwise_terms_blocked(c, k, q, 16),
+                           backend=counter,
+                           fullgraph=True,
+                           dynamic=True)
+        for batch in (2, 3, 7, 12):
+            cum, k, q = _pairwise_inputs(380 + batch, batch, 64, 32, 5.0)
+            got = fn(cum, k, q)
+            ref = kda._pairwise_terms_blocked(cum, k, q, 16)
+            for x, y in zip(got, ref):
+                torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-6)
+    finally:
+        dynamo.reset()
+    assert counter.frame_count == 1
+
+
+def test_chunked_vec_with_sub_chunk_compiles_fullgraph_dynamic_over_lengths():
+    import torch._dynamo as dynamo
+
+    dynamo.reset()
+    try:
+        fn = torch.compile(lambda *a: kda.kda_chunked_steps_vec(*a, chunk_size=64, vec_chunks=2, sub_chunk=16),
+                           backend="aot_eager",
+                           fullgraph=True,
+                           dynamic=True)
+        for length in (70, 130, 333):
+            q, k, v, log_gate, beta, state0 = _random_delta_inputs(390 + length, 2, length)
+            args = (state0, q, k, v, log_gate, beta)
+            out, state = fn(*args)
+            out_ref, state_ref = kda.kda_chunked_steps_vec(*args, chunk_size=64, vec_chunks=2)
+            torch.testing.assert_close(out, out_ref, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(state, state_ref, rtol=1e-5, atol=1e-5)
+    finally:
+        dynamo.reset()

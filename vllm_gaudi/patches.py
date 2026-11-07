@@ -1555,15 +1555,27 @@ def _patch_kimi_k3_arch() -> None:
         # out-of-place attn_res: in-place updates do not survive per-layer graph boundaries in torch.compile mode
         from vllm_gaudi.extension.logger import logger as _ext_logger
         import vllm_gaudi.envs as gaudi_envs
-        from vllm_gaudi.ops.hpu_kda_pytorch import KIMI_DECODER_LAYER_CLASSES, install_functional_attn_res
+        from vllm_gaudi.ops.hpu_kda_pytorch import (KIMI_DECODER_LAYER_CLASSES, effective_intra_sub_chunk,
+                                                    install_functional_attn_res, parse_intra_sub_chunk,
+                                                    parse_prefill_settings)
         if install_functional_attn_res(_amd_linear, cache_bank_norm=gaudi_envs.HPU_KIMI_ATTN_RES_RSTD_CACHE) is None:
             _ext_logger().warning(
                 "Kimi-K3: none of %s with forward_attn_residual in %s, the in-place upstream "
                 "attn_res stays active", KIMI_DECODER_LAYER_CLASSES, _amd_linear.__name__)
         else:
             _kimi_patch_installed("functional_attn_res")
-        _ext_logger().info("Kimi-K3 KDA prefill: chunk %s, intra sub-chunk %s", gaudi_envs.HPU_KIMI_KDA_PREFILL_CHUNK,
-                           gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK)
+        try:
+            kda_chunk, kda_vec = parse_prefill_settings(gaudi_envs.HPU_KIMI_KDA_PREFILL_CHUNK)
+            kda_sub = parse_intra_sub_chunk(gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK)
+        except ValueError as e:
+            _ext_logger().warning("Kimi-K3 KDA prefill settings: %s", e)
+        else:
+            kda_sub_eff = effective_intra_sub_chunk(kda_chunk, kda_sub)
+            if kda_sub != kda_sub_eff:
+                _ext_logger().warning(
+                    "HPU_KIMI_KDA_INTRA_SUB_CHUNK=%d ignored: it must divide the KDA prefill chunk %d into "
+                    "at least two blocks; using the full pairwise path", kda_sub, kda_chunk)
+            _ext_logger().info("Kimi-K3 KDA prefill: chunk %d,%d, intra sub-chunk %d", kda_chunk, kda_vec, kda_sub_eff)
 
         # Monkey-patch KimiMoE.forward to ensure inputs are safely 2D
         orig_moe_forward = getattr(_amd_linear.KimiMoE, "forward", None)

@@ -12,7 +12,8 @@ read from and written to a single slot per request.
 
 import torch
 
-from vllm_gaudi.ops.hpu_kda_pytorch import (gated_rmsnorm_sigmoid, kda_decode_step, kda_prefill_step,
+from vllm_gaudi.ops.hpu_kda_pytorch import (effective_intra_sub_chunk, gated_rmsnorm_sigmoid, kda_decode_step,
+                                            kda_prefill_step, parse_intra_sub_chunk, parse_prefill_settings,
                                             write_kda_decode_state)
 
 
@@ -81,18 +82,6 @@ def run_with_deferred_kda_state(model, forward, *args, **kwargs):
     return out
 
 
-def parse_prefill_settings(value: str) -> tuple[int, int]:
-    """Parse HPU_KIMI_KDA_PREFILL_CHUNK ``"<chunk_size>,<vec_chunks>"``."""
-    parts = [p.strip() for p in value.split(",")]
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
-        raise ValueError(f"HPU_KIMI_KDA_PREFILL_CHUNK must be '<chunk_size>,<vec_chunks>', got {value!r}")
-    chunk_size, vec_chunks = int(parts[0]), int(parts[1])
-    if chunk_size <= 0 or (chunk_size > 16 and chunk_size % 16 != 0):
-        raise ValueError(f"HPU_KIMI_KDA_PREFILL_CHUNK chunk_size must be positive and, above 16, a multiple of 16, "
-                         f"got {chunk_size}")
-    return chunk_size, vec_chunks
-
-
 # Chunk length of the chunk-parallel KDA prefill and the number of chunks whose intra-chunk terms are computed
 # together. assume_constant_result makes dynamo treat the result as a constant without a graph break.
 @torch.compiler.assume_constant_result
@@ -101,18 +90,11 @@ def _prefill_settings() -> tuple[int, int]:
     return parse_prefill_settings(gaudi_envs.HPU_KIMI_KDA_PREFILL_CHUNK)
 
 
-def parse_intra_sub_chunk(value: str) -> int:
-    """Parse HPU_KIMI_KDA_INTRA_SUB_CHUNK (0 = off)."""
-    value = value.strip()
-    if not value.isdigit():
-        raise ValueError(f"HPU_KIMI_KDA_INTRA_SUB_CHUNK must be a non-negative integer, got {value!r}")
-    return int(value)
-
-
 @torch.compiler.assume_constant_result
 def _intra_sub_chunk() -> int:
     from vllm_gaudi import envs as gaudi_envs
-    return parse_intra_sub_chunk(gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK)
+    return effective_intra_sub_chunk(_prefill_settings()[0],
+                                     parse_intra_sub_chunk(gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK))
 
 
 def _state_indices(self, attn_metadata) -> torch.Tensor:

@@ -266,6 +266,33 @@ def kda_chunked_steps(state: torch.Tensor,
     return out[:, :seq_len], state
 
 
+def parse_prefill_settings(value: str) -> tuple[int, int]:
+    """Parse HPU_KIMI_KDA_PREFILL_CHUNK ``"<chunk_size>,<vec_chunks>"``."""
+    parts = [p.strip() for p in value.split(",")]
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ValueError(f"HPU_KIMI_KDA_PREFILL_CHUNK must be '<chunk_size>,<vec_chunks>', got {value!r}")
+    chunk_size, vec_chunks = int(parts[0]), int(parts[1])
+    if chunk_size <= 0 or (chunk_size > 16 and chunk_size % 16 != 0):
+        raise ValueError(f"HPU_KIMI_KDA_PREFILL_CHUNK chunk_size must be positive and, above 16, a multiple of 16, "
+                         f"got {chunk_size}")
+    return chunk_size, vec_chunks
+
+
+def parse_intra_sub_chunk(value: str) -> int:
+    """Parse HPU_KIMI_KDA_INTRA_SUB_CHUNK (empty or 0 = off)."""
+    value = value.strip()
+    if not value:
+        return 0
+    if not value.isdigit():
+        raise ValueError(f"HPU_KIMI_KDA_INTRA_SUB_CHUNK must be a non-negative integer, got {value!r}")
+    return int(value)
+
+
+def effective_intra_sub_chunk(chunk_size: int, sub_chunk: int) -> int:
+    """``sub_chunk`` if it splits ``chunk_size`` into at least two equal blocks, else 0 (full pairwise path)."""
+    return sub_chunk if 0 < sub_chunk < chunk_size and chunk_size % sub_chunk == 0 else 0
+
+
 def _pairwise_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor):
     """Raw A and Aqk ``sum_k x_i k_j exp(G_i - G_j)`` of [N,C,K] inputs from the full [N,C,C,K] pairwise decay."""
     # exp(G_i - G_j) for j <= i; the clamp keeps the masked-out upper triangle finite (0 * inf would be NaN)
@@ -282,29 +309,29 @@ def _pairwise_terms_blocked(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tenso
 
     Diagonal blocks use the pairwise form. Block (I, J), J < I, factors through r_J = G at the last row of J:
     ``exp(G_i - G_j) = exp(G_i - r_J) exp(r_J - G_j)``, both exponents <= 0 since G is non-increasing.
+    Blocks J > I are zero.
     """
     batch, chunk, kdim = cum.shape
     m = chunk // sub_chunk
-    a_diag, aqk_diag = _pairwise_terms(*(x.reshape(batch * m, sub_chunk, kdim) for x in (cum, kc, qc)))
-    cum_b, kc_b, qc_b = (x.reshape(batch, m, sub_chunk, kdim) for x in (cum, kc, qc))
-    ref = cum_b[:, :, -1:, :]  # r_J, [N,M,1,K]
-    right = (kc_b * torch.exp(ref - cum_b)).transpose(-1, -2)  # [N,M(J),K,S]
-    right = right.unsqueeze(1).expand(batch, m, m, kdim, sub_chunk).reshape(batch, m * m, kdim, sub_chunk)
-    # clamped: blocks with J >= I are masked out later
-    left_decay = torch.exp(torch.clamp(cum_b.unsqueeze(2) - ref.unsqueeze(1), max=0.0))  # [N,M(I),M(J),S,K]
-
-    def assemble(x, diag):  # off-diagonal [N,M*M,S,S] and diagonal [N*M,S,S] blocks -> [N,C,C]
-        x = x.reshape(batch, m, m, sub_chunk, sub_chunk) * off_mask + diag.reshape(batch, m, 1, sub_chunk,
-                                                                                   sub_chunk) * eye
-        return x.permute(0, 1, 3, 2, 4).reshape(batch, chunk, chunk)
-
-    eye = torch.eye(m, dtype=cum.dtype, device=cum.device).reshape(m, m, 1, 1)
-    off_mask = torch.tril(torch.ones(m, m, dtype=cum.dtype, device=cum.device), -1).reshape(m, m, 1, 1)
-    out = []
-    for x_b, diag in ((kc_b, a_diag), (qc_b, aqk_diag)):
-        left = (x_b.unsqueeze(2) * left_decay).reshape(batch, m * m, sub_chunk, kdim)
-        out.append(assemble(torch.matmul(left, right), diag))
-    return out[0], out[1]
+    diags = _pairwise_terms(*(x.reshape(batch * m, sub_chunk, kdim) for x in (cum, kc, qc)))
+    diags = tuple(x.reshape(batch, chunk, sub_chunk) for x in diags)  # rows of block J: J*S:(J+1)*S
+    cum_b = cum.reshape(batch, m, sub_chunk, kdim)
+    right = (kc.reshape(batch, m, sub_chunk, kdim) * torch.exp(cum_b[:, :, -1:, :] - cum_b)).reshape(batch, chunk, kdim)
+    cols = ([], [])
+    for j in range(m):
+        lo, hi = j * sub_chunk, (j + 1) * sub_chunk
+        below = []
+        if hi < chunk:
+            left_decay = torch.exp(torch.clamp(cum[:, hi:] - cum[:, hi - 1:hi], max=0.0))  # [N,C-hi,K]
+            right_t = right[:, lo:hi].transpose(-1, -2)  # [N,K,S]
+            below = [torch.matmul(x[:, hi:] * left_decay, right_t) for x in (kc, qc)]
+        for i, (col, diag) in enumerate(zip(cols, diags)):
+            parts = [cum.new_zeros(batch, lo, sub_chunk)] if lo else []
+            parts.append(diag[:, lo:hi])
+            if below:
+                parts.append(below[i])
+            col.append(torch.cat(parts, dim=1))
+    return torch.cat(cols[0], dim=2), torch.cat(cols[1], dim=2)
 
 
 def _intra_chunk_terms(cum: torch.Tensor,
@@ -332,7 +359,7 @@ def _intra_chunk_terms(cum: torch.Tensor,
 
     cum, kc, qc, vc, bc, k_gamma, q_gamma = (fold(x) for x in (cum, kc, qc, vc, bc, k_gamma, q_gamma))
     chunk = strict.shape[-1]
-    if 0 < sub_chunk < chunk and chunk % sub_chunk == 0:
+    if effective_intra_sub_chunk(chunk, sub_chunk):
         a_raw, aqk_raw = _pairwise_terms_blocked(cum, kc, qc, sub_chunk)
     else:
         a_raw, aqk_raw = _pairwise_terms(cum, kc, qc)
