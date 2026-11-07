@@ -1232,6 +1232,8 @@ def _kimi_k3_runner_class(base: type) -> type:
         try:
             return base.__getattr__(self, name)  # type: ignore[attr-defined]
         except AttributeError:
+            if name == "quant_method":
+                raise  # loaders would process the runner as if it owned the expert weights
             # __dict__ lookup avoids recursion while the runner is built
             routed = self.__dict__.get("_modules", {}).get("routed_experts", self.__dict__.get("routed_experts"))
             if routed is not None and hasattr(routed, name):

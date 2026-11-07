@@ -235,8 +235,13 @@ class HPUKimiK3Mxfp4MoEMethod(Mxfp4MoEMethod):
         )
 
     def process_weights_after_loading(self, layer) -> None:
+        # only the module that owns the expert weights, once
+        params = vars(layer).get("_parameters")
+        if (params is not None and "w13_weight" not in params) or vars(layer).get("_hpu_kimi_weights_processed"):
+            return
         if not self._maybe_convert_to_fp8(layer):
             HPUGptOssMxfp4MoEMethod.process_weights_after_loading(self, layer)
+        layer._hpu_kimi_weights_processed = True
         self.moe_quant_config = object()
 
     def _maybe_convert_to_fp8(self, layer) -> bool:

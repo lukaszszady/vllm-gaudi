@@ -316,6 +316,7 @@ def _original_make(mxfp4):
 
 
 def _fp8_setup(mxfp4, monkeypatch, spec):
+    monkeypatch.delitem(sys.modules, "vllm_gaudi.ops.hpu_situ_moe")  # the converter needs the real LUTs
     fp8 = pytest.importorskip("vllm_gaudi.ops.hpu_mxfp4_fp8")
     monkeypatch.setitem(sys.modules, "vllm_gaudi.ops.hpu_mxfp4_fp8", fp8)
     created = []
@@ -398,3 +399,83 @@ def test_fp8_layers_are_skipped_for_the_exact_situ_path(mxfp4, monkeypatch):
     method.process_weights_after_loading(layer)
 
     assert not created and layer.moe_op is mxfp4_created[0]
+
+
+def _routed_experts_module(method, layer_name="language_model.model.layers.2.mlp.experts"):
+    """A RoutedExperts-like module: the expert weights are registered parameters and it owns the quant method."""
+    import torch
+    routed = torch.nn.Module()
+    for key, value in vars(_mxfp4_layer()).items():
+        setattr(routed, key, value)
+    routed.layer_name = layer_name
+    routed.quant_method = method
+    return routed
+
+
+def _delegating_runner(routed):
+    """A MoE runner whose missing attributes, quant_method included, come from routed_experts."""
+    import torch
+
+    class Runner(torch.nn.Module):
+
+        def __getattr__(self, name):
+            try:
+                return torch.nn.Module.__getattr__(self, name)
+            except AttributeError:
+                return getattr(self.__dict__["_modules"]["routed_experts"], name)
+
+    runner = Runner()
+    runner.routed_experts = routed
+    return runner
+
+
+def _process_like_the_loader(model):
+    # vllm model_loader/utils.py process_weights_after_loading and ops/hpu_weights.py
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            quant_method.process_weights_after_loading(module)
+
+
+def test_fp8_conversion_skips_a_runner_that_only_delegates_to_the_routed_experts(mxfp4, monkeypatch):
+    import torch
+    created, mxfp4_created = _fp8_setup(mxfp4, monkeypatch, "2")
+    routed = _routed_experts_module(mxfp4.HPUKimiK3Mxfp4MoEMethod(_moe()))
+    model = torch.nn.Module()
+    model.experts = _delegating_runner(routed)
+
+    _process_like_the_loader(model)  # the runner comes first in named_modules()
+
+    (op, ) = created
+    assert routed.moe_op is op and not mxfp4_created
+    assert routed.w13_weight.dtype == torch.float8_e4m3fn and routed.w2_weight.dtype == torch.float8_e4m3fn
+    assert not model.experts._parameters and "moe_op" not in model.experts._modules
+    expected = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+    assert [name for name, _ in model.named_parameters()] == ["experts.routed_experts." + n for n in expected]
+
+
+def test_fp8_conversion_releases_the_mxfp4_parameters(mxfp4, monkeypatch):
+    import gc
+    import weakref
+    _fp8_setup(mxfp4, monkeypatch, "2")
+    routed = _routed_experts_module(mxfp4.HPUKimiK3Mxfp4MoEMethod(_moe()))
+    old = [weakref.ref(getattr(routed, n)) for n in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")]
+
+    routed.quant_method.process_weights_after_loading(routed)
+    gc.collect()
+
+    assert all(ref() is None for ref in old)
+
+
+@pytest.mark.parametrize("spec", ["2", ""])
+def test_process_weights_after_loading_twice_is_a_no_op(mxfp4, monkeypatch, spec):
+    created, mxfp4_created = _fp8_setup(mxfp4, monkeypatch, spec)
+    routed = _routed_experts_module(mxfp4.HPUKimiK3Mxfp4MoEMethod(_moe()))
+
+    routed.quant_method.process_weights_after_loading(routed)
+    op, params = routed.moe_op, dict(routed.named_parameters())
+    routed.quant_method.process_weights_after_loading(routed)
+
+    assert len(created) + len(mxfp4_created) == 1
+    assert routed.moe_op is op
+    assert all(p is params[n] for n, p in routed.named_parameters())

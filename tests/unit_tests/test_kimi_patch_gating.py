@@ -153,6 +153,19 @@ def test_k3_runner_is_not_swapped_twice(patches):
     assert not any(c.__dict__.get("_hpu_kimi_k3_runner") for c in k3_cls.__mro__[1:])
 
 
+def test_k3_runner_does_not_expose_the_quant_method_of_its_routed_experts(patches):
+    runner = _build(patches, 0, ["KimiK3ForConditionalGeneration"])
+    runner.routed_experts.quant_method = object()
+    model = torch.nn.Module()
+    model.experts = runner
+
+    # the weight loaders run process_weights_after_loading on every module that has a quant_method
+    owners = [name for name, module in model.named_modules() if getattr(module, "quant_method", None) is not None]
+
+    assert owners == ["experts.routed_experts"]
+    assert runner.w13_weight_packed is runner.routed_experts.w13_weight_packed
+
+
 def test_patching_twice_wraps_init_once(patches):
     base = patches.test_classes[0]
     init = base.__init__
