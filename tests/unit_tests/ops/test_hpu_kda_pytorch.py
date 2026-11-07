@@ -1326,7 +1326,8 @@ def _max_tensor_rank(fn):
 
 @pytest.mark.parametrize("lengths,padded,chunk,vec_chunks", [([70, 41], 96, 32, 2), ([37], 37, 16, 0),
                                                              ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
-def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, chunk, vec_chunks):
+@pytest.mark.parametrize("sub_chunk", [0, 8])
+def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, chunk, vec_chunks, sub_chunk):
     """The HPU compiler fails with 'strided_view ... Invalid argument' on the rank 6/7 views of the batched
     intra-chunk terms, so no op of the chunked_vec prefill may see a tensor with more than 5 dims."""
     params = _make_params(140)
@@ -1336,13 +1337,15 @@ def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, ch
     n = len(lengths)
     args = (batch["mixed_qkv"], batch["raw_g"], batch["raw_beta"], params["conv_weight"], None, params["A_log"],
             params["dt_bias"], params["lower_bound"], *caches, torch.arange(n), torch.tensor([1, 0, 1][:n]), mask, H, D)
-    rank, op = _max_tensor_rank(lambda: kda.kda_prefill_step(*args, chunk_size=chunk, vec_chunks=vec_chunks))
+    rank, op = _max_tensor_rank(
+        lambda: kda.kda_prefill_step(*args, chunk_size=chunk, vec_chunks=vec_chunks, sub_chunk=sub_chunk))
     assert rank <= 5, (rank, op)
 
 
 @pytest.mark.parametrize("lengths,padded,chunk,vec_chunks", [([70, 41], 96, 32, 2), ([37], 37, 16, 0),
                                                              ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
-def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chunk, vec_chunks):
+@pytest.mark.parametrize("sub_chunk", [0, 8])
+def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chunk, vec_chunks, sub_chunk):
     """Fallback for the HPU 'strided_view' failure: no diagonal / as_strided, and no select or stepped slice on a
     non-leading dim (the views the Synapse graph compiler cannot lower) in the chunked_vec prefill."""
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -1367,7 +1370,7 @@ def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chun
     args = (batch["mixed_qkv"], batch["raw_g"], batch["raw_beta"], params["conv_weight"], None, params["A_log"],
             params["dt_bias"], params["lower_bound"], *caches, torch.arange(n), torch.tensor([1, 0, 1][:n]), mask, H, D)
     with _Views():
-        kda.kda_prefill_step(*args, chunk_size=chunk, vec_chunks=vec_chunks)
+        kda.kda_prefill_step(*args, chunk_size=chunk, vec_chunks=vec_chunks, sub_chunk=sub_chunk)
     assert not bad, bad[:5]
 
 
@@ -2191,3 +2194,156 @@ def test_installed_layers_with_cached_bank_norm_compile_per_layer_without_extra_
         assert (count, reasons) == breaks_and_mutations(False, idx)[:2]
         assert all("_run_self_attn" in r or "disable" in r for r in reasons), reasons
         assert mutated == []
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Blockwise intra-chunk A / Aqk (HPU_KIMI_KDA_INTRA_SUB_CHUNK)
+# ---------------------------------------------------------------------------------------------------------------
+def _pairwise_inputs(seed, batch, chunk, dim, gate_scale):
+    g = torch.Generator().manual_seed(seed)
+    k = kda.l2norm(torch.randn(batch, chunk, dim, generator=g))
+    q = kda.l2norm(torch.randn(batch, chunk, dim, generator=g)) * dim**-0.5
+    cum = torch.cumsum(-gate_scale * torch.sigmoid(torch.randn(batch, chunk, dim, generator=g)), dim=1)
+    return cum, k, q
+
+
+@pytest.mark.parametrize("chunk,sub_chunk", [(64, 16), (64, 32), (64, 8), (32, 16), (16, 8)])
+@pytest.mark.parametrize("gate_scale", [0.05, 5.0, 80.0])
+def test_blocked_pairwise_terms_match_full_pairwise_decay(chunk, sub_chunk, gate_scale):
+    cum, k, q = _pairwise_inputs(300 + chunk + sub_chunk, 6, chunk, 128, gate_scale)
+    strict = torch.tril(torch.ones(chunk, chunk), -1)
+    lower = torch.tril(torch.ones(chunk, chunk))
+    a_ref, aqk_ref = kda._pairwise_terms(cum, k, q)
+    a_blk, aqk_blk = kda._pairwise_terms_blocked(cum, k, q, sub_chunk)
+    assert torch.isfinite(a_blk).all() and torch.isfinite(aqk_blk).all()
+    torch.testing.assert_close(a_blk * strict, a_ref * strict, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(aqk_blk * lower, aqk_ref * lower, rtol=1e-4, atol=1e-4)
+    # against float64: the blocked error stays at the fp32 rounding level of the full pairwise form
+    a64, aqk64 = kda._pairwise_terms(cum.double(), k.double(), q.double())
+    for blk, ref, exact, mask in ((a_blk, a_ref, a64, strict), (aqk_blk, aqk_ref, aqk64, lower)):
+        err_blk = ((blk.double() - exact) * mask).abs().max().item()
+        err_ref = ((ref.double() - exact) * mask).abs().max().item()
+        assert err_blk <= 4 * err_ref + 1e-6, (err_blk, err_ref)
+
+
+def test_blocked_pairwise_terms_match_float64_reference_under_strong_decay():
+    """Gates down to -200 per step: the factors exp(G_i - r_J) and exp(r_J - G_j) underflow, the exact value is
+    smaller still, so nothing overflows and the error stays at fp32 rounding."""
+    cum, k, q = _pairwise_inputs(320, 4, 64, 128, 200.0)
+    lower = torch.tril(torch.ones(64, 64, dtype=torch.float64))
+    decay = torch.exp(torch.clamp(cum.double().unsqueeze(-2) - cum.double().unsqueeze(-3), max=0.0))
+    ref = (decay * k.double().unsqueeze(-3) * q.double().unsqueeze(-2)).sum(-1) * lower
+    _, aqk = kda._pairwise_terms_blocked(cum, k, q, 16)
+    assert torch.isfinite(aqk).all()
+    torch.testing.assert_close(aqk.double() * lower, ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("length,chunk,vec_chunks,sub_chunk", [(1, 8, 16, 4), (13, 8, 0, 4), (100, 32, 2, 16),
+                                                               (300, 16, 3, 8), (1030, 64, 16, 16), (1030, 64, 0, 32),
+                                                               (77, 8, 2, 16)])
+def test_chunked_vec_with_sub_chunk_matches_dense_and_loop(length, chunk, vec_chunks, sub_chunk):
+    q, k, v, log_gate, beta, state = _random_delta_inputs(330 + length, 2, length)
+    out_loop, state_loop = kda.kda_recurrent_steps(state, q, k, v, torch.exp(log_gate), beta)
+    args = (state, q, k, v, log_gate, beta)
+    out_ref, state_ref = kda.kda_chunked_steps_vec(*args, chunk_size=chunk, vec_chunks=vec_chunks)
+    out_blk, state_blk = kda.kda_chunked_steps_vec(*args, chunk_size=chunk, vec_chunks=vec_chunks, sub_chunk=sub_chunk)
+    torch.testing.assert_close(out_blk, out_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(state_blk, state_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out_blk, out_loop, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state_blk, state_loop, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("gate_scale", [0.05, 60.0])
+def test_chunked_vec_with_sub_chunk_near_parallel_keys_beta_one(gate_scale):
+    q, k, v, log_gate, beta, state = _random_delta_inputs(340, 2, 333, dim=32, gate_scale=gate_scale)
+    k = kda.l2norm(k[:, :1].expand_as(k) + 0.01 * k)
+    beta = torch.full_like(beta, 0.999)
+    out_loop, state_loop = kda.kda_recurrent_steps(state, q, k, v, torch.exp(log_gate), beta)
+    out_ref, state_ref = kda.kda_chunked_steps_vec(state, q, k, v, log_gate, beta, chunk_size=64, vec_chunks=2)
+    out_blk, state_blk = kda.kda_chunked_steps_vec(state,
+                                                   q,
+                                                   k,
+                                                   v,
+                                                   log_gate,
+                                                   beta,
+                                                   chunk_size=64,
+                                                   vec_chunks=2,
+                                                   sub_chunk=16)
+    assert torch.isfinite(out_blk).all() and torch.isfinite(state_blk).all()
+    torch.testing.assert_close(out_blk, out_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state_blk, state_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(out_blk, out_loop, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(state_blk, state_loop, rtol=1e-3, atol=1e-3)
+
+
+def test_chunked_vec_with_sub_chunk_in_bf16_stays_close_to_fp32_loop():
+    q, k, v, log_gate, beta, state = _random_delta_inputs(341, 1, 200)
+    out_loop, state_loop = kda.kda_recurrent_steps(state, q, k, v, torch.exp(log_gate), beta)
+    bf = lambda x: x.to(torch.bfloat16)  # noqa: E731
+    out16, state16 = kda.kda_chunked_steps_vec(bf(state),
+                                               bf(q),
+                                               bf(k),
+                                               bf(v),
+                                               bf(log_gate),
+                                               bf(beta),
+                                               chunk_size=64,
+                                               sub_chunk=16)
+    assert out16.dtype == torch.bfloat16
+    torch.testing.assert_close(out16.float(), out_loop, rtol=0.1, atol=0.1)
+    torch.testing.assert_close(state16.float(), state_loop, rtol=0.1, atol=0.1)
+
+
+def test_blocked_pairwise_terms_shrink_the_largest_intermediate():
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+
+    def largest(fn):
+        sizes = []
+
+        class _Sizes(TorchDispatchMode):
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                sizes.extend(t.numel() for t in tree_leaves(out) if isinstance(t, torch.Tensor))
+                return out
+
+        with _Sizes():
+            fn()
+        return max(sizes)
+
+    cum, k, q = _pairwise_inputs(350, 4, 64, 128, 5.0)
+    full = largest(lambda: kda._pairwise_terms(cum, k, q))
+    blocked = largest(lambda: kda._pairwise_terms_blocked(cum, k, q, 16))
+    assert full == 4 * 64 * 64 * 128 and blocked <= full // 4, (full, blocked)
+
+
+@pytest.mark.parametrize("seq_len,vec_chunks,chunk,sub_chunk", [(150, 2, 16, 8), (160, 2, 16, 8), (150, 0, 16, 8),
+                                                                (37, 16, 64, 16)])
+def test_chunked_vec_with_sub_chunk_traced_sizes_are_plain_dynamic_dims(seq_len, vec_chunks, chunk, sub_chunk):
+    heads, dim = 2, 16
+
+    def fn(x, state):
+        q, k, v, g, b = (x.reshape(1, x.shape[1], 5, heads, dim)[:, :, i] for i in range(5))
+        return kda.kda_chunked_steps_vec(state, q, k, v, -g.abs() * 0.1, b[..., 0].sigmoid(), chunk, vec_chunks,
+                                         sub_chunk)
+
+    x = torch.randn(1, seq_len, 5 * heads * dim)
+    state = torch.zeros(1, heads, dim, dim)
+    assert _unsupported_size_exprs(fn, (x, state), 1) == []
+
+
+@pytest.mark.parametrize("value,expected", [(None, 0), ("16", 16), (" 32 ", 32), ("0", 0)])
+def test_intra_sub_chunk_comes_from_env(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("HPU_KIMI_KDA_INTRA_SUB_CHUNK", raising=False)
+    else:
+        monkeypatch.setenv("HPU_KIMI_KDA_INTRA_SUB_CHUNK", value)
+    module = _load_layer_module(monkeypatch, {"value": None})
+    assert module._intra_sub_chunk() == expected
+
+
+@pytest.mark.parametrize("value", ["-16", "a", "16,4", ""])
+def test_intra_sub_chunk_rejects_invalid_values(monkeypatch, value):
+    module = _load_layer_module(monkeypatch, {"value": None})
+    with pytest.raises(ValueError, match="HPU_KIMI_KDA_INTRA_SUB_CHUNK"):
+        module.parse_intra_sub_chunk(value)

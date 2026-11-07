@@ -266,13 +266,63 @@ def kda_chunked_steps(state: torch.Tensor,
     return out[:, :seq_len], state
 
 
-def _intra_chunk_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor, vc: torch.Tensor, bc: torch.Tensor,
-                       k_gamma: torch.Tensor, q_gamma: torch.Tensor, strict: torch.Tensor, lower: torch.Tensor):
+def _pairwise_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor):
+    """Raw A and Aqk ``sum_k x_i k_j exp(G_i - G_j)`` of [N,C,K] inputs from the full [N,C,C,K] pairwise decay."""
+    # exp(G_i - G_j) for j <= i; the clamp keeps the masked-out upper triangle finite (0 * inf would be NaN)
+    decay = torch.exp(torch.clamp(cum.unsqueeze(-2) - cum.unsqueeze(-3), max=0.0))  # [N,C(i),C(j),K]
+    k_decayed = decay * kc.unsqueeze(-3)  # k_j * exp(G_i - G_j)
+    # contract with k_i (A) and q_i (Aqk) over K; two matmuls instead of a stride-2 last-dim select of one
+    a_raw = torch.matmul(k_decayed, kc.unsqueeze(-1)).squeeze(-1)  # [N,C(i),C(j)]
+    aqk_raw = torch.matmul(k_decayed, qc.unsqueeze(-1)).squeeze(-1)
+    return a_raw, aqk_raw
+
+
+def _pairwise_terms_blocked(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor, sub_chunk: int):
+    """``_pairwise_terms`` with the chunk split into M sub-chunks of ``sub_chunk`` rows.
+
+    Diagonal blocks use the pairwise form. Block (I, J), J < I, factors through r_J = G at the last row of J:
+    ``exp(G_i - G_j) = exp(G_i - r_J) exp(r_J - G_j)``, both exponents <= 0 since G is non-increasing.
+    """
+    batch, chunk, kdim = cum.shape
+    m = chunk // sub_chunk
+    a_diag, aqk_diag = _pairwise_terms(*(x.reshape(batch * m, sub_chunk, kdim) for x in (cum, kc, qc)))
+    cum_b, kc_b, qc_b = (x.reshape(batch, m, sub_chunk, kdim) for x in (cum, kc, qc))
+    ref = cum_b[:, :, -1:, :]  # r_J, [N,M,1,K]
+    right = (kc_b * torch.exp(ref - cum_b)).transpose(-1, -2)  # [N,M(J),K,S]
+    right = right.unsqueeze(1).expand(batch, m, m, kdim, sub_chunk).reshape(batch, m * m, kdim, sub_chunk)
+    # clamped: blocks with J >= I are masked out later
+    left_decay = torch.exp(torch.clamp(cum_b.unsqueeze(2) - ref.unsqueeze(1), max=0.0))  # [N,M(I),M(J),S,K]
+
+    def assemble(x, diag):  # off-diagonal [N,M*M,S,S] and diagonal [N*M,S,S] blocks -> [N,C,C]
+        x = x.reshape(batch, m, m, sub_chunk, sub_chunk) * off_mask + diag.reshape(batch, m, 1, sub_chunk,
+                                                                                   sub_chunk) * eye
+        return x.permute(0, 1, 3, 2, 4).reshape(batch, chunk, chunk)
+
+    eye = torch.eye(m, dtype=cum.dtype, device=cum.device).reshape(m, m, 1, 1)
+    off_mask = torch.tril(torch.ones(m, m, dtype=cum.dtype, device=cum.device), -1).reshape(m, m, 1, 1)
+    out = []
+    for x_b, diag in ((kc_b, a_diag), (qc_b, aqk_diag)):
+        left = (x_b.unsqueeze(2) * left_decay).reshape(batch, m * m, sub_chunk, kdim)
+        out.append(assemble(torch.matmul(left, right), diag))
+    return out[0], out[1]
+
+
+def _intra_chunk_terms(cum: torch.Tensor,
+                       kc: torch.Tensor,
+                       qc: torch.Tensor,
+                       vc: torch.Tensor,
+                       bc: torch.Tensor,
+                       k_gamma: torch.Tensor,
+                       q_gamma: torch.Tensor,
+                       strict: torch.Tensor,
+                       lower: torch.Tensor,
+                       sub_chunk: int = 0):
     """State-independent terms of a group of chunks (all inputs [B,H,G,C,*], bc [B,H,G,C,1]).
 
     With U = Uv - Wk S_0^T the pseudo values of ``kda_chunked_steps``, returns ``(uv, wk, q_eff, o_intra)`` with
     ``Uv = (I + A)^-1 (beta V)``, ``Wk = (I + A)^-1 (beta K exp(G))``, so that the chunk output is
-    ``O = q_eff S_0^T + o_intra`` (``q_eff = Q exp(G) - Aqk Wk``, ``o_intra = Aqk Uv``).
+    ``O = q_eff S_0^T + o_intra`` (``q_eff = Q exp(G) - Aqk Wk``, ``o_intra = Aqk Uv``). A ``sub_chunk`` that
+    divides the chunk into at least two blocks selects ``_pairwise_terms_blocked``.
     """
     # fold B, H and the chunk group into one batch dim: the HPU compiler rejects rank 6/7 views
     lead = cum.shape[:3]
@@ -281,12 +331,11 @@ def _intra_chunk_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor, vc
         return x.reshape(lead[0] * lead[1] * lead[2], *x.shape[3:])
 
     cum, kc, qc, vc, bc, k_gamma, q_gamma = (fold(x) for x in (cum, kc, qc, vc, bc, k_gamma, q_gamma))
-    # exp(G_i - G_j) for j <= i; the clamp keeps the masked-out upper triangle finite (0 * inf would be NaN)
-    decay = torch.exp(torch.clamp(cum.unsqueeze(-2) - cum.unsqueeze(-3), max=0.0))  # [N,C(i),C(j),K]
-    k_decayed = decay * kc.unsqueeze(-3)  # k_j * exp(G_i - G_j)
-    # contract with k_i (A) and q_i (Aqk) over K; two matmuls instead of a stride-2 last-dim select of one
-    a_raw = torch.matmul(k_decayed, kc.unsqueeze(-1)).squeeze(-1)  # [N,C(i),C(j)]
-    aqk_raw = torch.matmul(k_decayed, qc.unsqueeze(-1)).squeeze(-1)
+    chunk = strict.shape[-1]
+    if 0 < sub_chunk < chunk and chunk % sub_chunk == 0:
+        a_raw, aqk_raw = _pairwise_terms_blocked(cum, kc, qc, sub_chunk)
+    else:
+        a_raw, aqk_raw = _pairwise_terms(cum, kc, qc)
     a_mat = a_raw * strict * bc  # beta_i on the row
     aqk = aqk_raw * lower
     inv = _unit_lower_inverse_dense(a_mat)
@@ -304,7 +353,8 @@ def kda_chunked_steps_vec(state: torch.Tensor,
                           g: torch.Tensor,
                           beta: torch.Tensor,
                           chunk_size: int = 64,
-                          vec_chunks: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
+                          vec_chunks: int = 16,
+                          sub_chunk: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     """``kda_chunked_steps`` with everything that does not depend on the state batched over the chunks.
 
     Same arguments and result. The pairwise decay, A, Aqk, the exact (I + A)^-1 and the terms derived from it
@@ -315,6 +365,7 @@ def kda_chunked_steps_vec(state: torch.Tensor,
         U   = Uv - Wk s                  s <- s * exp(G_C)^T + (K exp(G_C - G))^T U
 
     and the outputs of all chunks come from the stacked chunk-initial states in one matmul at the end.
+    ``sub_chunk`` > 0 computes A and Aqk blockwise (see ``_intra_chunk_terms``).
     """
     if chunk_size <= 0 or (chunk_size > 16 and chunk_size % 16 != 0):
         raise ValueError(f"chunk_size must be positive and, above 16, a multiple of 16, got {chunk_size}")
@@ -349,7 +400,7 @@ def kda_chunked_steps_vec(state: torch.Tensor,
         sl = slice(start, start + group)
         terms.append(
             _intra_chunk_terms(cum[:, :, sl], kc[:, :, sl], qc[:, :, sl], vc[:, :, sl], bc[:, :, sl], k_gamma[:, :, sl],
-                               q_gamma[:, :, sl], strict, lower))
+                               q_gamma[:, :, sl], strict, lower, sub_chunk))
     uv, wk, q_eff, o_intra = (torch.cat(parts, dim=2) if len(parts) > 1 else parts[0] for parts in zip(*terms))
 
     s_t = state.transpose(-1, -2)  # [B,H,K,V]
@@ -408,14 +459,15 @@ def kda_prefill_step(mixed_qkv: torch.Tensor,
                      num_heads: int,
                      head_dim: int,
                      chunk_size: int = 64,
-                     vec_chunks: int = 16):
+                     vec_chunks: int = 16,
+                     sub_chunk: int = 0):
     """Out-of-place prefill: only READS the caches, returns ``(o, slots, conv_rows, ssm_rows)`` like
     ``kda_decode_step`` (store the rows with ``write_kda_decode_state``), so it is traceable by torch.compile.
 
     mixed_qkv [B,L,3P] (pre-conv), raw_g [B,L,P], raw_beta [B,L,H], token_mask [B,L] (1 = real token, padding at
     the end of each sequence) or None, state_idx [B] (-1 = padded row), has_initial_state [B] or None.
-    o is [B,L,H,V] (fp32). The delta rule is ``kda_chunked_steps_vec`` with the given ``chunk_size`` and
-    ``vec_chunks``.
+    o is [B,L,H,V] (fp32). The delta rule is ``kda_chunked_steps_vec`` with the given ``chunk_size``,
+    ``vec_chunks`` and ``sub_chunk``.
     """
     bsz, seq_len, channels = mixed_qkv.shape
     width = conv_weight.shape[-1]
@@ -454,7 +506,15 @@ def kda_prefill_step(mixed_qkv: torch.Tensor,
     q, k, v, g, beta = _prepare_qkv_gates(conv_out, raw_g, raw_beta, A_log, dt_bias, lower_bound, num_heads, head_dim,
                                           token_mask)
     state = read_ssm_state(ssm_cache, slots) * use_init.reshape(bsz, 1, 1, 1)
-    out, state = kda_chunked_steps_vec(state, q, k, v, g, beta, chunk_size=chunk_size, vec_chunks=vec_chunks)
+    out, state = kda_chunked_steps_vec(state,
+                                       q,
+                                       k,
+                                       v,
+                                       g,
+                                       beta,
+                                       chunk_size=chunk_size,
+                                       vec_chunks=vec_chunks,
+                                       sub_chunk=sub_chunk)
     ssm_rows = state.to(dtype=ssm_cache.dtype).contiguous()
     return out, slots, conv_rows, ssm_rows
 

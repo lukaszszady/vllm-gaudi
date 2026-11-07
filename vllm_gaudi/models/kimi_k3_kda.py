@@ -101,6 +101,20 @@ def _prefill_settings() -> tuple[int, int]:
     return parse_prefill_settings(gaudi_envs.HPU_KIMI_KDA_PREFILL_CHUNK)
 
 
+def parse_intra_sub_chunk(value: str) -> int:
+    """Parse HPU_KIMI_KDA_INTRA_SUB_CHUNK (0 = off)."""
+    value = value.strip()
+    if not value.isdigit():
+        raise ValueError(f"HPU_KIMI_KDA_INTRA_SUB_CHUNK must be a non-negative integer, got {value!r}")
+    return int(value)
+
+
+@torch.compiler.assume_constant_result
+def _intra_sub_chunk() -> int:
+    from vllm_gaudi import envs as gaudi_envs
+    return parse_intra_sub_chunk(gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK)
+
+
 def _state_indices(self, attn_metadata) -> torch.Tensor:
     indices = attn_metadata.load_indices_tensor
     if indices is not None and indices.dim() > 1:
@@ -168,6 +182,7 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                 if mask is not None:
                     mask = mask.reshape(num_seqs, seq_len)
                 chunk_size, vec_chunks = _prefill_settings()
+                sub_chunk = _intra_sub_chunk()
                 # a strided view would cross the graph break below (strided_view fails in Synapse)
                 gate_proj = gate_proj.contiguous()
                 core, slots, conv_rows, ssm_rows = kda_prefill_step(mixed_qkv.reshape(num_seqs, seq_len, -1),
@@ -179,6 +194,7 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                                                                     token_mask=mask,
                                                                     chunk_size=chunk_size,
                                                                     vec_chunks=vec_chunks,
+                                                                    sub_chunk=sub_chunk,
                                                                     **common)
                 core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
                 # separate statement: ops chained on the disabled call break the HPU backend (unparsable stack_trace)

@@ -1562,6 +1562,8 @@ def _patch_kimi_k3_arch() -> None:
                 "attn_res stays active", KIMI_DECODER_LAYER_CLASSES, _amd_linear.__name__)
         else:
             _kimi_patch_installed("functional_attn_res")
+        _ext_logger().info("Kimi-K3 KDA prefill: chunk %s, intra sub-chunk %s", gaudi_envs.HPU_KIMI_KDA_PREFILL_CHUNK,
+                           gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK)
 
         # Monkey-patch KimiMoE.forward to ensure inputs are safely 2D
         orig_moe_forward = getattr(_amd_linear.KimiMoE, "forward", None)
