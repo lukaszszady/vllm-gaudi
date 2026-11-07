@@ -2226,6 +2226,59 @@ def test_blocked_pairwise_terms_match_full_pairwise_decay(chunk, sub_chunk, gate
         assert err_blk <= 4 * err_ref + 1e-6, (err_blk, err_ref)
 
 
+def _pairwise_terms_blocked_by_columns(cum, kc, qc, sub_chunk):
+    """Column-by-column assembly with zero padding and torch.cat (reference for the batched blocked form)."""
+    batch, chunk, kdim = cum.shape
+    m = chunk // sub_chunk
+    diags = kda._pairwise_terms(*(x.reshape(batch * m, sub_chunk, kdim) for x in (cum, kc, qc)))
+    diags = tuple(x.reshape(batch, chunk, sub_chunk) for x in diags)
+    cum_b = cum.reshape(batch, m, sub_chunk, kdim)
+    right = (kc.reshape(batch, m, sub_chunk, kdim) * torch.exp(cum_b[:, :, -1:, :] - cum_b)).reshape(batch, chunk, kdim)
+    cols = ([], [])
+    for j in range(m):
+        lo, hi = j * sub_chunk, (j + 1) * sub_chunk
+        below = []
+        if hi < chunk:
+            left_decay = torch.exp(torch.clamp(cum[:, hi:] - cum[:, hi - 1:hi], max=0.0))
+            right_t = right[:, lo:hi].transpose(-1, -2)
+            below = [torch.matmul(x[:, hi:] * left_decay, right_t) for x in (kc, qc)]
+        for i, (col, diag) in enumerate(zip(cols, diags)):
+            parts = [cum.new_zeros(batch, lo, sub_chunk)] if lo else []
+            parts.append(diag[:, lo:hi])
+            if below:
+                parts.append(below[i])
+            col.append(torch.cat(parts, dim=1))
+    return torch.cat(cols[0], dim=2), torch.cat(cols[1], dim=2)
+
+
+@pytest.mark.parametrize("sub_chunk", [8, 16, 32])
+@pytest.mark.parametrize("gate_scale", [0.05, 5.0, 200.0])
+def test_blocked_pairwise_terms_match_column_assembly(sub_chunk, gate_scale):
+    cum, k, q = _pairwise_inputs(390 + sub_chunk, 5, 64, 128, gate_scale)
+    for got, ref in zip(kda._pairwise_terms_blocked(cum, k, q, sub_chunk),
+                        _pairwise_terms_blocked_by_columns(cum, k, q, sub_chunk)):
+        assert got.shape == ref.shape == (5, 64, 64)
+        torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-7)
+
+
+def test_blocked_pairwise_terms_use_no_cat_or_zero_fill():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    ops = []
+
+    class _Ops(TorchDispatchMode):
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            ops.append(func.overloadpacket.__name__)
+            return func(*args, **(kwargs or {}))
+
+    cum, k, q = _pairwise_inputs(395, 3, 64, 32, 5.0)
+    with _Ops():
+        kda._pairwise_terms_blocked(cum, k, q, 16)
+    assert not {"cat", "zeros", "new_zeros", "zero_", "fill_", "copy_", "slice_scatter"} & set(ops), ops
+    assert ops.count("bmm") + ops.count("mm") <= 4, ops
+
+
 def test_blocked_pairwise_terms_match_float64_reference_under_strong_decay():
     """Gates down to -200 per step: the factors exp(G_i - r_J) and exp(r_J - G_j) underflow, the exact value is
     smaller still, so nothing overflows and the error stays at fp32 rounding."""

@@ -314,24 +314,22 @@ def _pairwise_terms_blocked(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tenso
     batch, chunk, kdim = cum.shape
     m = chunk // sub_chunk
     diags = _pairwise_terms(*(x.reshape(batch * m, sub_chunk, kdim) for x in (cum, kc, qc)))
-    diags = tuple(x.reshape(batch, chunk, sub_chunk) for x in diags)  # rows of block J: J*S:(J+1)*S
     cum_b = cum.reshape(batch, m, sub_chunk, kdim)
-    right = (kc.reshape(batch, m, sub_chunk, kdim) * torch.exp(cum_b[:, :, -1:, :] - cum_b)).reshape(batch, chunk, kdim)
-    cols = ([], [])
-    for j in range(m):
-        lo, hi = j * sub_chunk, (j + 1) * sub_chunk
-        below = []
-        if hi < chunk:
-            left_decay = torch.exp(torch.clamp(cum[:, hi:] - cum[:, hi - 1:hi], max=0.0))  # [N,C-hi,K]
-            right_t = right[:, lo:hi].transpose(-1, -2)  # [N,K,S]
-            below = [torch.matmul(x[:, hi:] * left_decay, right_t) for x in (kc, qc)]
-        for i, (col, diag) in enumerate(zip(cols, diags)):
-            parts = [cum.new_zeros(batch, lo, sub_chunk)] if lo else []
-            parts.append(diag[:, lo:hi])
-            if below:
-                parts.append(below[i])
-            col.append(torch.cat(parts, dim=1))
-    return torch.cat(cols[0], dim=2), torch.cat(cols[1], dim=2)
+    last = cum_b[:, :, -1:, :]  # r_J, [N,M,1,K]
+    right_t = (kc.reshape(batch, m, sub_chunk, kdim) * torch.exp(last - cum_b)).transpose(-1, -2)  # [N,M,K,S]
+    # all M block columns at once; rows of block J and above are replaced below
+    left_decay = torch.exp(torch.clamp(cum.unsqueeze(1) - last, max=0.0))  # [N,M(J),C,K]
+    blk = torch.arange(m, device=cum.device)
+    on_diag = (blk.unsqueeze(1) == blk).reshape(m, 1, m, 1)
+    below = (blk.unsqueeze(1) > blk).reshape(m, 1, m, 1)
+    outs = []
+    for x, diag in zip((kc, qc), diags):
+        off = torch.matmul(x.unsqueeze(1) * left_decay, right_t)  # [N,M(J),C,S]
+        off = off.transpose(1, 2).reshape(batch, m, sub_chunk, m, sub_chunk)  # [N,M(I),S,M(J),S]
+        diag = diag.reshape(batch, m, sub_chunk, 1, sub_chunk)
+        full = torch.where(on_diag, diag, torch.where(below, off, 0.0))
+        outs.append(full.reshape(batch, chunk, chunk))
+    return outs[0], outs[1]
 
 
 def _intra_chunk_terms(cum: torch.Tensor,
