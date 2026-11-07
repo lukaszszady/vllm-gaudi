@@ -298,9 +298,9 @@ def _pairwise_terms(cum: torch.Tensor, kc: torch.Tensor, qc: torch.Tensor):
     # exp(G_i - G_j) for j <= i; the clamp keeps the masked-out upper triangle finite (0 * inf would be NaN)
     decay = torch.exp(torch.clamp(cum.unsqueeze(-2) - cum.unsqueeze(-3), max=0.0))  # [N,C(i),C(j),K]
     k_decayed = decay * kc.unsqueeze(-3)  # k_j * exp(G_i - G_j)
-    # contract with k_i (A) and q_i (Aqk) over K; two matmuls instead of a stride-2 last-dim select of one
-    a_raw = torch.matmul(k_decayed, kc.unsqueeze(-1)).squeeze(-1)  # [N,C(i),C(j)]
-    aqk_raw = torch.matmul(k_decayed, qc.unsqueeze(-1)).squeeze(-1)
+    # contract with k_i (A) and q_i (Aqk) over K elementwise: as matmuls these are width-1 batched GEMVs
+    a_raw = (k_decayed * kc.unsqueeze(-2)).sum(-1)  # [N,C(i),C(j)]
+    aqk_raw = (k_decayed * qc.unsqueeze(-2)).sum(-1)
     return a_raw, aqk_raw
 
 

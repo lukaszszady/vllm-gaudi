@@ -2284,6 +2284,27 @@ def test_blocked_pairwise_terms_use_no_cat_and_four_matmuls():
     assert sum(ops.count(name) for name in ("bmm", "mm", "baddbmm", "addmm", "matmul")) <= 4, ops
 
 
+def test_pairwise_terms_contract_over_k_without_matmul():
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    ops = []
+
+    class _Ops(TorchDispatchMode):
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            ops.append(func.overloadpacket.__name__)
+            return func(*args, **(kwargs or {}))
+
+    cum, k, q = _pairwise_inputs(396, 3, 16, 32, 5.0)
+    with _Ops():
+        a, aqk = kda._pairwise_terms(cum, k, q)
+    assert not {"bmm", "mm", "baddbmm", "addmm", "matmul"} & set(ops), ops
+    decay = torch.exp(torch.clamp(cum.double().unsqueeze(-2) - cum.double().unsqueeze(-3), max=0.0))
+    k_dec = decay * k.double().unsqueeze(-3)
+    torch.testing.assert_close(a.double(), (k_dec * k.double().unsqueeze(-2)).sum(-1), rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(aqk.double(), (k_dec * q.double().unsqueeze(-2)).sum(-1), rtol=1e-6, atol=1e-7)
+
+
 def test_blocked_pairwise_terms_match_float64_reference_under_strong_decay():
     """Gates down to -200 per step: the factors exp(G_i - r_J) and exp(r_J - G_j) underflow, the exact value is
     smaller still, so nothing overflows and the error stays at fp32 rounding."""
