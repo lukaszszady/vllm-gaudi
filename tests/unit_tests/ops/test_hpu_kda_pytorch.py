@@ -2255,13 +2255,18 @@ def _pairwise_terms_blocked_by_columns(cum, kc, qc, sub_chunk):
 @pytest.mark.parametrize("gate_scale", [0.05, 5.0, 200.0])
 def test_blocked_pairwise_terms_match_column_assembly(sub_chunk, gate_scale):
     cum, k, q = _pairwise_inputs(390 + sub_chunk, 5, 64, 128, gate_scale)
-    for got, ref in zip(kda._pairwise_terms_blocked(cum, k, q, sub_chunk),
-                        _pairwise_terms_blocked_by_columns(cum, k, q, sub_chunk)):
+    # compare in float64 and against it: CPU matmul results vary with the kernel and batch layout
+    cum64, k64, q64 = cum.double(), k.double(), q.double()
+    refs = _pairwise_terms_blocked_by_columns(cum64, k64, q64, sub_chunk)
+    for got, ref in zip(kda._pairwise_terms_blocked(cum64, k64, q64, sub_chunk), refs):
         assert got.shape == ref.shape == (5, 64, 64)
-        torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(got, ref, rtol=1e-7, atol=1e-8)
+    for got, ref in zip(kda._pairwise_terms_blocked(cum, k, q, sub_chunk), refs):
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got.double(), ref, rtol=1e-4, atol=1e-4)
 
 
-def test_blocked_pairwise_terms_use_no_cat_or_zero_fill():
+def test_blocked_pairwise_terms_use_no_cat_and_four_matmuls():
     from torch.utils._python_dispatch import TorchDispatchMode
 
     ops = []
@@ -2275,8 +2280,8 @@ def test_blocked_pairwise_terms_use_no_cat_or_zero_fill():
     cum, k, q = _pairwise_inputs(395, 3, 64, 32, 5.0)
     with _Ops():
         kda._pairwise_terms_blocked(cum, k, q, 16)
-    assert not {"cat", "zeros", "new_zeros", "zero_", "fill_", "copy_", "slice_scatter"} & set(ops), ops
-    assert ops.count("bmm") + ops.count("mm") <= 4, ops
+    assert not {"cat", "slice_scatter", "index_put", "index_put_"} & set(ops), ops
+    assert sum(ops.count(name) for name in ("bmm", "mm", "baddbmm", "addmm", "matmul")) <= 4, ops
 
 
 def test_blocked_pairwise_terms_match_float64_reference_under_strong_decay():
