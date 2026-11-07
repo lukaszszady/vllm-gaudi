@@ -313,3 +313,88 @@ def test_moe_layers_under_the_nested_submodel_config_get_the_hpu_method(mxfp4, m
 def _original_make(mxfp4):
     # upstream stub behaviour: the unwrapped method builds the (raising) upstream Mxfp4MoEMethod
     return lambda self, moe: mxfp4.orig_mxfp4_method(moe)
+
+
+def _fp8_setup(mxfp4, monkeypatch, spec):
+    fp8 = pytest.importorskip("vllm_gaudi.ops.hpu_mxfp4_fp8")
+    monkeypatch.setitem(sys.modules, "vllm_gaudi.ops.hpu_mxfp4_fp8", fp8)
+    created = []
+
+    class FakeFp8Slot:
+
+        def __init__(self):
+            self.calls = {}
+
+        def set_weight(self, value):
+            self.calls["weight"] = value
+
+        def set_scale_inv_fp8(self, value):
+            self.calls["scale"] = value
+
+    class FakeFp8Op:
+
+        def __init__(self, global_experts, local_experts, experts_min, experts_max, dispatch_fn):
+            self.args = (global_experts, local_experts, experts_min, experts_max, dispatch_fn)
+            self.w13_list = [FakeFp8Slot() for _ in range(local_experts)]
+            self.w2_list = [FakeFp8Slot() for _ in range(local_experts)]
+            self.cached = False
+            created.append(self)
+
+        def _cache_weight_lists(self):
+            self.cached = True
+
+    monkeypatch.setattr(sys.modules["vllm_gaudi.extension.ops"],
+                        "VllmMixtureOfExpertsOpFP8PerChannel",
+                        FakeFp8Op,
+                        raising=False)
+    monkeypatch.setattr(mxfp4.gaudi_envs, "HPU_KIMI_MOE_FP8_LAYERS", spec, raising=False)
+    monkeypatch.setattr(mxfp4.gaudi_envs, "HPU_KIMI_SITU_IMPL", "", raising=False)
+    mxfp4_created = []
+    mxfp4.VllmMixtureOfExpertsOpMXFP4 = _fake_op_class(mxfp4_created)
+    return created, mxfp4_created
+
+
+def _mxfp4_layer(local=3, global_=6, ep_rank=1):
+    import torch
+    layer = _layer(local=local, global_=global_, ep_rank=ep_rank)
+    layer.w13_weight = torch.nn.Parameter(torch.full((local, 4, 16), 0x21, dtype=torch.uint8), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(torch.full((local, 4, 1), 127, dtype=torch.uint8), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.full((local, 2, 32), 0x21, dtype=torch.uint8), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(torch.full((local, 2, 2), 127, dtype=torch.uint8), requires_grad=False)
+    return layer
+
+
+def test_fp8_layers_replace_the_mxfp4_op_for_selected_layers_only(mxfp4, monkeypatch):
+    import torch
+    created, mxfp4_created = _fp8_setup(mxfp4, monkeypatch, "2")
+    method = mxfp4.HPUKimiK3Mxfp4MoEMethod(_moe())
+    selected = _mxfp4_layer()
+    selected.layer_name = "language_model.model.layers.2.mlp.experts"
+    other = _mxfp4_layer()
+    other.layer_name = "language_model.model.layers.3.mlp.experts"
+
+    method.process_weights_after_loading(selected)
+    method.process_weights_after_loading(other)
+
+    (op, ) = created
+    assert selected.moe_op is op and op.cached and op.args == (6, 3, 3, 5, None)
+    assert selected.w13_weight.dtype == torch.float8_e4m3fn and selected.w13_weight.shape == (3, 4, 32)
+    assert selected.w2_weight_scale.dtype == torch.float32 and selected.w2_weight_scale.shape == (3, 2)
+    assert op.w13_list[0].calls["weight"].shape == (4, 32) and op.w2_list[2].calls["scale"].shape == (2, )
+    # 0x21 = (0.5, 1.0) at scale 2**0
+    restored = selected.w13_weight.float() * selected.w13_weight_scale.unsqueeze(-1)
+    assert torch.equal(restored[0, 0, :2], torch.tensor([0.5, 1.0]))
+    assert other.moe_op is mxfp4_created[0] and other.w13_weight.dtype == torch.uint8
+
+
+def test_fp8_layers_are_skipped_for_the_exact_situ_path(mxfp4, monkeypatch):
+    created, mxfp4_created = _fp8_setup(mxfp4, monkeypatch, "all")
+    mxfp4.situ_impl_or_exact = lambda value: "exact"
+    method = mxfp4.HPUKimiK3Mxfp4MoEMethod(_moe())
+    layer = _layer()
+    layer.layer_name = "model.layers.1.mlp.experts"
+    layer.activation = types.SimpleNamespace(value="situ")
+
+    method.process_weights_after_loading(layer)
+
+    assert not created and layer.moe_op is mxfp4_created[0]

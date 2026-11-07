@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_COMPACT_GDN: bool = False
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_ATTN_RES_RSTD_CACHE: bool = True
+    HPU_KIMI_MOE_FP8_LAYERS: str = ""
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -128,6 +129,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 attn_res: keep the mean square of each stored block next to the bank instead of recomputing it per read
     "HPU_KIMI_ATTN_RES_RSTD_CACHE":
     lambda: os.environ.get("HPU_KIMI_ATTN_RES_RSTD_CACHE", "1").strip().lower() in ("1", "true"),
+
+    # Kimi-K3 routed experts converted at load from MXFP4 to per-row FP8 for these decoder layers
+    # ("" off, "all", or "1-8,40"); needs HPU_KIMI_SITU_IMPL=silu
+    "HPU_KIMI_MOE_FP8_LAYERS":
+    lambda: os.environ.get("HPU_KIMI_MOE_FP8_LAYERS", ""),
 }
 
 # end-env-vars-definition

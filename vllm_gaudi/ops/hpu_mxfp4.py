@@ -6,6 +6,7 @@ Monkey-patches the CUDA GptOssMxfp4MoEMethod so that when the quant config
 flows through (HPU_MXFP4_NATIVE=1), the HPU-specific kernel setup is used
 instead of CUDA kernel infrastructure.
 """
+import logging
 from collections.abc import Callable
 from functools import partial
 
@@ -29,6 +30,9 @@ from vllm_gaudi.v1.worker.hpu_dp_utils import (
     dispatch_tensor,
     get_hpu_dp_metadata,
 )
+
+# vLLM installs handlers on the "vllm" logger tree only
+_fp8_logger = logging.getLogger("vllm.gaudi.kimi_moe_fp8")
 
 
 class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
@@ -231,8 +235,58 @@ class HPUKimiK3Mxfp4MoEMethod(Mxfp4MoEMethod):
         )
 
     def process_weights_after_loading(self, layer) -> None:
-        HPUGptOssMxfp4MoEMethod.process_weights_after_loading(self, layer)
+        if not self._maybe_convert_to_fp8(layer):
+            HPUGptOssMxfp4MoEMethod.process_weights_after_loading(self, layer)
         self.moe_quant_config = object()
+
+    def _maybe_convert_to_fp8(self, layer) -> bool:
+        """HPU_KIMI_MOE_FP8_LAYERS: replace the MXFP4 experts of a selected layer by per-row FP8 ones."""
+        spec = getattr(gaudi_envs, "HPU_KIMI_MOE_FP8_LAYERS", "")
+        if not (spec or "").strip():
+            return False
+        from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpFP8PerChannel
+        from vllm_gaudi.ops.hpu_mxfp4_fp8 import layer_selected, mxfp4_experts_to_fp8
+        layer_name = getattr(layer, "layer_name", None)
+        if not layer_selected(spec, layer_name):
+            return False
+        activation = getattr(layer, "activation", None)
+        if (getattr(activation, "value", activation) == "situ"
+                and situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL) == "exact"):
+            # the exact SiTU path reads the packed MXFP4 tensors
+            _fp8_logger.warning("HPU_KIMI_MOE_FP8_LAYERS ignored for %s: needs HPU_KIMI_SITU_IMPL=silu", layer_name)
+            return False
+
+        num_experts = layer.local_num_experts
+        ep_shift = layer.moe_config.ep_rank * num_experts
+        if layer.moe_config.dp_size > 1 and self.use_dispatch_fn:
+            dispatch_fn = partial(dispatch_hidden_states, is_sequence_parallel=layer.moe_config.is_sequence_parallel)
+        else:
+            dispatch_fn = None
+        before = sum(t.numel() * t.element_size()
+                     for t in (layer.w13_weight, layer.w13_weight_scale, layer.w2_weight, layer.w2_weight_scale))
+        inexact = 0
+        for name in ("w13", "w2"):
+            weight, scale, n = mxfp4_experts_to_fp8(
+                getattr(layer, f"{name}_weight").data,
+                getattr(layer, f"{name}_weight_scale").data)
+            setattr(layer, f"{name}_weight", torch.nn.Parameter(weight, requires_grad=False))
+            setattr(layer, f"{name}_weight_scale", torch.nn.Parameter(scale, requires_grad=False))
+            inexact += n
+
+        op = VllmMixtureOfExpertsOpFP8PerChannel(layer.global_num_experts, num_experts, ep_shift,
+                                                 num_experts + ep_shift - 1, dispatch_fn)
+        for expert_id in range(num_experts):
+            op.w13_list[expert_id].set_weight(layer.w13_weight.data[expert_id])
+            op.w13_list[expert_id].set_scale_inv_fp8(layer.w13_weight_scale.data[expert_id])
+            op.w2_list[expert_id].set_weight(layer.w2_weight.data[expert_id])
+            op.w2_list[expert_id].set_scale_inv_fp8(layer.w2_weight_scale.data[expert_id])
+        op._cache_weight_lists()
+        layer.moe_op = op
+        after = sum(t.numel() * t.element_size()
+                    for t in (layer.w13_weight, layer.w13_weight_scale, layer.w2_weight, layer.w2_weight_scale))
+        _fp8_logger.info("Kimi-K3 MoE FP8 experts for %s: +%.1f MiB, %d inexact elements", layer_name,
+                         (after - before) / 2**20, inexact)
+        return True
 
     def get_fused_moe_quant_config(self, layer):
         return None
