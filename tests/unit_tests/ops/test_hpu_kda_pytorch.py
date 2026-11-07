@@ -2078,8 +2078,9 @@ def _unsupported_size_exprs(fn, args, dynamic_dim):
     return sorted(found)
 
 
-@pytest.mark.parametrize("seq_len,vec_chunks", [(150, 2), (160, 2), (150, 0), (37, 16)])
-@pytest.mark.parametrize("scan_block", [0, 4, 8])
+@pytest.mark.parametrize("seq_len,vec_chunks", [(150, 2), (160, 2), (150, 0), (37, 16), (128, 2), (256, 2), (256, 0),
+                                                (512, 2)])
+@pytest.mark.parametrize("scan_block", [0, 4, 8, 16])
 def test_chunked_vec_traced_sizes_are_plain_dynamic_dims(seq_len, vec_chunks, scan_block):
     """With a dynamic sequence length the traced graph (as the Habana backend sees it) must contain only sizes
     like ``16 * ((s0 + 15) // 16)``: Mod/Min/Max/ceiling or a division by a symbolic size make its symbolic size
@@ -2473,7 +2474,7 @@ def test_blocked_pairwise_terms_shrink_the_largest_intermediate():
 
 
 @pytest.mark.parametrize("seq_len,vec_chunks,chunk,sub_chunk", [(150, 2, 16, 8), (160, 2, 16, 8), (150, 0, 16, 8),
-                                                                (37, 16, 64, 16)])
+                                                                (37, 16, 64, 16), (256, 2, 16, 8), (512, 2, 16, 8)])
 def test_chunked_vec_with_sub_chunk_traced_sizes_are_plain_dynamic_dims(seq_len, vec_chunks, chunk, sub_chunk):
     heads, dim = 2, 16
 

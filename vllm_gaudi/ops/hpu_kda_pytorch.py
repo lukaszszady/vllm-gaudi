@@ -407,8 +407,8 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
 
     # [block, num_blocks, B*H, K, D]: the position in the block leads, so every step reads a leading-dim slice
     def to_blocks(x, value=0.0):
-        if pad:  # identity maps
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 0, 0, pad), value=value)
+        # identity maps; unconditional, so no pad == 0 guard specializes the block reshape
+        x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 0, 0, pad), value=value)
         return x.reshape(num_blocks, block, bsz * heads, kdim, x.shape[-1]).transpose(0, 1).contiguous()
 
     eye = torch.eye(kdim, dtype=tw.dtype, device=tw.device)
