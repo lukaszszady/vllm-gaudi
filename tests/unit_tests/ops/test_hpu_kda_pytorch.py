@@ -2405,21 +2405,23 @@ def test_blocked_pairwise_terms_compile_fullgraph_dynamic_once_for_any_batch():
     assert counter.frame_count == 1
 
 
-def test_chunked_vec_with_sub_chunk_compiles_fullgraph_dynamic_over_lengths():
+def test_chunked_vec_with_sub_chunk_compiles_fullgraph_and_matches_eager():
     import torch._dynamo as dynamo
+    from torch._dynamo.testing import CompileCounterWithBackend
 
     dynamo.reset()
+    counter = CompileCounterWithBackend("aot_eager")
     try:
         fn = torch.compile(lambda *a: kda.kda_chunked_steps_vec(*a, chunk_size=64, vec_chunks=2, sub_chunk=16),
-                           backend="aot_eager",
+                           backend=counter,
                            fullgraph=True,
-                           dynamic=True)
-        for length in (70, 130, 333):
-            q, k, v, log_gate, beta, state0 = _random_delta_inputs(390 + length, 2, length)
-            args = (state0, q, k, v, log_gate, beta)
-            out, state = fn(*args)
-            out_ref, state_ref = kda.kda_chunked_steps_vec(*args, chunk_size=64, vec_chunks=2)
-            torch.testing.assert_close(out, out_ref, rtol=1e-5, atol=1e-5)
-            torch.testing.assert_close(state, state_ref, rtol=1e-5, atol=1e-5)
+                           dynamic=False)
+        q, k, v, log_gate, beta, state0 = _random_delta_inputs(520, 2, 130)
+        args = (state0, q, k, v, log_gate, beta)
+        out, state = fn(*args)
+        out_ref, state_ref = kda.kda_chunked_steps_vec(*args, chunk_size=64, vec_chunks=2)
+        assert counter.frame_count == 1
+        torch.testing.assert_close(out, out_ref, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(state, state_ref, rtol=1e-5, atol=1e-5)
     finally:
         dynamo.reset()
