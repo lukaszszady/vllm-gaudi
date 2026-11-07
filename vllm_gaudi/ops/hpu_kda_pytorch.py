@@ -342,17 +342,17 @@ def _intra_chunk_terms(cum: torch.Tensor,
                        strict: torch.Tensor,
                        lower: torch.Tensor,
                        sub_chunk: int = 0):
-    """State-independent terms of a group of chunks (all inputs [B,H,G,C,*], bc [B,H,G,C,1]).
+    """State-independent terms of a group of chunks (all inputs [G,B,H,C,*], bc [G,B,H,C,1]).
 
     With U = Uv - Wk S_0^T the pseudo values of ``kda_chunked_steps``, returns ``(uv, wk, q_eff, o_intra)`` with
     ``Uv = (I + A)^-1 (beta V)``, ``Wk = (I + A)^-1 (beta K exp(G))``, so that the chunk output is
     ``O = q_eff S_0^T + o_intra`` (``q_eff = Q exp(G) - Aqk Wk``, ``o_intra = Aqk Uv``). A ``sub_chunk`` that
     divides the chunk into at least two blocks selects ``_pairwise_terms_blocked``.
     """
-    # fold B, H and the chunk group into one batch dim: the HPU compiler rejects rank 6/7 views
+    # fold the chunk group, B and H into one batch dim: the HPU compiler rejects rank 6/7 views
     lead = cum.shape[:3]
 
-    def fold(x):  # [B,H,G,C,D] -> [B*H*G,C,D]; reshape copies the non-contiguous slices of a chunk group
+    def fold(x):  # [G,B,H,C,D] -> [G*B*H,C,D]
         return x.reshape(lead[0] * lead[1] * lead[2], *x.shape[3:])
 
     cum, kc, qc, vc, bc, k_gamma, q_gamma = (fold(x) for x in (cum, kc, qc, vc, bc, k_gamma, q_gamma))
@@ -406,17 +406,18 @@ def kda_chunked_steps_vec(state: torch.Tensor,
     beta = torch.nn.functional.pad(beta, (0, 0, 0, pad))
     group = vec_chunks if 0 < vec_chunks < num_chunks else num_chunks  # not min(): no Min in the traced shapes
 
-    def to_chunks(x):  # [B, N*C, H, D] -> [B, H, N, C, D]
-        return x.reshape(bsz, num_chunks, chunk, heads, -1).permute(0, 3, 1, 2, 4).contiguous()
+    # chunk axis leading and contiguous: chunk groups and the recurrence steps are dense leading-dim slices
+    def to_chunks(x):  # [B, N*C, H, D] -> [N, B, H, C, D]
+        return x.reshape(bsz, num_chunks, chunk, heads, -1).permute(1, 0, 3, 2, 4).contiguous()
 
     qc, kc, vc, gc = to_chunks(q), to_chunks(k), to_chunks(v), to_chunks(g)
-    bc = beta.reshape(bsz, num_chunks, chunk, heads).permute(0, 3, 1, 2).contiguous().unsqueeze(-1)  # [B,H,N,C,1]
-    cum = torch.cumsum(gc, dim=3)  # G, [B,H,N,C,K]
+    bc = beta.reshape(bsz, num_chunks, chunk, heads).permute(1, 0, 3, 2).contiguous().unsqueeze(-1)  # [N,B,H,C,1]
+    cum = torch.cumsum(gc, dim=3)  # G, [N,B,H,C,K]
     last = cum[:, :, :, -1:, :]  # G_C
     q_gamma = qc * torch.exp(cum)
     k_gamma = kc * torch.exp(cum)
-    k_tail_t = (kc * torch.exp(last - cum)).transpose(-1, -2)  # [B,H,N,K,C]
-    gamma_last = torch.exp(last.squeeze(3)).unsqueeze(-1)  # [B,H,N,K,1]
+    k_tail_t = (kc * torch.exp(last - cum)).transpose(-1, -2)  # [N,B,H,K,C]
+    gamma_last = torch.exp(last.squeeze(3)).unsqueeze(-1)  # [N,B,H,K,1]
 
     strict = torch.tril(torch.ones(chunk, chunk, dtype=q.dtype, device=q.device), -1)
     lower = torch.tril(torch.ones(chunk, chunk, dtype=q.dtype, device=q.device))
@@ -425,25 +426,24 @@ def kda_chunked_steps_vec(state: torch.Tensor,
     for start in range(0, num_chunks, group):
         sl = slice(start, start + group)
         terms.append(
-            _intra_chunk_terms(cum[:, :, sl], kc[:, :, sl], qc[:, :, sl], vc[:, :, sl], bc[:, :, sl], k_gamma[:, :, sl],
-                               q_gamma[:, :, sl], strict, lower, sub_chunk))
-    uv, wk, q_eff, o_intra = (torch.cat(parts, dim=2) if len(parts) > 1 else parts[0] for parts in zip(*terms))
+            _intra_chunk_terms(cum[sl], kc[sl], qc[sl], vc[sl], bc[sl], k_gamma[sl], q_gamma[sl], strict, lower,
+                               sub_chunk))
+    uv, wk, q_eff, o_intra = (torch.cat(parts) if len(parts) > 1 else parts[0] for parts in zip(*terms))
 
-    tw = torch.matmul(k_tail_t, wk)  # [B,H,N,K,K]
-    tu = torch.matmul(k_tail_t, uv)  # [B,H,N,K,V]
+    tw = torch.matmul(k_tail_t, wk)  # [N,B,H,K,K]
+    tu = torch.matmul(k_tail_t, uv)  # [N,B,H,K,V]
 
     s_t = state.transpose(-1, -2)  # [B,H,K,V]
     starts = []
-    # chunk axis first and contiguous, so the loop only selects dense slices (no strided views of permuted tensors)
-    tw_c, tu_c, gl_c = (x.movedim(2, 0).contiguous() for x in (tw, tu, gamma_last))
-    for tw_n, tu_n, gl_n in zip(tw_c, tu_c, gl_c):
+    for tw_n, tu_n, gl_n in zip(tw, tu, gamma_last):
         starts.append(s_t)
         # the decay stays elementwise; only the delta-rule correction goes through the matmul
         s_t = s_t * gl_n + tu_n - torch.matmul(tw_n, s_t)
-    out = torch.matmul(q_eff, torch.stack(starts, dim=2)) + o_intra  # [B,H,N,C,V]
-    out = out.permute(0, 2, 3, 1, 4).reshape(bsz, num_chunks * chunk, heads, vdim)
-    # exact shape and a dense layout: this output crosses a graph break (storage offset 0, no padded tail)
-    return out[:, :seq_len].contiguous(), s_t.transpose(-1, -2)
+    out = torch.matmul(q_eff, torch.stack(starts)) + o_intra  # [N,B,H,C,V]
+    out = out.permute(1, 0, 3, 2, 4).reshape(bsz, num_chunks * chunk, heads, vdim)
+    # exact shape and a dense layout: this output crosses a graph break (storage offset 0, no padded tail);
+    # clone, since with B = 1 the slice of the reshaped buffer is already contiguous
+    return out[:, :seq_len].clone(memory_format=torch.contiguous_format), s_t.transpose(-1, -2)
 
 
 def _prepare_qkv_gates(conv_out: torch.Tensor, raw_g: torch.Tensor, raw_beta: torch.Tensor, A_log: torch.Tensor,
