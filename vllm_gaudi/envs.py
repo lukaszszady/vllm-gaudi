@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     HPU_KIMI_ATTN_RES_RSTD_CACHE: bool = True
     HPU_KIMI_MOE_FP8_LAYERS: str = ""
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
+    HPU_KIMI_KDA_SCAN_BLOCK: str = "8"
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -130,6 +131,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 KDA prefill: rows per block of the blockwise intra-chunk A / Aqk ("0" = full pairwise decay)
     "HPU_KIMI_KDA_INTRA_SUB_CHUNK":
     lambda: os.environ.get("HPU_KIMI_KDA_INTRA_SUB_CHUNK", "0"),
+
+    # Kimi-K3 KDA prefill: chunks per block of the scanned state recurrence ("0" or "1" = one step per chunk)
+    "HPU_KIMI_KDA_SCAN_BLOCK":
+    lambda: os.environ.get("HPU_KIMI_KDA_SCAN_BLOCK", "8"),
 
     # Kimi-K3 attn_res: keep the mean square of each stored block next to the bank instead of recomputing it per read
     "HPU_KIMI_ATTN_RES_RSTD_CACHE":

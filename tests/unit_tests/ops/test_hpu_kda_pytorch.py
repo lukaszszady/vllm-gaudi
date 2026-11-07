@@ -1283,9 +1283,44 @@ def test_chunked_vec_leaves_only_the_state_recurrence_per_chunk():
     """Per extra chunk the old loop runs the whole intra-chunk part (pairwise decay, A, Aqk, the log2(C) level
     inverse); the vectorized form only U = Uv - Wk s and the state update (2 matmuls, sub, mul, add)."""
     old_all, old_compute = _ops_per_chunk(kda.kda_chunked_steps)
-    new_all, new_compute = _ops_per_chunk(kda.kda_chunked_steps_vec, vec_chunks=0)
+    new_all, new_compute = _ops_per_chunk(kda.kda_chunked_steps_vec, vec_chunks=0, scan_block=0)
     assert new_compute <= 6, (new_all, new_compute)
     assert old_compute >= 10 * new_compute and old_all >= 10 * new_all, (old_all, old_compute, new_all, new_compute)
+
+
+@pytest.mark.parametrize("length,chunk,scan_block", [(1, 8, 8), (7, 8, 2), (100, 32, 2), (100, 32, 3), (300, 16, 4),
+                                                     (300, 16, 8), (300, 16, 64), (1030, 64, 8), (1030, 64, 5)])
+def test_chunked_vec_scanned_recurrence_matches_the_chunk_loop(length, chunk, scan_block):
+    q, k, v, log_gate, beta, state = _random_delta_inputs(380 + length + scan_block, 2, length)
+    args = (state, q, k, v, log_gate, beta)
+    out_loop, state_loop = kda.kda_recurrent_steps(state, q, k, v, torch.exp(log_gate), beta)
+    out_ref, state_ref = kda.kda_chunked_steps_vec(*args, chunk_size=chunk, vec_chunks=0, scan_block=0)
+    out, state_out = kda.kda_chunked_steps_vec(*args, chunk_size=chunk, vec_chunks=0, scan_block=scan_block)
+    assert out.shape == out_ref.shape and state_out.shape == state_ref.shape
+    torch.testing.assert_close(out, out_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(state_out, state_ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out, out_loop, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state_out, state_loop, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("gate_scale", [0.0, 1e-3, 0.05])
+def test_chunked_vec_scanned_recurrence_with_slow_gates_and_near_parallel_keys(gate_scale):
+    q, k, v, log_gate, beta, state = _random_delta_inputs(390, 1, 1500, gate_scale=gate_scale)
+    k = kda.l2norm(k[:, :1].expand_as(k) + 0.01 * k)
+    beta = torch.full_like(beta, 0.999)
+    args = (state, q, k, v, log_gate, beta)
+    out_ref, state_ref = kda.kda_chunked_steps_vec(*args, chunk_size=64, vec_chunks=0, scan_block=0)
+    out, state_out = kda.kda_chunked_steps_vec(*args, chunk_size=64, vec_chunks=0, scan_block=8)
+    assert torch.isfinite(out).all() and torch.isfinite(state_out).all()
+    torch.testing.assert_close(out, out_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state_out, state_ref, rtol=1e-4, atol=1e-4)
+
+
+def test_chunked_vec_scanned_recurrence_steps_once_per_block():
+    _, loop_compute = _ops_per_chunk(kda.kda_chunked_steps_vec, vec_chunks=0, scan_block=0)
+    # lengths 256 / 512 are 4 / 8 chunks: one block of 4 / 8 chunks, one more scan level
+    _, scan_compute = _ops_per_chunk(kda.kda_chunked_steps_vec, vec_chunks=0, scan_block=8)
+    assert scan_compute < loop_compute, (scan_compute, loop_compute)
 
 
 def test_prefill_step_only_reads_the_caches_and_write_completes_it():
@@ -1327,7 +1362,8 @@ def _max_tensor_rank(fn):
 @pytest.mark.parametrize("lengths,padded,chunk,vec_chunks", [([70, 41], 96, 32, 2), ([37], 37, 16, 0),
                                                              ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
 @pytest.mark.parametrize("sub_chunk", [0, 8])
-def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, chunk, vec_chunks, sub_chunk):
+@pytest.mark.parametrize("scan_block", [0, 2, 8])
+def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, chunk, vec_chunks, sub_chunk, scan_block):
     """The HPU compiler fails with 'strided_view ... Invalid argument' on the rank 6/7 views of the batched
     intra-chunk terms, so no op of the chunked_vec prefill may see a tensor with more than 5 dims."""
     params = _make_params(140)
@@ -1337,15 +1373,16 @@ def test_chunked_vec_prefill_step_has_no_tensor_above_rank_5(lengths, padded, ch
     n = len(lengths)
     args = (batch["mixed_qkv"], batch["raw_g"], batch["raw_beta"], params["conv_weight"], None, params["A_log"],
             params["dt_bias"], params["lower_bound"], *caches, torch.arange(n), torch.tensor([1, 0, 1][:n]), mask, H, D)
-    rank, op = _max_tensor_rank(
-        lambda: kda.kda_prefill_step(*args, chunk_size=chunk, vec_chunks=vec_chunks, sub_chunk=sub_chunk))
+    rank, op = _max_tensor_rank(lambda: kda.kda_prefill_step(
+        *args, chunk_size=chunk, vec_chunks=vec_chunks, sub_chunk=sub_chunk, scan_block=scan_block))
     assert rank <= 5, (rank, op)
 
 
 @pytest.mark.parametrize("lengths,padded,chunk,vec_chunks", [([70, 41], 96, 32, 2), ([37], 37, 16, 0),
                                                              ([64, 5, 33], 64, 16, 3), ([9], 12, 4, 1)])
 @pytest.mark.parametrize("sub_chunk", [0, 8])
-def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chunk, vec_chunks, sub_chunk):
+@pytest.mark.parametrize("scan_block", [0, 2, 8])
+def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chunk, vec_chunks, sub_chunk, scan_block):
     """Fallback for the HPU 'strided_view' failure: no diagonal / as_strided, and no select or stepped slice on a
     non-leading dim (the views the Synapse graph compiler cannot lower) in the chunked_vec prefill."""
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -1370,7 +1407,7 @@ def test_chunked_vec_prefill_step_uses_no_strided_view_ops(lengths, padded, chun
     args = (batch["mixed_qkv"], batch["raw_g"], batch["raw_beta"], params["conv_weight"], None, params["A_log"],
             params["dt_bias"], params["lower_bound"], *caches, torch.arange(n), torch.tensor([1, 0, 1][:n]), mask, H, D)
     with _Views():
-        kda.kda_prefill_step(*args, chunk_size=chunk, vec_chunks=vec_chunks, sub_chunk=sub_chunk)
+        kda.kda_prefill_step(*args, chunk_size=chunk, vec_chunks=vec_chunks, sub_chunk=sub_chunk, scan_block=scan_block)
     assert not bad, bad[:5]
 
 
@@ -2012,7 +2049,8 @@ def _unsupported_size_exprs(fn, args, dynamic_dim):
 
 
 @pytest.mark.parametrize("seq_len,vec_chunks", [(150, 2), (160, 2), (150, 0), (37, 16)])
-def test_chunked_vec_traced_sizes_are_plain_dynamic_dims(seq_len, vec_chunks):
+@pytest.mark.parametrize("scan_block", [0, 4, 8])
+def test_chunked_vec_traced_sizes_are_plain_dynamic_dims(seq_len, vec_chunks, scan_block):
     """With a dynamic sequence length the traced graph (as the Habana backend sees it) must contain only sizes
     like ``16 * ((s0 + 15) // 16)``: Mod/Min/Max/ceiling or a division by a symbolic size make its symbolic size
     evaluation fail with 'RuntimeError: Not Implemented' in warmup."""
@@ -2020,7 +2058,15 @@ def test_chunked_vec_traced_sizes_are_plain_dynamic_dims(seq_len, vec_chunks):
 
     def fn(x, state):
         q, k, v, g, b = (x.reshape(1, x.shape[1], 5, heads, dim)[:, :, i] for i in range(5))
-        return kda.kda_chunked_steps_vec(state, q, k, v, -g.abs() * 0.1, b[..., 0].sigmoid(), chunk, vec_chunks)
+        return kda.kda_chunked_steps_vec(state,
+                                         q,
+                                         k,
+                                         v,
+                                         -g.abs() * 0.1,
+                                         b[..., 0].sigmoid(),
+                                         chunk,
+                                         vec_chunks,
+                                         scan_block=scan_block)
 
     x = torch.randn(1, seq_len, 5 * heads * dim)
     state = torch.zeros(1, heads, dim, dim)
@@ -2433,6 +2479,21 @@ def test_intra_sub_chunk_rejects_invalid_values(monkeypatch, value):
                                                       (64, 128, 0), (64, 0, 0), (16, 8, 8)])
 def test_effective_intra_sub_chunk(chunk, sub_chunk, expected):
     assert kda.effective_intra_sub_chunk(chunk, sub_chunk) == expected
+
+
+@pytest.mark.parametrize("value,expected", [(None, 8), ("4", 4), (" 16 ", 16), ("0", 0), ("1", 1), ("", 0)])
+def test_scan_block_comes_from_env(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("HPU_KIMI_KDA_SCAN_BLOCK", raising=False)
+    else:
+        monkeypatch.setenv("HPU_KIMI_KDA_SCAN_BLOCK", value)
+    assert _load_layer_module(monkeypatch, {"value": None})._scan_block() == expected
+
+
+@pytest.mark.parametrize("value", ["-8", "a", "8,4"])
+def test_scan_block_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="HPU_KIMI_KDA_SCAN_BLOCK"):
+        kda.parse_scan_block(value)
 
 
 def test_intra_sub_chunk_follows_the_prefill_chunk(monkeypatch):
