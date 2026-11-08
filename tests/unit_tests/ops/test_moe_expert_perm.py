@@ -200,11 +200,33 @@ def test_remap_compiles_once_for_layers_with_different_permutations(ops):
     assert counter.frame_count == 1
 
 
-def test_remap():
-    perm = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
-    ids = torch.tensor([[0, 3], [1, 2]], dtype=torch.int32)
+def test_remap_reads_each_layers_table_as_a_graph_input(ops):
+    w13, w2 = _checkpoint()
+    perms = [[5, 0, 7, 2, 6, 1, 3, 4], [1, 2, 3, 4, 5, 6, 7, 0]]
+    layers = [_build_rank(ops, 1, w13, w2, p, f"model.layers.{i + 1}.mlp.experts") for i, p in enumerate(perms)]
+    graph_inputs = []
+
+    def backend(gm, example_inputs):
+        graph_inputs.extend(example_inputs)
+        return gm
+
+    compiled = [torch.compile(layer, backend=backend, fullgraph=True) for layer in layers]
+    x, topk_ids, topk_weights = _routing()
+    for layer, fn in zip(layers, compiled):
+        torch.testing.assert_close(fn(x, topk_ids, topk_weights), layer(x, topk_ids, topk_weights))
+    assert any(t is layers[0]._hpu_expert_perm for t in graph_inputs)
+    # an in-place update of the table must reach the compiled graph (not folded into a constant)
+    layers[1]._hpu_expert_perm.copy_(torch.tensor(perms[0]))
+    torch.testing.assert_close(compiled[1](x, topk_ids, topk_weights), layers[1](x, topk_ids, topk_weights))
+    assert not dynamo.utils.counters["graph_break"]
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_remap(ids_dtype):
+    perm = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
+    ids = torch.tensor([[0, 3], [1, 2]], dtype=ids_dtype)
     out = perm_mod.remap(perm, ids)
-    assert out.dtype == torch.int32
+    assert out.dtype == ids_dtype
     assert out.tolist() == [[2, 1], [0, 3]]
 
 
@@ -217,7 +239,7 @@ def test_apply_to_layer_keeps_shared_buffers():
     assert layer.expert_mask.tolist() == [0] * 6 + [1, 1, 1]
     assert layer._map_global_expert_id_to_local_expert_id(7) == 0
     assert layer._map_global_expert_id_to_local_expert_id(0) == -1
-    assert layer._hpu_expert_perm.dtype == torch.int32
+    assert layer._hpu_expert_perm.dtype == torch.int64
 
 
 def test_apply_to_layer_rejects_round_robin():
@@ -348,13 +370,14 @@ def test_remap_table_follows_the_expert_map_and_weight_device():
     layer._expert_map = layer._expert_map.to("meta")
     perm_mod.apply_to_layer(layer, list(range(NUM_EXPERTS)))
     assert layer._hpu_expert_perm.device.type == "meta"
-    assert layer._hpu_expert_perm.dtype == torch.int32
+    assert layer._hpu_expert_perm.dtype == torch.int64
 
     layer = _RoutedExperts(0)
     perm_mod.apply_to_layer(layer, list(range(NUM_EXPERTS)))
     layer.w13_weight = torch.nn.Parameter(torch.empty(LOCAL, 1, device="meta"), requires_grad=False)
     perm_mod.place_on_weight_device(layer)
     assert layer._hpu_expert_perm.device.type == "meta"
+    assert layer._hpu_expert_perm.dtype == torch.int64
     assert "_hpu_expert_perm" in dict(layer.named_buffers())
 
     plain = _RoutedExperts(0)

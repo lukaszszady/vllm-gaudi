@@ -82,7 +82,8 @@ def local_expert_map(perm: list, ep_rank: int, local_num_experts: int) -> list:
 
 def remap(perm: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
     """Routing table of global expert ids -> physical slots."""
-    return perm.index_select(0, topk_ids.reshape(-1)).view(topk_ids.shape)
+    # int64 indexing instead of an int32 index_select
+    return perm[topk_ids.long()].to(topk_ids.dtype)
 
 
 def apply_to_layer(layer, perm: list) -> None:
@@ -107,9 +108,9 @@ def apply_to_layer(layer, perm: list) -> None:
     to_local = layer._map_global_expert_id_to_local_expert_id
     layer._map_global_expert_id_to_local_expert_id = (lambda expert_id: slots[expert_id]
                                                       if expert_id < len(slots) else to_local(expert_id))
-    # int32 as topk_ids in _hpu_mxfp4_routed_apply; moved to the weight device in place_on_weight_device
+    # moved to the weight device in place_on_weight_device
     layer.register_buffer("_hpu_expert_perm",
-                          torch.tensor(perm, dtype=torch.int32, device=map_device),
+                          torch.tensor(perm, dtype=torch.int64, device=map_device),
                           persistent=False)
 
 
