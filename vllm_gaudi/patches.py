@@ -1705,6 +1705,11 @@ def _patch_compressed_tensors_mxfp4() -> None:
                     return orig_process(self, layer)
                 return
 
+            import vllm_gaudi.envs as gaudi_envs
+            if gaudi_envs.VLLM_HPU_MOE_EXPERT_PERM_FILE:
+                from vllm_gaudi.extension.moe_expert_perm import place_on_weight_device
+                place_on_weight_device(layer)
+
             if hasattr(layer, "w13_weight_packed"):
                 layer.w13_weight = torch.nn.Parameter(layer.w13_weight_packed.data, requires_grad=False)
                 delattr(layer, "w13_weight_packed")

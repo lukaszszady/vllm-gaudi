@@ -329,3 +329,55 @@ def test_offline_lpt_tool_writes_a_valid_balanced_permutation(tmp_path, capsys):
     physical.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
     logical, _ = tool.load_weights(str(physical), ["17-64"], "chunks", applied=perms)
     assert logical == weights
+
+
+def test_remap_table_follows_the_expert_map_and_weight_device():
+    layer = _RoutedExperts(0)
+    layer._expert_map = layer._expert_map.to("meta")
+    perm_mod.apply_to_layer(layer, list(range(NUM_EXPERTS)))
+    assert layer._hpu_expert_perm.device.type == "meta"
+    assert layer._hpu_expert_perm.dtype == torch.int32
+
+    layer = _RoutedExperts(0)
+    perm_mod.apply_to_layer(layer, list(range(NUM_EXPERTS)))
+    layer.w13_weight = torch.nn.Parameter(torch.empty(LOCAL, 1, device="meta"), requires_grad=False)
+    perm_mod.place_on_weight_device(layer)
+    assert layer._hpu_expert_perm.device.type == "meta"
+    assert "_hpu_expert_perm" in dict(layer.named_buffers())
+
+    plain = _RoutedExperts(0)
+    perm_mod.place_on_weight_device(plain)
+    assert getattr(plain, "_hpu_expert_perm", None) is None
+
+
+def _vllm_config(monkeypatch, speculative_config=None):
+    hf_config = types.SimpleNamespace(num_hidden_layers=3, first_k_dense_replace=1, moe_layer_freq=1)
+    config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(enable_ep_weight_filter=False),
+                                   model_config=types.SimpleNamespace(hf_text_config=hf_config),
+                                   speculative_config=speculative_config)
+    monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.config", types.SimpleNamespace(get_current_vllm_config=lambda: config))
+
+
+def test_mtp_drafter_layers_keep_the_default_placement(monkeypatch, tmp_path):
+    _vllm_config(monkeypatch, types.SimpleNamespace(method="mtp"))
+    perm = [7, 6, 5, 4, 3, 2, 1, 0]
+    path = _file(tmp_path, {"num_experts": NUM_EXPERTS, "layers": {"1": perm, "2": perm}})
+    target = _RoutedExperts(0, "model.layers.2.block_sparse_moe.experts")
+    drafter = _RoutedExperts(0, "model.layers.3.mtp_block.block_sparse_moe.experts")
+    default_map = drafter._expert_map.clone()
+    perm_mod.apply_file(target, path)
+    perm_mod.apply_file(drafter, path)
+    assert target._hpu_expert_perm.tolist() == perm
+    assert getattr(drafter, "_hpu_expert_perm", None) is None
+    assert torch.equal(drafter._expert_map, default_map)
+    assert perm_mod.is_drafter_layer(2, types.SimpleNamespace(num_hidden_layers=3), None) is False
+    assert perm_mod.is_drafter_layer(3, types.SimpleNamespace(num_hidden_layers=3),
+                                     types.SimpleNamespace(method="deepseek_mtp"))
+
+
+def test_separate_draft_model_is_rejected(monkeypatch, tmp_path):
+    _vllm_config(monkeypatch, types.SimpleNamespace(method="eagle3"))
+    path = _file(tmp_path, {"num_experts": NUM_EXPERTS, "layers": {"1": list(range(NUM_EXPERTS))}})
+    with pytest.raises(ValueError, match="speculative method 'eagle3'"):
+        perm_mod.apply_file(_RoutedExperts(0, "model.layers.1.block_sparse_moe.experts"), path)

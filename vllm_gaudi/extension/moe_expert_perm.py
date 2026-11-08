@@ -107,7 +107,36 @@ def apply_to_layer(layer, perm: list) -> None:
     to_local = layer._map_global_expert_id_to_local_expert_id
     layer._map_global_expert_id_to_local_expert_id = (lambda expert_id: slots[expert_id]
                                                       if expert_id < len(slots) else to_local(expert_id))
-    layer.register_buffer("_hpu_expert_perm", torch.tensor(perm, dtype=torch.int32), persistent=False)
+    # int32 as topk_ids in _hpu_mxfp4_routed_apply; moved to the weight device in place_on_weight_device
+    layer.register_buffer("_hpu_expert_perm",
+                          torch.tensor(perm, dtype=torch.int32, device=map_device),
+                          persistent=False)
+
+
+def place_on_weight_device(layer) -> None:
+    """Move the remap table to the device of the loaded expert weights (no host->device copy per step)."""
+    perm = getattr(layer, "_hpu_expert_perm", None)
+    if perm is None:
+        return
+    device = next((p.device for p in layer.parameters(recurse=False)), None)
+    if device is not None and perm.device != device:
+        layer.register_buffer("_hpu_expert_perm", perm.to(device), persistent=False)
+
+
+def is_drafter_layer(layer_index: int, hf_config, speculative_config) -> bool:
+    """MoE layer of an MTP drafter (numbered after the target's decoder layers), left without a permutation.
+
+    Other speculative methods load a separate draft model whose layer indices can collide with the target's.
+    """
+    if speculative_config is None:
+        return False
+    method = str(getattr(speculative_config, "method", None) or "")
+    if method != "mtp" and not method.endswith("_mtp"):
+        raise ValueError(f"VLLM_HPU_MOE_EXPERT_PERM_FILE does not work with speculative method {method!r}")
+    num_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_layers is None:
+        raise ValueError("VLLM_HPU_MOE_EXPERT_PERM_FILE with MTP needs num_hidden_layers in the model config")
+    return layer_index >= num_layers
 
 
 def apply_file(layer, path: str) -> None:
@@ -118,8 +147,10 @@ def apply_file(layer, path: str) -> None:
         raise ValueError("VLLM_HPU_MOE_EXPERT_PERM_FILE does not work with enable_ep_weight_filter")
     model_config = vllm_config.model_config
     hf_config = getattr(model_config, "hf_text_config", None) or model_config.hf_config
-    perms = load(path, layer.global_num_experts, moe_layer_indices(hf_config))
     index = decoder_layer_index(layer.layer_name)
+    if is_drafter_layer(index, hf_config, getattr(vllm_config, "speculative_config", None)):
+        return
+    perms = load(path, layer.global_num_experts, moe_layer_indices(hf_config))
     if index not in perms:
         raise ValueError(f"{path}: no permutation for decoder layer {index} ({layer.layer_name})")
     apply_to_layer(layer, perms[index])
