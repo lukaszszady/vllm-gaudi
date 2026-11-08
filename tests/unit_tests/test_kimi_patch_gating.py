@@ -645,6 +645,28 @@ def test_linear_model_forward_wrapper_works_without_step(arch_modules):
     assert model.forward(torch.arange(2), torch.arange(2)) == "hidden"
 
 
+@pytest.mark.parametrize("value,expected", [("256", 256), ("", 0), ("0", 0)])
+def test_k3_arch_patch_sets_the_attn_res_bmm_threshold_from_the_env(arch_modules, monkeypatch, value, expected):
+    import vllm_gaudi.ops.hpu_kda_pytorch as kda
+    monkeypatch.setattr(kda, "_ATTN_RES_BMM_MIN_TOKENS", 7)
+    monkeypatch.setenv("HPU_KIMI_ATTN_RES_BMM", value)
+    arch_modules._patch_kimi_k3_arch()
+    assert expected == kda._ATTN_RES_BMM_MIN_TOKENS
+
+
+@pytest.mark.parametrize("value", ["on", "-1", "1.5"])
+def test_k3_arch_patch_warns_on_a_bad_attn_res_bmm_value_and_keeps_the_threshold(arch_modules, monkeypatch, caplog,
+                                                                                 value):
+    import logging
+    import vllm_gaudi.ops.hpu_kda_pytorch as kda
+    monkeypatch.setattr(kda, "_ATTN_RES_BMM_MIN_TOKENS", 0)
+    monkeypatch.setenv("HPU_KIMI_ATTN_RES_BMM", value)
+    with caplog.at_level(logging.WARNING, logger="vllm"):
+        arch_modules._patch_kimi_k3_arch()
+    assert kda._ATTN_RES_BMM_MIN_TOKENS == 0
+    assert any("HPU_KIMI_ATTN_RES_BMM" in r.getMessage() for r in caplog.records)
+
+
 def test_apply_attn_res_replacement_accepts_quant_key_none_and_rejects_a_quant_key(arch_modules):
     arch_modules._patch_kimi_attn_res()
     apply_attn_res = arch_modules.test_linear._apply_attn_res

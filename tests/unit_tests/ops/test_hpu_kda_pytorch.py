@@ -2274,8 +2274,44 @@ def test_attn_res_bank_mix_matches_the_fp32_sum(dtype, num_blocks):
     if dtype == torch.float32:
         torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
     else:
-        # the weights keep ~16 bits; the sum is rounded to bf16 once
-        assert ((out.double() - ref).abs() <= 2**-8 * ref.abs() + 1e-5 * ref.abs().amax()).all()
+        assert _within_one_bf16_rounding(out, probs, bank, ref)
+
+
+def _within_one_bf16_rounding(out, probs, bank, ref):
+    # one rounding of the sum plus a weight error far below the bf16 weights' own
+    magnitude = (probs.double().unsqueeze(-1) * bank.double().abs()).sum(dim=1)
+    return bool(((out.double() - ref).abs() <= 2**-8 * ref.abs() + 2**-14 * magnitude).all())
+
+
+def _bank_mix_without_lo(probs, bank):
+    return torch.bmm(probs.to(bank.dtype).unsqueeze(1), bank)[:, 0].float()
+
+
+@pytest.mark.parametrize("num_blocks", [2, 7, 12])
+def test_attn_res_bank_mix_low_weight_part_is_needed(num_blocks):
+    g = torch.Generator().manual_seed(520 + num_blocks)
+    probs = torch.softmax(torch.randn(64, num_blocks, generator=g) * 4, dim=-1)
+    bank = (torch.randn(64, num_blocks, 512, generator=g) * 3).bfloat16()
+    ref = (probs.double().unsqueeze(-1) * bank.double()).sum(dim=1)
+    assert _within_one_bf16_rounding(kda.attn_res_bank_mix(probs, bank), probs, bank, ref)
+    assert not _within_one_bf16_rounding(_bank_mix_without_lo(probs, bank), probs, bank, ref)
+
+
+@pytest.mark.parametrize("num_blocks", [2, 7, 12])
+def test_attn_res_bank_mix_is_exact_when_the_bmm_rows_are_exact(num_blocks):
+    # one power-of-two entry per (token, dim): both bmm rows are exact in bf16, only hi + lo approximates the weight
+    g = torch.Generator().manual_seed(540 + num_blocks)
+    probs = torch.softmax(torch.randn(64, num_blocks, generator=g) * 4, dim=-1)
+    which = torch.randint(0, num_blocks, (64, 1, 512), generator=g)
+    value = 2.0**torch.randint(-4, 5, (64, 1, 512), generator=g) * torch.randn(64, 1, 512, generator=g).sign()
+    bank = torch.zeros(64, num_blocks, 512).scatter_(1, which, value).bfloat16()
+    ref = (probs.double().unsqueeze(-1) * bank.double()).sum(dim=1)
+
+    def rel_err(out):
+        return ((out.double() - ref).abs() / ref.abs()).max().item()
+
+    assert rel_err(kda.attn_res_bank_mix(probs, bank)) <= 2**-14
+    assert rel_err(_bank_mix_without_lo(probs, bank)) > 2**-12
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

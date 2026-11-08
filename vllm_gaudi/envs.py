@@ -143,7 +143,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "HPU_KIMI_ATTN_RES_RSTD_CACHE":
     lambda: os.environ.get("HPU_KIMI_ATTN_RES_RSTD_CACHE", "1").strip().lower() in ("1", "true"),
 
-    # Kimi-K3 attn_res: mix the stored blocks with a bmm in calls with at least this many tokens ("0" = never)
+    # Kimi-K3 attn_res: mix the stored blocks with a bmm in calls with at least this many tokens ("0" = never);
+    # the count is the whole batch of the call (all sequences), not per sequence
     "HPU_KIMI_ATTN_RES_BMM":
     lambda: os.environ.get("HPU_KIMI_ATTN_RES_BMM", "0"),
 
