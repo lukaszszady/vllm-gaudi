@@ -1794,8 +1794,8 @@ def _attn_res_fp32_mix(prefix, delta, blocks, norm_weight, qk_weight, output_nor
 @pytest.mark.parametrize("output_norm", [True, False])
 def test_attn_res_functional_matches_the_fp32_mix_at_model_like_sizes(dtype, num_blocks, block_write_idx, has_delta,
                                                                       output_norm):
-    """Bank read in its own dtype + bmm vs the old fp32 copy: equal in fp32, within bf16 rounding in bf16 (Kimi-K3:
-    up to 12 stored blocks + the prefix, logits large enough for a peaked softmax)."""
+    """Bank read in its own dtype, fp32 weighted sum vs the old fp32 copy: equal in fp32, one bf16 rounding in bf16
+    (Kimi-K3: up to 12 stored blocks + the prefix, logits large enough for a peaked softmax)."""
     g = torch.Generator().manual_seed(300 + num_blocks)
     tokens, hidden, bank = 64, 512, 13
     prefix = (torch.randn(tokens, hidden, generator=g) * 3).to(dtype)
@@ -1810,10 +1810,9 @@ def test_attn_res_functional_matches_the_fp32_mix_at_model_like_sizes(dtype, num
     if dtype == torch.float32:
         torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
     else:
-        # the old version rounds the fp32 mix once; the new one also rounds weights and weighted sum to bf16
+        # both round the fp32 mix to bf16 once
         scale = ref.abs().amax(dim=-1, keepdim=True)
-        assert ((out.float() - ref).abs() <= 2e-2 * ref.abs() + 1e-2 * scale).all()
-        assert (out.float() - ref).abs().mean() <= 4e-3 * ref.abs().mean()
+        assert ((out.float() - ref).abs() <= 8e-3 * ref.abs() + 1e-4 * scale).all()
 
 
 @pytest.mark.parametrize("has_delta", [True, False])

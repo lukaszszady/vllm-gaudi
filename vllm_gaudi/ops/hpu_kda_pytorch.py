@@ -703,11 +703,11 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
                         output_norm_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Out-of-place ``attn_res``: returns ``(new_prefix, new_blocks, mixed)``, no input is modified.
 
-    Same numbers as the Triton kernel up to the rounding of the softmax weights of the stored blocks and of their
-    weighted sum to the bank dtype (see ``attn_res_torch``, which adds its in-place side effects). Needed in
-    torch.compile mode, where regional compilation makes the prefix and the block bank graph inputs and HPU
-    compile can silently drop in-place writes to them. ``new_prefix`` is ``prefix`` itself without a delta and
-    ``new_blocks`` is ``blocks`` itself without a block write (no copy in those cases). All shapes are static.
+    Same numbers as the Triton kernel up to fp32 reduction order (see ``attn_res_torch``, which adds its in-place
+    side effects). Needed in torch.compile mode, where regional compilation makes the prefix and the block bank
+    graph inputs and HPU compile can silently drop in-place writes to them. ``new_prefix`` is ``prefix`` itself
+    without a delta and ``new_blocks`` is ``blocks`` itself without a block write (no copy in those cases). All
+    shapes are static.
     """
     new_prefix, new_blocks, _, mixed = attn_res_functional_cached(prefix, delta, blocks, None, norm_weight, qk_weight,
                                                                   output_norm_weight, num_blocks, block_write_idx, eps,
@@ -772,8 +772,11 @@ def attn_res_functional_cached(
         own_rstd = torch.rsqrt(own_ms + eps)  # [M, 1]
         own_logit = (updated * qk).sum(dim=-1, keepdim=True) * own_rstd
         probs = torch.softmax(torch.cat((bank_logits, own_logit), dim=-1), dim=-1)  # [M, S + 1]
-        bank_probs = probs[:, :num_blocks].to(bank.dtype).unsqueeze(1)  # [M, 1, S]
-        mixed = torch.bmm(bank_probs, bank).squeeze(1).float() + probs[:, num_blocks:] * updated
+        # fp32 weighted sum over the stored blocks as elementwise ops (no M=1 bmm), in the kernel's order
+        mixed = probs[:, :1] * bank[:, 0].float()
+        for r in range(1, num_blocks):
+            mixed = mixed + probs[:, r:r + 1] * bank[:, r].float()
+        mixed = mixed + probs[:, num_blocks:] * updated
     if output_norm_weight is not None:
         mixed = mixed * torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps)
         mixed = mixed * output_norm_weight.float()
