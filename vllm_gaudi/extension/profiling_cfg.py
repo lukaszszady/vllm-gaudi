@@ -284,3 +284,102 @@ def make_trace_handler(output_dir: str, rank: int, use_gzip: bool = True, copy_d
                 _logger.warning("Cannot copy the profiler trace on rank %d (%s) to %s: %r", rank, tag, copy_dir, exc)
 
     return handler
+
+
+def forward_traces_to_rank0(group,
+                            copy_dir: str | None = None,
+                            host: str | None = None,
+                            chunk_bytes: int = COPY_PART_BYTES,
+                            dist=None) -> list[str]:
+    """Send the last trace of every rank on another host than rank 0 to rank 0 over ``group`` (gloo), where
+    it is written with ``copy_trace_parts`` into rank 0's ``copy_dir`` (default VLLM_PROFILE_COPY_DIR).
+
+    Collective: every rank of ``group`` must call it, also ranks without a trace. Metadata is gathered first, so
+    all ranks derive the same transfer plan; files go in ``chunk_bytes`` pieces. Failures are logged, never
+    raised. Returns the parts written on rank 0.
+    """
+    import socket
+
+    import torch
+    dist = torch.distributed if dist is None else dist
+    copy_dir = profile_copy_dir() if copy_dir is None else copy_dir
+    host = socket.gethostname() if host is None else host
+    rank = dist.get_rank()
+    tag = rank_tag(rank)
+    path = WRITTEN_TRACES[-1] if WRITTEN_TRACES else None
+    size = 0
+    with contextlib.suppress(OSError):
+        size = os.path.getsize(path) if path else 0
+    meta: list = [None] * dist.get_world_size(group)
+    try:
+        dist.all_gather_object(meta, (rank, host, size, bool(copy_dir)), group=group)
+    except Exception as exc:
+        _logger.warning("Cannot gather profiler trace metadata on rank %d (%s): %r", rank, tag, exc)
+        return []
+    root = next((m for m in meta if m[0] == 0), None)
+    if root is None or not root[3]:
+        return []
+    senders = [(r, s) for r, h, s, _ in meta if r != 0 and h != root[1] and s > 0]
+    written: list[str] = []
+    for src, total in senders:
+        if rank not in (0, src):
+            continue
+        sizes = [min(chunk_bytes, total - off) for off in range(0, total, chunk_bytes)]
+        try:
+            if rank == src:
+                _send_trace(dist, group, path, sizes)
+                _logger.warning("Profiler trace sent to rank 0 from rank %d (%s): %d bytes", rank, tag, total)
+            else:
+                parts = _recv_trace(dist, group, src, sizes, copy_dir)
+                written += parts
+                _logger.warning("Profiler trace of rank %d (%s) copied on rank 0: %s", src, rank_tag(src),
+                                ", ".join(parts))
+        except Exception as exc:
+            _logger.warning("Cannot forward the profiler trace of rank %d (%s) to rank 0: %r", src, rank_tag(src), exc)
+    return written
+
+
+def _send_trace(dist, group, path: str, sizes: list[int]) -> None:
+    import torch
+    src = None
+    with contextlib.suppress(OSError):
+        src = open(path, "rb")  # noqa: SIM115
+    try:
+        for n in sizes:
+            buf = bytearray(n)
+            if src is not None:
+                src.readinto(buf)  # a short read leaves zeros; the chunk count must match the receiver's
+            dist.send(torch.frombuffer(buf, dtype=torch.uint8), dst=0, group=group)
+    finally:
+        if src is not None:
+            src.close()
+
+
+def _recv_trace(dist, group, src: int, sizes: list[int], copy_dir: str) -> list[str]:
+    import torch
+    recv_dir = os.path.join(copy_dir, "recv")
+    tmp = os.path.join(recv_dir, f"{src}_recv.pt.trace.json.gz")
+    dst = None
+    error = None
+    try:
+        os.makedirs(recv_dir, exist_ok=True)
+        dst = open(tmp, "wb")  # noqa: SIM115
+    except OSError as exc:
+        error = exc
+    try:
+        for n in sizes:
+            buf = torch.empty(n, dtype=torch.uint8)
+            dist.recv(buf, src=src, group=group)
+            if dst is not None:
+                dst.write(buf.numpy().tobytes())
+    finally:
+        if dst is not None:
+            dst.close()
+    try:
+        if error is not None:
+            raise error
+        return copy_trace_parts(tmp, copy_dir, src)
+    finally:
+        _remove_if_exists(tmp)
+        with contextlib.suppress(OSError):
+            os.rmdir(recv_dir)

@@ -38,10 +38,10 @@ from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cach
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemoryProfiler, HabanaProfilerCounterHelper,
                                            format_bytes, setup_profiler)
-from vllm_gaudi.extension.profiling_cfg import (ScatteredBlockAllocator, bucketing_max_batched_tokens, hold_before_exit,
-                                                pad_owner_block, profile_blocks_scattered, profile_exit_delay_s,
-                                                profile_sampling_kwargs, profiling_max_batched_tokens,
-                                                profiling_max_reqs, rank_tag)
+from vllm_gaudi.extension.profiling_cfg import (ScatteredBlockAllocator, bucketing_max_batched_tokens,
+                                                forward_traces_to_rank0, hold_before_exit, pad_owner_block,
+                                                profile_blocks_scattered, profile_exit_delay_s, profile_sampling_kwargs,
+                                                profiling_max_batched_tokens, profiling_max_reqs, rank_tag)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
 from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
@@ -6100,6 +6100,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             profiler = self._profiler_call(profiler, "step", rank)
         self._profiler_call(profiler, "stop", rank)
         self._barrier_after_profiling(rank)
+        self._forward_traces_after_profiling()
         # Same delay on every rank (VLLM_PROFILE_EXIT_DELAY_S, default 0) so the traces can be copied off the pod.
         hold_before_exit(profile_exit_delay_s())
 
@@ -6148,6 +6149,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logger.warning("Barrier after profiling passed on rank %d (%s)", rank, tag)
         except Exception as exc:
             logger.warning("Barrier after profiling failed on rank %d (%s): %r", rank, tag, exc)
+
+    @staticmethod
+    def _forward_traces_after_profiling() -> None:
+        """Copy the traces of ranks on other nodes into rank 0's VLLM_PROFILE_COPY_DIR (collective, gloo)."""
+        if not (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1):
+            return
+        forward_traces_to_rank0(get_world_group().cpu_group)
 
     @staticmethod
     def _profiler_call(profiler, method: str, rank: int):
