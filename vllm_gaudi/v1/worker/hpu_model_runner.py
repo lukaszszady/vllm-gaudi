@@ -44,6 +44,7 @@ from vllm_gaudi.extension.profiling_cfg import (ScatteredBlockAllocator, bucketi
                                                 profiling_max_reqs, rank_tag)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
+from vllm_gaudi.extension import moe_load_stats
 from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
@@ -4436,6 +4437,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # For D case, wait until kv finish load here
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
+        if not warmup_mode and getattr(self, "moe_load_stats", None) is not None:
+            self.moe_load_stats.on_step()
+
         if self.is_pooling_model:
             # 1. padding input_ids and positions 2. fill attn_metadata
             prefillInputData_list = self._prepare_inputs_for_pooling(scheduler_output)
@@ -5224,6 +5228,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             get_target_layer_suffix_list(model_config.model_type if model_config is not None else None),
                             hidden_layer_markstep_interval)
         torch.hpu.synchronize()
+        self.moe_load_stats = moe_load_stats.MoELoadStats.from_env()
+        if self.moe_load_stats is not None:
+            self.moe_load_stats.attach(self.model, self.device)
         if self.is_pooling_model:
             self.set_causal_option(self.model)
 
@@ -6704,6 +6711,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                f"allocated {format_bytes(end_mem - start_mem)} of device memory")
         logger.info(msg)
         self.profiler.end()
+        if getattr(self, "moe_load_stats", None) is not None:
+            self.moe_load_stats.reset()
 
         if not (self.num_mamba_like_layers or self.is_pooling_model) \
              and max_bucket > self.input_batch.max_num_reqs:

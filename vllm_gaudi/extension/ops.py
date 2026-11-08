@@ -13,6 +13,7 @@ import habana_frameworks.torch.core as htcore
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.extension.utils import FP8Matmul, get_kv_fetch_extra_args
 from vllm_gaudi.extension.scales import ConvertScaleToHwAligned
+from vllm_gaudi.extension import moe_load_stats
 import vllm.model_executor.layers.quantization as vllm_quant
 import habana_frameworks.torch.utils.experimental as htexp
 import types
@@ -1936,6 +1937,9 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
     The forward() method is decorated accordingly.
     """
 
+    # device accumulator set by moe_load_stats when VLLM_HPU_MOE_LOAD_STATS=1
+    _load_stats = None
+
     def __init__(self,
                  global_num_experts: int,
                  num_total_experts: int,
@@ -2022,6 +2026,10 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
         # expert_routing_table must be int32 for the mxfp4 op
         if expert_routing_table.dtype != torch.int32:
             expert_routing_table = expert_routing_table.to(torch.int32)
+
+        if self._load_stats is not None:
+            moe_load_stats.accumulate(self._load_stats, expert_routing_table, self.global_num_experts, self.num_experts,
+                                      chunk_size)
 
         compiled_fwd = self._get_compiled_forward()
         if self.has_bias:

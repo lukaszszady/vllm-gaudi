@@ -172,3 +172,24 @@ def test_first_moe_op_per_process_logs_in_graph_call_once(ops, caplog):
             ] == ["VllmMixtureOfExpertsOpMXFP4 built (first layer in this process): in_graph_call=True"]
     # vLLM installs handlers on the "vllm" logger tree only; anything else never reaches server.log
     assert records[0].name.startswith("vllm.")
+
+
+def test_load_stats_buffer_is_updated_in_graph_without_recompiles(ops):
+    from vllm_gaudi.extension import moe_load_stats
+
+    layers = [_Layer(_make_moe_op(ops, in_graph_call=True)) for _ in range(3)]
+    for layer in layers:
+        layer.moe_op._load_stats = moe_load_stats.new_buffer(1, "cpu")
+    counter = CompileCounter()
+    compiled = [torch.compile(layer, backend=counter, fullgraph=True) for layer in layers]
+
+    for _ in range(2):
+        for layer in compiled:
+            layer(*_inputs())
+
+    assert not dynamo.utils.counters["graph_break"]
+    assert counter.frame_count == 1
+    for layer in layers:
+        # 3 tokens x top-2 on expert 0, twice: rows, active experts, chunks (= experts without chunking), forwards
+        assert layer.moe_op._load_stats[0, 0, :3].tolist() == [12.0, 2.0, 2.0]
+        assert layer.moe_op._load_stats[0, 0, -1] == 2
