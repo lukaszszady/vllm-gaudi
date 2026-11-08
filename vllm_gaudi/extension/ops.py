@@ -1939,6 +1939,7 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
 
     # device accumulator set by moe_load_stats when VLLM_HPU_MOE_LOAD_STATS=1
     _load_stats = None
+    _expert_stats = None
 
     def __init__(self,
                  global_num_experts: int,
@@ -2029,7 +2030,7 @@ class VllmMixtureOfExpertsOpMXFP4(VllmMixtureOfExpertsOpBase):
 
         if self._load_stats is not None:
             moe_load_stats.accumulate(self._load_stats, expert_routing_table, self.global_num_experts, self.num_experts,
-                                      chunk_size)
+                                      chunk_size, self._expert_stats)
 
         compiled_fwd = self._get_compiled_forward()
         if self.has_bias:

@@ -5,11 +5,13 @@ Every rank sees the full routing table of the batch, so each MoE forward counts,
 token rows routed to its local experts, its active experts, its expert chunks (sum of ceil(rows / chunk_size)
 per active expert) and its largest expert. The counts are accumulated on device per token-count bucket
 (sum, sum of squares, max) and copied to the host every VLLM_HPU_MOE_LOAD_STATS_INTERVAL model steps. Rank 0
-logs a short summary per copy and rewrites VLLM_HPU_MOE_LOAD_STATS_FILE with the cumulative per-layer table.
+logs a short summary per copy and rewrites VLLM_HPU_MOE_LOAD_STATS_FILE with the cumulative per-layer table and
+VLLM_HPU_MOE_EXPERT_STATS_FILE (default moe_expert_stats.log next to the former) with per-expert totals as JSON lines.
 All ranks accumulate and copy, so the extra device work and syncs are the same on every rank.
 """
 
 import atexit
+import json
 import logging
 import math
 import os
@@ -24,6 +26,8 @@ TOKEN_BUCKETS = (1, 17, 65, 257, 1025, 2049, 4097, 8193)
 FEATURES = ("rows", "experts", "chunks", "max_rows")
 # per-forward columns after the per-rank features
 _CHUNKS_MAX, _CHUNKS_SPREAD, _COUNT = 0, 1, 2
+# per global expert, summed over forwards
+EXPERT_FEATURES = ("rows", "active", "chunks", "rows_sq")
 
 
 def enabled() -> bool:
@@ -39,22 +43,33 @@ def new_buffer(ep_size: int, device) -> torch.Tensor:
     return torch.zeros(3, len(TOKEN_BUCKETS), num_columns(ep_size), dtype=torch.float32, device=device)
 
 
+def new_expert_buffer(global_num_experts: int, device) -> torch.Tensor:
+    """[expert feature, token bucket, global expert] accumulator of one MoE layer."""
+    return torch.zeros(len(EXPERT_FEATURES), len(TOKEN_BUCKETS), global_num_experts, dtype=torch.float32, device=device)
+
+
 def bucket_label(i: int) -> str:
     if i + 1 < len(TOKEN_BUCKETS):
         return f"{TOKEN_BUCKETS[i]}-{TOKEN_BUCKETS[i + 1] - 1}"
     return f">={TOKEN_BUCKETS[i]}"
 
 
-def accumulate(buf: torch.Tensor, routing_table: torch.Tensor, global_num_experts: int, local_num_experts: int,
-               chunk_size: int) -> None:
+def accumulate(buf: torch.Tensor,
+               routing_table: torch.Tensor,
+               global_num_experts: int,
+               local_num_experts: int,
+               chunk_size: int,
+               expert_buf: Optional[torch.Tensor] = None) -> None:
     """Add the EP load of one forward (routing_table [tokens, top_k] of global expert ids) to buf in place."""
     ids = routing_table.reshape(-1).long()
     valid = (ids >= 0) & (ids < global_num_experts)
     counts = torch.zeros(global_num_experts, dtype=torch.float32, device=ids.device)
     counts = counts.scatter_add(0, torch.where(valid, ids, torch.zeros_like(ids)), valid.float())
+    active = (counts > 0).float()
+    expert_chunks = torch.ceil(counts / chunk_size) if chunk_size > 0 else active
     per_rank = counts.view(-1, local_num_experts)
-    experts = (per_rank > 0).float().sum(1)
-    chunks = torch.ceil(per_rank / chunk_size).sum(1) if chunk_size > 0 else experts
+    experts = active.view(-1, local_num_experts).sum(1)
+    chunks = expert_chunks.view(-1, local_num_experts).sum(1)
     chunks_max = chunks.amax()
     tokens = torch.ones_like(routing_table[:, 0], dtype=torch.float32).sum()
     lower = torch.tensor(TOKEN_BUCKETS, dtype=torch.float32, device=ids.device)
@@ -68,6 +83,9 @@ def accumulate(buf: torch.Tensor, routing_table: torch.Tensor, global_num_expert
     ])
     v = in_bucket * v
     buf.copy_(torch.stack([buf[0] + v, buf[1] + v * v, torch.maximum(buf[2], v)]))
+    if expert_buf is not None:
+        ev = torch.stack([counts, active, expert_chunks, counts * counts])
+        expert_buf.copy_(expert_buf + in_bucket.view(1, -1, 1) * ev.unsqueeze(1))
 
 
 def _rank() -> int:
@@ -85,9 +103,14 @@ def _in_words(n: int) -> str:
 class MoELoadStats:
     """Owns the device accumulators of all MXFP4 MoE ops of a model and their host-side totals."""
 
-    def __init__(self, interval: int, path: Optional[str], rank: Optional[int] = None):
+    def __init__(self,
+                 interval: int,
+                 path: Optional[str],
+                 rank: Optional[int] = None,
+                 expert_path: Optional[str] = None):
         self.interval = max(1, interval)
         self.path = path
+        self.expert_path = expert_path
         self.rank = _rank() if rank is None else rank
         self.ops: list = []
         self.steps = 0
@@ -95,6 +118,7 @@ class MoELoadStats:
         self.ep_size = 0
         self.local_num_experts = 0
         self.total = None
+        self.expert_total = None
 
     @classmethod
     def from_env(cls) -> Optional["MoELoadStats"]:
@@ -102,21 +126,28 @@ class MoELoadStats:
             return None
         interval = int(os.environ.get("VLLM_HPU_MOE_LOAD_STATS_INTERVAL", "100"))
         path = os.environ.get("VLLM_HPU_MOE_LOAD_STATS_FILE") or None
-        return cls(interval, path)
+        expert_path = os.environ.get("VLLM_HPU_MOE_EXPERT_STATS_FILE") or None
+        if expert_path is None and path is not None:
+            expert_path = os.path.join(os.path.dirname(path), "moe_expert_stats.log")
+        return cls(interval, path, expert_path=expert_path)
 
     def attach(self, model: torch.nn.Module, device, op_types=None) -> int:
         if op_types is None:
             from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpMXFP4
             op_types = (VllmMixtureOfExpertsOpMXFP4, )
+        seen = {id(op) for _, op in self.ops}
         for name, module in model.named_modules():
             op = getattr(module, "moe_op", None)
-            if not isinstance(op, op_types) or op.global_num_experts % op.num_experts:
+            # the same op can be reachable from several modules
+            if not isinstance(op, op_types) or op.global_num_experts % op.num_experts or id(op) in seen:
                 continue
             ep_size = op.global_num_experts // op.num_experts
             if self.ops and (ep_size, op.num_experts) != (self.ep_size, self.local_num_experts):
                 continue
             self.ep_size, self.local_num_experts = ep_size, op.num_experts
             op._load_stats = new_buffer(ep_size, device)
+            op._expert_stats = new_expert_buffer(op.global_num_experts, device)
+            seen.add(id(op))
             self.ops.append((name, op))
         if self.ops:
             self.total = torch.zeros(3,
@@ -124,6 +155,11 @@ class MoELoadStats:
                                      len(TOKEN_BUCKETS),
                                      num_columns(self.ep_size),
                                      dtype=torch.float64)
+            self.expert_total = torch.zeros(len(self.ops),
+                                            len(EXPERT_FEATURES),
+                                            len(TOKEN_BUCKETS),
+                                            self.ep_size * self.local_num_experts,
+                                            dtype=torch.float64)
             if self.rank == 0:
                 atexit.register(self.flush)
         logger.info("MoE load stats on %d layers, %d EP ranks x %d local experts, copy every %d steps, file %s",
@@ -133,8 +169,9 @@ class MoELoadStats:
     def reset(self) -> None:
         if not self.ops:
             return
-        torch._foreach_zero_([op._load_stats for _, op in self.ops])
+        torch._foreach_zero_(self._buffers())
         self.total.zero_()
+        self.expert_total.zero_()
         self.steps = 0
 
     def on_step(self) -> None:
@@ -145,10 +182,18 @@ class MoELoadStats:
             self.collect()
             self.emit()
 
+    def _buffers(self) -> list:
+        return [op._load_stats for _, op in self.ops] + [op._expert_stats for _, op in self.ops]
+
     def collect(self) -> None:
-        bufs = [op._load_stats for _, op in self.ops]
-        host = torch.stack(bufs).to("cpu", torch.float64).transpose(0, 1)
+        n = len(self.ops)
+        bufs = self._buffers()
+        # one device-to-host copy for all accumulators
+        flat = torch.cat([b.reshape(-1) for b in bufs]).to("cpu", torch.float64)
         torch._foreach_zero_(bufs)
+        layer_size = bufs[0].numel()
+        host = flat[:n * layer_size].view(n, *bufs[0].shape).transpose(0, 1)
+        self.expert_total += flat[n * layer_size:].view(n, *bufs[n].shape)
         self.total[0] += host[0]
         self.total[1] += host[1]
         torch.maximum(self.total[2], host[2], out=self.total[2])
@@ -169,6 +214,35 @@ class MoELoadStats:
         if self.path:
             with open(self.path, "w") as f:
                 f.write("\n".join(self.report_lines()) + "\n")
+        if self.expert_path:
+            tmp = self.expert_path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("\n".join(self.expert_lines()) + "\n")
+            os.replace(tmp, self.expert_path)
+
+    def expert_lines(self) -> list:
+        """JSON lines: a header, then one record per (layer, token bucket) with forwards."""
+        lines = [
+            json.dumps({
+                "steps": self.steps,
+                "copies": self.copies,
+                "ep_size": self.ep_size,
+                "local_num_experts": self.local_num_experts,
+                "buckets": [bucket_label(b) for b in range(len(TOKEN_BUCKETS))],
+                "features": list(EXPERT_FEATURES),
+                "layers": [name for name, _ in self.ops],
+            })
+        ]
+        counts = self.total[0, :, :, self._extra(_COUNT)]
+        for li in range(len(self.ops)):
+            for b in range(len(TOKEN_BUCKETS)):
+                if counts[li, b] == 0:
+                    continue
+                rec = {"layer": li, "bucket": bucket_label(b), "forwards": int(counts[li, b])}
+                for fi, f in enumerate(EXPERT_FEATURES):
+                    rec[f] = [int(v) for v in self.expert_total[li, fi, b].round().tolist()]
+                lines.append(json.dumps(rec, separators=(",", ":")))
+        return lines
 
     # host-side views of the totals
     def _col(self, feature: str, rank: int) -> int:
