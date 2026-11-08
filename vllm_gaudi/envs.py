@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     HPU_KIMI_KDA_SCAN_BLOCK: str = "8"
     VLLM_HPU_TWO_STAGE_TOPK: bool = True
+    VLLM_HPU_MOE_EXPERT_PERM_FILE: str = ""
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -149,6 +150,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Grouped top-k router: top-k of wide expert rows (>= 512 experts) as a top-k per 128 experts, then over the winners
     "VLLM_HPU_TWO_STAGE_TOPK":
     lambda: os.environ.get("VLLM_HPU_TWO_STAGE_TOPK", "1").strip().lower() in ("1", "true"),
+
+    # JSON file with a static per-layer permutation of the global expert ids of the MXFP4 routed experts:
+    # expert e of a layer is stored in physical slot perm[e] and routed there ("" off)
+    "VLLM_HPU_MOE_EXPERT_PERM_FILE":
+    lambda: os.environ.get("VLLM_HPU_MOE_EXPERT_PERM_FILE", ""),
 }
 
 # end-env-vars-definition

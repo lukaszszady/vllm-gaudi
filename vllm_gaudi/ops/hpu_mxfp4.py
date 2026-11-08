@@ -234,6 +234,12 @@ class HPUKimiK3Mxfp4MoEMethod(Mxfp4MoEMethod):
             moe_parallel_config=moe_parallel_config,
         )
 
+    def create_weights(self, layer, *args, **kwargs):
+        if gaudi_envs.VLLM_HPU_MOE_EXPERT_PERM_FILE:
+            from vllm_gaudi.extension.moe_expert_perm import apply_file
+            apply_file(layer, gaudi_envs.VLLM_HPU_MOE_EXPERT_PERM_FILE)
+        return super().create_weights(layer, *args, **kwargs)
+
     def process_weights_after_loading(self, layer) -> None:
         # only the module that owns the expert weights, once
         params = vars(layer).get("_parameters")
