@@ -722,6 +722,40 @@ def attn_res_bank_mean_square(blocks: torch.Tensor, num_valid_blocks: int) -> to
     return torch.cat((valid, valid.new_zeros(num_tokens, num_bank - num_valid_blocks)), dim=1)
 
 
+# attn_res calls with at least this many tokens mix the stored blocks with attn_res_bank_mix (0 = never)
+_ATTN_RES_BMM_MIN_TOKENS = 0
+
+
+def parse_attn_res_bmm(value: str) -> int:
+    """Parse HPU_KIMI_ATTN_RES_BMM (empty or 0 = off, N = bmm mix for calls with at least N tokens)."""
+    value = value.strip()
+    if not value:
+        return 0
+    if not value.isdigit():
+        raise ValueError(f"HPU_KIMI_ATTN_RES_BMM must be a non-negative integer, got {value!r}")
+    return int(value)
+
+
+def set_attn_res_bmm_min_tokens(min_tokens: int) -> None:
+    """Set the token count from which ``attn_res_functional_cached`` uses ``attn_res_bank_mix`` (0 = never)."""
+    global _ATTN_RES_BMM_MIN_TOKENS
+    if min_tokens < 0:
+        raise ValueError(f"min_tokens must be non-negative, got {min_tokens}")
+    _ATTN_RES_BMM_MIN_TOKENS = min_tokens
+
+
+def attn_res_bank_mix(probs: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
+    """fp32 ``sum_r probs[:, r] * bank[:, r]`` for fp32 ``probs`` [M, S] and ``bank`` [M, S, D], as one bmm.
+
+    The bank is read in its own dtype. The weights enter as a high and a low part in the bank dtype (two rows per
+    token), so only the weighted sum itself is rounded to the bank dtype.
+    """
+    hi = probs.to(bank.dtype)
+    lo = (probs - hi.float()).to(bank.dtype)
+    out = torch.bmm(torch.stack((hi, lo), dim=1), bank)  # [M, 2, D]
+    return out[:, 0].float() + out[:, 1].float()
+
+
 def attn_res_functional_cached(
         prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor, bank_ms: torch.Tensor | None,
         norm_weight: torch.Tensor, qk_weight: torch.Tensor, output_norm_weight: torch.Tensor | None, num_blocks: int,
@@ -772,11 +806,14 @@ def attn_res_functional_cached(
         own_rstd = torch.rsqrt(own_ms + eps)  # [M, 1]
         own_logit = (updated * qk).sum(dim=-1, keepdim=True) * own_rstd
         probs = torch.softmax(torch.cat((bank_logits, own_logit), dim=-1), dim=-1)  # [M, S + 1]
-        # fp32 weighted sum over the stored blocks as elementwise ops (no M=1 bmm), in the kernel's order
-        mixed = probs[:, :1] * bank[:, 0].float()
-        for r in range(1, num_blocks):
-            mixed = mixed + probs[:, r:r + 1] * bank[:, r].float()
-        mixed = mixed + probs[:, num_blocks:] * updated
+        if 0 < _ATTN_RES_BMM_MIN_TOKENS <= num_tokens:
+            mixed = attn_res_bank_mix(probs[:, :num_blocks], bank) + probs[:, num_blocks:] * updated
+        else:
+            # fp32 weighted sum over the stored blocks as elementwise ops (no M=1 bmm), in the kernel's order
+            mixed = probs[:, :1] * bank[:, 0].float()
+            for r in range(1, num_blocks):
+                mixed = mixed + probs[:, r:r + 1] * bank[:, r].float()
+            mixed = mixed + probs[:, num_blocks:] * updated
     if output_norm_weight is not None:
         mixed = mixed * torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps)
         mixed = mixed * output_norm_weight.float()

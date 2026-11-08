@@ -1558,14 +1558,23 @@ def _patch_kimi_k3_arch() -> None:
         from vllm_gaudi.extension.logger import logger as _ext_logger
         import vllm_gaudi.envs as gaudi_envs
         from vllm_gaudi.ops.hpu_kda_pytorch import (KIMI_DECODER_LAYER_CLASSES, effective_intra_sub_chunk,
-                                                    install_functional_attn_res, parse_intra_sub_chunk,
-                                                    parse_prefill_settings, parse_scan_block)
+                                                    install_functional_attn_res, parse_attn_res_bmm,
+                                                    parse_intra_sub_chunk, parse_prefill_settings, parse_scan_block,
+                                                    set_attn_res_bmm_min_tokens)
         if install_functional_attn_res(_amd_linear, cache_bank_norm=gaudi_envs.HPU_KIMI_ATTN_RES_RSTD_CACHE) is None:
             _ext_logger().warning(
                 "Kimi-K3: none of %s with forward_attn_residual in %s, the in-place upstream "
                 "attn_res stays active", KIMI_DECODER_LAYER_CLASSES, _amd_linear.__name__)
         else:
             _kimi_patch_installed("functional_attn_res")
+        try:
+            attn_res_bmm = parse_attn_res_bmm(gaudi_envs.HPU_KIMI_ATTN_RES_BMM)
+        except ValueError as e:
+            _ext_logger().warning("Kimi-K3 attn_res: %s", e)
+        else:
+            set_attn_res_bmm_min_tokens(attn_res_bmm)
+            if attn_res_bmm:
+                _ext_logger().info("Kimi-K3 attn_res: bmm mix of the stored blocks from %d tokens", attn_res_bmm)
         try:
             kda_chunk, kda_vec = parse_prefill_settings(gaudi_envs.HPU_KIMI_KDA_PREFILL_CHUNK)
             kda_sub = parse_intra_sub_chunk(gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK)

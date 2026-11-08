@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_COMPACT_GDN: bool = False
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_ATTN_RES_RSTD_CACHE: bool = True
+    HPU_KIMI_ATTN_RES_BMM: str = "0"
     HPU_KIMI_MOE_FP8_LAYERS: str = ""
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     HPU_KIMI_KDA_SCAN_BLOCK: str = "8"
@@ -141,6 +142,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 attn_res: keep the mean square of each stored block next to the bank instead of recomputing it per read
     "HPU_KIMI_ATTN_RES_RSTD_CACHE":
     lambda: os.environ.get("HPU_KIMI_ATTN_RES_RSTD_CACHE", "1").strip().lower() in ("1", "true"),
+
+    # Kimi-K3 attn_res: mix the stored blocks with a bmm in calls with at least this many tokens ("0" = never)
+    "HPU_KIMI_ATTN_RES_BMM":
+    lambda: os.environ.get("HPU_KIMI_ATTN_RES_BMM", "0"),
 
     # Kimi-K3 routed experts converted at load from MXFP4 to per-row FP8 for these decoder layers
     # ("" off, "all", or "1-8,40"); needs HPU_KIMI_SITU_IMPL=silu

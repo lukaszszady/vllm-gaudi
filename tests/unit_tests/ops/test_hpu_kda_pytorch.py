@@ -2239,6 +2239,104 @@ def test_attn_res_functional_cached_compiles_to_one_graph(has_delta, num_blocks,
         dynamo.reset()
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# attn_res stored-block mix as one bmm (HPU_KIMI_ATTN_RES_BMM)
+# ---------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("value,expected", [("", 0), ("0", 0), (" 256 ", 256), ("1", 1)])
+def test_parse_attn_res_bmm(value, expected):
+    assert kda.parse_attn_res_bmm(value) == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "on", "1.5", "256,512"])
+def test_parse_attn_res_bmm_rejects_bad_values(value):
+    with pytest.raises(ValueError):
+        kda.parse_attn_res_bmm(value)
+
+
+def test_set_attn_res_bmm_min_tokens(monkeypatch):
+    monkeypatch.setattr(kda, "_ATTN_RES_BMM_MIN_TOKENS", 0)
+    kda.set_attn_res_bmm_min_tokens(256)
+    assert kda._ATTN_RES_BMM_MIN_TOKENS == 256
+    with pytest.raises(ValueError):
+        kda.set_attn_res_bmm_min_tokens(-1)
+    assert kda._ATTN_RES_BMM_MIN_TOKENS == 256
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_blocks", [1, 7, 12])
+def test_attn_res_bank_mix_matches_the_fp32_sum(dtype, num_blocks):
+    g = torch.Generator().manual_seed(500 + num_blocks)
+    probs = torch.softmax(torch.randn(64, num_blocks, generator=g) * 4, dim=-1)
+    bank = (torch.randn(64, num_blocks, 512, generator=g) * 3).to(dtype)
+    ref = (probs.double().unsqueeze(-1) * bank.double()).sum(dim=1)
+    out = kda.attn_res_bank_mix(probs, bank)
+    assert out.dtype == torch.float32
+    if dtype == torch.float32:
+        torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
+    else:
+        # the weights keep ~16 bits; the sum is rounded to bf16 once
+        assert ((out.double() - ref).abs() <= 2**-8 * ref.abs() + 1e-5 * ref.abs().amax()).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(0, -1), (1, -1), (6, 3), (7, 6), (12, -1)])
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("output_norm", [True, False])
+def test_attn_res_functional_cached_bmm_mix_matches_the_loop(monkeypatch, dtype, num_blocks, block_write_idx, has_delta,
+                                                             output_norm):
+    g = torch.Generator().manual_seed(600 + num_blocks)
+    tokens, hidden, bank = 64, 512, 13
+    prefix = (torch.randn(tokens, hidden, generator=g) * 3).to(dtype)
+    delta = torch.randn(tokens, hidden, generator=g).to(dtype) if has_delta else None
+    blocks = (torch.randn(tokens, bank, hidden, generator=g) * torch.rand(1, bank, 1, generator=g) * 4).to(dtype)
+    norm_w = torch.rand(hidden, generator=g) + 0.5
+    qk_w = torch.randn(hidden, generator=g) * 0.2
+    out_w = torch.rand(hidden, generator=g) + 0.5 if output_norm else None
+    bank_ms = kda.attn_res_bank_mean_square(blocks, bank)
+    args = (prefix, delta, blocks, bank_ms, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+
+    monkeypatch.setattr(kda, "_ATTN_RES_BMM_MIN_TOKENS", 0)
+    loop = kda.attn_res_functional_cached(*args)
+    monkeypatch.setattr(kda, "_ATTN_RES_BMM_MIN_TOKENS", tokens + 1)
+    below = kda.attn_res_functional_cached(*args)
+    monkeypatch.setattr(kda, "_ATTN_RES_BMM_MIN_TOKENS", tokens)
+    mixed = kda.attn_res_functional_cached(*args)
+
+    assert all(torch.equal(a, b) for a, b in zip(below, loop))
+    assert all(torch.equal(a, b) for a, b in zip(mixed[:3], loop[:3]))
+    out = mixed[3]
+    if dtype == torch.float32:
+        torch.testing.assert_close(out, loop[3], rtol=1e-5, atol=1e-5)
+    else:
+        ref = _attn_res_fp32_mix(prefix, delta, blocks, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+        # the bank part of the mix is rounded to bf16 once more than in the loop
+        scale = ref.abs().amax(dim=-1, keepdim=True)
+        assert ((out.float() - ref).abs() <= 1.2e-2 * ref.abs() + 2e-3 * scale).all()
+
+
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(1, -1), (3, -1), (3, 2)])
+def test_attn_res_functional_cached_bmm_mix_compiles_to_one_graph(monkeypatch, has_delta, num_blocks, block_write_idx):
+    import torch._dynamo as dynamo
+    prefix, delta, blocks, norm_w, qk_w, out_w = _attn_res_case(210 + num_blocks, torch.bfloat16)
+    delta = delta if has_delta else None
+    monkeypatch.setattr(kda, "_ATTN_RES_BMM_MIN_TOKENS", 1)
+
+    def fn(p, d, b):
+        ms = kda.attn_res_bank_mean_square(b, num_blocks)
+        return kda.attn_res_functional_cached(p, d, b, ms, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+
+    dynamo.reset()
+    try:
+        compiled = torch.compile(fn, backend="aot_eager", fullgraph=True, dynamic=False)
+        with dynamo.config.patch(error_on_recompile=True):
+            for p, d, b in ((prefix, delta, blocks), (prefix * 2, None if delta is None else delta * 2, blocks + 1)):
+                for x, y in zip(compiled(p, d, b), fn(p, d, b)):
+                    torch.testing.assert_close(x, y, rtol=1e-2, atol=1e-2)
+    finally:
+        dynamo.reset()
+
+
 def _run_installed_layers(cache_bank_norm,
                           wrap=lambda layer: layer,
                           num_layers=14,
