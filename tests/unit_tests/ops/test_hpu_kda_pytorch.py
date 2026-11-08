@@ -1667,6 +1667,40 @@ def test_attn_res_torch_updates_a_3d_prefix_in_place_and_rejects_mismatched_bank
         kda.attn_res_torch(prefix, None, blocks[:3], norm_w, qk_w, None, 1, -1, 1e-6, 1e-6)
 
 
+def test_eager_attn_res_compiles_its_own_graph_only_on_hpu_in_compile_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: calls.append(kw) or fn)
+    monkeypatch.setattr(kda, "_compiled_attn_res_functional", None)
+    monkeypatch.setattr(kda, "_hpu_lazy_mode", lambda: False)
+    assert kda._eager_attn_res_functional("cpu") is kda.attn_res_functional
+    assert kda._eager_attn_res_functional("hpu") is kda._eager_attn_res_functional("hpu")
+    assert calls == [dict(backend="hpu_backend", dynamic=False)]
+    monkeypatch.setattr(kda, "_hpu_lazy_mode", lambda: True)
+    assert kda._eager_attn_res_functional("hpu") is kda.attn_res_functional
+
+
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(0, 0), (3, -1), (3, 2)])
+def test_attn_res_torch_with_a_compiled_mix_keeps_results_and_side_effects(monkeypatch, has_delta, num_blocks,
+                                                                           block_write_idx):
+    import torch._dynamo as dynamo
+    prefix, delta, blocks, norm_w, qk_w, out_w = _attn_res_case(140 + num_blocks, torch.bfloat16)
+    delta = delta if has_delta else None
+    ref_prefix, ref_blocks = prefix.clone(), blocks.clone()
+    ref_out = kda.attn_res_torch(ref_prefix, delta, ref_blocks, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6,
+                                 1e-6)
+    dynamo.reset()
+    try:
+        compiled = torch.compile(kda.attn_res_functional, backend="aot_eager", dynamic=False)
+        monkeypatch.setattr(kda, "_eager_attn_res_functional", lambda device_type: compiled)
+        out = kda.attn_res_torch(prefix, delta, blocks, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+    finally:
+        dynamo.reset()
+    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+    assert torch.equal(prefix, ref_prefix)
+    assert torch.equal(blocks, ref_blocks)
+
+
 def _toy_params(num_layers, hidden, seed):
     g = torch.Generator().manual_seed(seed)
     mk = lambda *shape: torch.rand(*shape, generator=g) + 0.5  # noqa: E731

@@ -783,6 +783,31 @@ def attn_res_functional_cached(
     return new_prefix, new_blocks, new_ms, mixed.to(prefix.dtype)
 
 
+_compiled_attn_res_functional: Callable | None = None
+
+
+def _hpu_lazy_mode() -> bool:
+    try:
+        import habana_frameworks.torch.utils.internal as htu
+    except ImportError:
+        return False
+    return htu.is_lazy()
+
+
+def _eager_attn_res_functional(device_type: str) -> Callable:
+    """``attn_res_functional`` for a call outside a compiled region.
+
+    On HPU in torch.compile mode it runs as its own compiled graph: eagerly, every op of the per-block mix is a
+    separate recipe.
+    """
+    global _compiled_attn_res_functional
+    if device_type != "hpu" or torch.compiler.is_compiling() or _hpu_lazy_mode():
+        return attn_res_functional
+    if _compiled_attn_res_functional is None:
+        _compiled_attn_res_functional = torch.compile(attn_res_functional, backend="hpu_backend", dynamic=False)
+    return _compiled_attn_res_functional
+
+
 def attn_res_torch(prefix: torch.Tensor,
                    delta: torch.Tensor | None,
                    blocks: torch.Tensor,
@@ -813,9 +838,9 @@ def attn_res_torch(prefix: torch.Tensor,
         return out.view(prefix.shape)
     if prefix.dim() != 2:
         raise ValueError(f"attn_res expects a 2D or 3D prefix, got {tuple(prefix.shape)}")
-    new_prefix, new_blocks, mixed = attn_res_functional(prefix, delta, blocks, norm_weight, qk_weight,
-                                                        output_norm_weight, num_blocks, block_write_idx, eps,
-                                                        output_norm_eps)
+    functional = _eager_attn_res_functional(prefix.device.type)
+    new_prefix, new_blocks, mixed = functional(prefix, delta, blocks, norm_weight, qk_weight, output_norm_weight,
+                                               num_blocks, block_write_idx, eps, output_norm_eps)
     if delta is not None:
         prefix.copy_(new_prefix)  # the kernel's in-place side effect
     if block_write_idx >= 0:
