@@ -180,6 +180,7 @@ def test_load_stats_buffer_is_updated_in_graph_without_recompiles(ops):
     layers = [_Layer(_make_moe_op(ops, in_graph_call=True)) for _ in range(3)]
     for layer in layers:
         layer.moe_op._load_stats = moe_load_stats.new_buffer(1, "cpu")
+        layer.moe_op._expert_stats = moe_load_stats.new_expert_buffer(layer.moe_op.global_num_experts, "cpu")
     counter = CompileCounter()
     compiled = [torch.compile(layer, backend=counter, fullgraph=True) for layer in layers]
 
@@ -193,3 +194,4 @@ def test_load_stats_buffer_is_updated_in_graph_without_recompiles(ops):
         # 3 tokens x top-2 on expert 0, twice: rows, active experts, chunks (= experts without chunking), forwards
         assert layer.moe_op._load_stats[0, 0, :3].tolist() == [12.0, 2.0, 2.0]
         assert layer.moe_op._load_stats[0, 0, -1] == 2
+        assert layer.moe_op._expert_stats[:2, 0].sum(1).tolist() == [12.0, 2.0]
