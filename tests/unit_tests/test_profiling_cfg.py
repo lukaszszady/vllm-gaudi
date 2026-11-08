@@ -362,3 +362,86 @@ def test_profile_sampling_rejects_unknown_items():
     for spec in ("greedy", "seed=1", "top_p", "top_k=abc"):
         with pytest.raises(ValueError):
             cfg.profile_sampling_kwargs(spec)
+
+
+def _forward_worker(rank, world, init_file, hosts, traces, copy_dirs, chunk_bytes, out):
+    import torch.distributed as dist
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        cfg.WRITTEN_TRACES[:] = [traces[rank]] if traces[rank] else []
+        written = cfg.forward_traces_to_rank0(dist.group.WORLD,
+                                              copy_dir=copy_dirs[rank],
+                                              host=hosts[rank],
+                                              chunk_bytes=chunk_bytes)
+        dist.barrier()
+        out.put((rank, written))
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_forward(tmp_path, hosts, traces, copy_dirs, chunk_bytes=100):
+    import multiprocessing
+    ctx = multiprocessing.get_context("fork")
+    out = ctx.Queue()
+    init_file = tmp_path / f"init{len(list(tmp_path.glob('init*')))}"
+    world = len(hosts)
+    procs = [
+        ctx.Process(target=_forward_worker, args=(r, world, str(init_file), hosts, traces, copy_dirs, chunk_bytes, out))
+        for r in range(world)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+    assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+    return dict(out.get(timeout=5) for _ in procs)
+
+
+def _trace(tmp_path, rank, data):
+    path = tmp_path / f"{rank}_1_2.pt.trace.json.gz"
+    path.write_bytes(data)
+    return str(path)
+
+
+def test_forward_traces_copies_other_host_ranks_to_rank0(tmp_path):
+    pytest.importorskip("torch")
+    res = tmp_path / "res"
+    data2 = bytes(range(256)) * 3 + b"x"
+    data3 = b"small"
+    traces = [
+        _trace(tmp_path, 0, b"r0"),
+        _trace(tmp_path, 1, b"r1"),
+        _trace(tmp_path, 2, data2),
+        _trace(tmp_path, 3, data3)
+    ]
+    written = _run_forward(tmp_path, ["a", "a", "b", "b"], traces, [str(res)] * 4)
+    assert [os.path.basename(n)
+            for n in written[0]] == ["trace_rank2.pt.trace.json.gz.log", "trace_rank3.pt.trace.json.gz.log"]
+    assert written[1] == written[2] == written[3] == []
+    assert (res / "trace_rank2.pt.trace.json.gz.log").read_bytes() == data2
+    assert (res / "trace_rank3.pt.trace.json.gz.log").read_bytes() == data3
+    assert sorted(p.name
+                  for p in res.iterdir()) == ["trace_rank2.pt.trace.json.gz.log", "trace_rank3.pt.trace.json.gz.log"]
+
+
+def test_forward_traces_splits_large_traces_into_copy_parts(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    monkeypatch.setattr(cfg, "COPY_PART_BYTES", 300)
+    monkeypatch.setattr(cfg.copy_trace_parts, "__defaults__", (300, ))
+    res = tmp_path / "res"
+    data = os.urandom(1000)
+    written = _run_forward(tmp_path, ["a", "b"], [None, _trace(tmp_path, 1, data)], [str(res), ""], chunk_bytes=128)
+    assert [os.path.basename(n)
+            for n in written[0]] == [f"trace_rank1.pt.trace.json.gz.part{i:02d}.log" for i in range(4)]
+    assert b"".join(pathlib.Path(n).read_bytes() for n in written[0]) == data
+
+
+def test_forward_traces_without_trace_or_copy_dir_does_not_hang(tmp_path):
+    pytest.importorskip("torch")
+    res = tmp_path / "res"
+    # rank 1 on another host has no trace: nothing to send
+    assert _run_forward(tmp_path, ["a", "b"], [None, None], [str(res), str(res)]) == {0: [], 1: []}
+    # copy dir unset on rank 0: no transfer even though rank 1 has a trace
+    written = _run_forward(tmp_path, ["a", "b"], [None, _trace(tmp_path, 1, b"abc")], ["", str(res)])
+    assert written == {0: [], 1: []}
+    assert not res.exists()
