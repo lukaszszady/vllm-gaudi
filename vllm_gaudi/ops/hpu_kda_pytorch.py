@@ -402,30 +402,31 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
         block, num_blocks = scan_block, (num_chunks + scan_block - 1) // scan_block
     else:
         block, num_blocks = num_chunks, 1
-    pad = num_blocks * block - num_chunks
     rows = num_blocks * bsz * heads  # explicit sizes: no reshape(-1) divisions in the traced shapes
-
-    # [block, num_blocks, B*H, K, D]: the position in the block leads, so every step reads a leading-dim slice
-    def to_blocks(x, value=0.0):
-        # identity maps; unconditional, so no pad == 0 guard specializes the block reshape
-        x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, 0, 0, 0, 0, pad), value=value)
-        return x.reshape(num_blocks, block, bsz * heads, kdim, x.shape[-1]).transpose(0, 1).contiguous()
-
     eye = torch.eye(kdim, dtype=tw.dtype, device=tw.device)
-    a = eye * to_blocks(gamma_last, 1.0) - to_blocks(tw)
-    b = to_blocks(tu)
+    a = eye * gamma_last - tw  # [N,B,H,K,K]
+
+    # chunk j * block + i goes to row i * num_blocks + j: one gather instead of pad + transpose copy; the padded
+    # tail repeats the last chunk and only feeds discarded starts and the unused carry of the last block
+    order = torch.arange(num_blocks * block, device=tw.device).reshape(num_blocks, block).t()
+    order = order.clamp_max(num_chunks - 1).reshape(num_blocks * block)
+
+    # [block, num_blocks * B*H, K, D]: the position in the block leads, so every step reads a leading-dim slice
+    def to_blocks(x):
+        return x.index_select(0, order).reshape(block, rows, kdim, x.shape[-1])
+
+    a_blk, b_blk = to_blocks(a), to_blocks(tu)
     # prefix maps within the blocks: P_i = A_i P_{i-1}, c_i = A_i c_{i-1} + b_i
-    p, c = [a[0].reshape(rows, kdim, kdim)], [b[0].reshape(rows, kdim, vdim)]
-    for a_i, b_i in zip(a[1:], b[1:]):
-        a_i = a_i.reshape(rows, kdim, kdim)
+    p, c = [a_blk[0]], [b_blk[0]]
+    for a_i, b_i in zip(a_blk[1:], b_blk[1:]):
         p.append(torch.bmm(a_i, p[-1]))
-        c.append(torch.baddbmm(b_i.reshape(rows, kdim, vdim), a_i, c[-1]))
+        c.append(torch.baddbmm(b_i, a_i, c[-1]))
     x = s_t.reshape(bsz * heads, kdim, vdim)
-    xs = []
-    for p_j, c_j in zip(p[-1].reshape(num_blocks, bsz * heads, kdim, kdim),
-                        c[-1].reshape(num_blocks, bsz * heads, kdim, vdim)):
-        xs.append(x)
+    xs = [x]
+    for p_j, c_j in zip(p[-1].reshape(num_blocks, bsz * heads, kdim, kdim)[:-1],
+                        c[-1].reshape(num_blocks, bsz * heads, kdim, vdim)[:-1]):
         x = torch.baddbmm(c_j, p_j, x)
+        xs.append(x)
     xs = torch.stack(xs)  # [num_blocks, B*H, K, V]
     xs_rows = xs.flatten(0, 1)
     starts = [xs] + [
@@ -433,8 +434,11 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
         for p_i, c_i in zip(p[:-1], c[:-1])
     ]
     starts = torch.stack(starts, 1)
-    starts = starts.reshape(num_blocks * block, bsz, heads, kdim, vdim)
-    return starts[:num_chunks], x.reshape(bsz, heads, kdim, vdim)
+    starts = starts.reshape(num_blocks * block, bsz, heads, kdim, vdim)[:num_chunks]
+    # final state: one step from the last chunk start (the padded maps are not identities)
+    s_t = torch.baddbmm(tu[-1].reshape(bsz * heads, kdim, vdim), a[-1].reshape(bsz * heads, kdim, kdim),
+                        starts[-1].reshape(bsz * heads, kdim, vdim))
+    return starts, s_t.reshape(bsz, heads, kdim, vdim)
 
 
 def kda_chunked_steps_vec(state: torch.Tensor,

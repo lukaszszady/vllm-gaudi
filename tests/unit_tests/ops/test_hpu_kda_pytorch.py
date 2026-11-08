@@ -1353,6 +1353,13 @@ def test_chunk_start_states_scan_adds_inside_the_matmuls_and_does_not_concatenat
     assert not {"add", "cat"} & set(ops), sorted(set(ops))
 
 
+@pytest.mark.parametrize("num_chunks", [16, 21])
+def test_chunk_start_states_scan_blocks_the_maps_with_one_gather_each(num_chunks):
+    ops = _aten_ops(kda._chunk_start_states, *_chunk_maps(411, num_chunks), 8)
+    assert ops.count("index_select") == 2
+    assert not {"constant_pad_nd", "pad", "copy_"} & set(ops), sorted(set(ops))
+
+
 def test_prefill_step_only_reads_the_caches_and_write_completes_it():
     params = _make_params(134)
     xa, xb = _make_inputs(135, 70), _make_inputs(136, 41)
