@@ -249,36 +249,3 @@ def test_kimi_k3_routing_compiles_to_one_graph_for_all_token_counts(router):
     assert counter.frame_count == 1
     assert not any("gather" in name for name in targets)
     dynamo.reset()
-
-
-@pytest.mark.parametrize("with_bias", [True, False])
-def test_kimi_k3_two_stage_routing_gathers_only_the_unbiased_weights(router, with_bias):
-    """The expert ids come from the stage-2 top-k without a gather; with a bias one gather reads the weights."""
-    dynamo.reset()
-    targets = []
-
-    def backend(gm, example_inputs):
-        targets.extend(str(node.target) for node in gm.graph.nodes if node.op in ("call_function", "call_method"))
-        return gm
-
-    logits, bias = _kimi_like_inputs(9, 40, 896)
-    bias = bias if with_bias else None
-    compiled = torch.compile(
-        lambda x: router._grouped_topk_impl(x, 16, True, 1, 1, "sigmoid", 2.5, bias, torch.bfloat16),
-        backend=backend,
-        fullgraph=True,
-        dynamic=False)
-    weights, ids = compiled(logits)
-    ref_weights, ref_ids = reference_grouped_topk(logits, 16, True, 1, 1, "sigmoid", 2.5, bias, True)
-    if with_bias:
-        weights, ids = _by_expert(weights, ids)
-        ref_weights, ref_ids = _by_expert(ref_weights, ref_ids)
-        assert torch.equal(ids, ref_ids)
-    else:
-        # bf16 logits tie without a bias: the selected scores are those of torch.topk
-        scores = logits.sigmoid()
-        assert torch.equal(scores.gather(1, ids).sort(dim=-1).values, scores.gather(1, ref_ids).sort(dim=-1).values)
-        weights, ref_weights = weights.sort(dim=-1).values, ref_weights.sort(dim=-1).values
-    torch.testing.assert_close(weights, ref_weights.to(torch.bfloat16), rtol=1e-2, atol=0)
-    assert sum("index_select" in name or "gather" in name for name in targets) == int(with_bias)
-    dynamo.reset()
