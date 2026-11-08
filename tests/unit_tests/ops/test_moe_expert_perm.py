@@ -276,8 +276,20 @@ def test_load_validates_the_file(tmp_path):
 
 def test_layer_indices():
     assert perm_mod.decoder_layer_index("model.language_model.layers.17.block_sparse_moe.experts") == 17
+    # RoutedExperts.layer_name of KimiK3ForConditionalGeneration and of the KimiK3MTP drafter
+    for name, index in [("language_model.model.layers.1.block_sparse_moe.experts", 1),
+                        ("language_model.model.layers.92.block_sparse_moe.experts", 92),
+                        ("model.layers.92.block_sparse_moe.experts", 92),
+                        ("model.layers.93.block_sparse_moe.experts", 93),
+                        ("model.layers.93.mtp_block.block_sparse_moe.experts", 93)]:
+        assert perm_mod.decoder_layer_index(name) == index
     with pytest.raises(ValueError):
         perm_mod.decoder_layer_index("lm_head")
+    kimi_k3 = types.SimpleNamespace(num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1)
+    assert perm_mod.moe_layer_indices(kimi_k3) == set(range(1, 93))
+    mtp = types.SimpleNamespace(method="mtp")
+    assert not perm_mod.is_drafter_layer(92, kimi_k3, mtp)
+    assert perm_mod.is_drafter_layer(93, kimi_k3, mtp)
     cfg = types.SimpleNamespace(num_hidden_layers=5, first_k_dense_replace=1, moe_layer_freq=1)
     assert perm_mod.moe_layer_indices(cfg) == {1, 2, 3, 4}
     assert perm_mod.moe_layer_indices(types.SimpleNamespace()) is None
