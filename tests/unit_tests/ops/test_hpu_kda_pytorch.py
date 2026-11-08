@@ -2636,3 +2636,155 @@ def test_chunked_vec_with_sub_chunk_compiles_fullgraph_and_matches_eager():
         torch.testing.assert_close(state, state_ref, rtol=1e-5, atol=1e-5)
     finally:
         dynamo.reset()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# attn_res with the bank logits' dot products cached next to the bank (HPU_KIMI_ATTN_RES_LOGIT_CACHE)
+# ---------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(0, -1), (0, 0), (1, -1), (6, -1), (6, 3), (7, 6), (12, -1)])
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("output_norm", [True, False])
+def test_attn_res_cached_bank_logits_match_the_recomputed_ones(dtype, num_blocks, block_write_idx, has_delta,
+                                                               output_norm):
+    g = torch.Generator().manual_seed(500 + num_blocks)
+    tokens, hidden, bank, num_qk = 64, 512, 13, 5
+    prefix = (torch.randn(tokens, hidden, generator=g) * 3).to(dtype)
+    delta = torch.randn(tokens, hidden, generator=g).to(dtype) if has_delta else None
+    blocks = (torch.randn(tokens, bank, hidden, generator=g) * torch.rand(1, bank, 1, generator=g) * 4).to(dtype)
+    norm_w = torch.rand(hidden, generator=g) + 0.5
+    qk_w = torch.randn(hidden, generator=g) * 0.2
+    out_w = torch.rand(hidden, generator=g) + 0.5 if output_norm else None
+    qk_all = torch.randn(num_qk, hidden, generator=g) * 0.2
+    qk_all[3] = norm_w * qk_w
+    qk_col = torch.tensor([3])
+    bank_ms = kda.attn_res_bank_mean_square(blocks, bank)
+    bank_qk = kda.attn_res_bank_qk(blocks, bank, qk_all)
+    inputs = (prefix.clone(), blocks.clone(), bank_ms.clone(), bank_qk.clone())
+
+    new_prefix, new_blocks, new_ms, new_qk, out = kda.attn_res_functional_logit_cached(
+        prefix, delta, blocks, bank_ms, bank_qk, qk_all, qk_col, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6,
+        1e-6)
+    ref_prefix, ref_blocks, ref_ms, ref = kda.attn_res_functional_cached(prefix, delta, blocks, bank_ms, norm_w, qk_w,
+                                                                         out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+
+    assert all(torch.equal(a, b) for a, b in zip((prefix, blocks, bank_ms, bank_qk), inputs))
+    assert torch.equal(new_prefix, ref_prefix) and torch.equal(new_blocks, ref_blocks) and torch.equal(new_ms, ref_ms)
+    torch.testing.assert_close(new_qk, kda.attn_res_bank_qk(new_blocks, bank, qk_all), rtol=1e-6, atol=1e-5)
+    if dtype == torch.float32:
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=5e-5)  # fp32 reduction order of the dot products
+    else:
+        torch.testing.assert_close(out, ref)  # bf16 rounding at most
+        assert (out != ref).float().mean() <= 1e-3
+
+
+def test_attn_res_bank_qk_ignores_unwritten_blocks():
+    blocks = torch.full((3, 4, 8), float("nan"))
+    blocks[:, :2] = torch.randn(3, 2, 8)
+    qk_all = torch.randn(5, 8)
+    bank_qk = kda.attn_res_bank_qk(blocks, 2, qk_all)
+    assert bank_qk.shape == (3, 4, 5)
+    torch.testing.assert_close(bank_qk[:, :2], (blocks[:, :2, None] * qk_all).sum(dim=-1))
+    assert torch.equal(bank_qk[:, 2:], torch.zeros(3, 2, 5))
+    assert torch.equal(kda.attn_res_bank_qk(blocks, 0, qk_all), torch.zeros(3, 4, 5))
+
+
+def test_attn_res_logit_cached_rejects_a_mismatching_bank_qk():
+    prefix, delta, blocks, norm_w, qk_w, out_w = _attn_res_case(7, torch.float32)
+    qk_all = torch.randn(4, prefix.shape[-1])
+    bank_qk = torch.zeros(blocks.shape[0], blocks.shape[1], 3)
+    with pytest.raises(ValueError, match="bank dot products"):
+        kda.attn_res_functional_logit_cached(prefix, delta, blocks, None, bank_qk, qk_all, torch.tensor([0]), norm_w,
+                                             qk_w, out_w, 1, -1, 1e-6, 1e-6)
+
+
+def _installed_layers(cache_bank_norm, logit_cache, num_layers=14, block_size=4, hidden=16, seed=140):
+    _, cls = _upstream_linear_module()
+    mod = types.ModuleType("vllm.models.kimi_k3.amd.linear")
+    mod.KimiLinearDecoderLayer = cls
+    kda.install_functional_attn_res(mod, cache_bank_norm=cache_bank_norm)
+    _, _, params = _toy_params(num_layers, hidden, seed)
+    layers = torch.nn.ModuleList(cls(i, block_size, p) for i, p in enumerate(params))
+    if logit_cache:
+        assert kda.prepare_attn_res_logit_cache(layers) == num_layers
+        assert kda.prepare_attn_res_logit_cache(layers) == num_layers  # idempotent
+    return layers
+
+
+def _run_layers(layers, wrap=lambda layer: layer, tokens=5, hidden=16, seed=141):
+    g = torch.Generator().manual_seed(seed)
+    hidden_states = torch.randn(tokens, hidden, generator=g)
+    residual = torch.full((tokens, layers[0].attn_res_bank_rows, hidden), float("nan"))  # like new_empty
+    prefix_delta = None
+    for layer in [wrap(m) for m in layers]:
+        hidden_states, residual, prefix_delta = layer(None, hidden_states, residual, prefix_delta)
+    return hidden_states, residual, prefix_delta
+
+
+def _bank_rows(layers):
+    for m in layers:
+        m.attn_res_bank_rows = max(x.block_write_idx for x in layers) + 1
+    return layers
+
+
+@pytest.mark.parametrize("cache_bank_norm", [True, False])
+def test_installed_layers_with_cached_bank_logits_match_the_plain_bank(cache_bank_norm):
+    layers = _bank_rows(_installed_layers(cache_bank_norm, True))
+    prefix, (bank, bank_ms, bank_qk), delta = _run_layers(layers)
+    ref_prefix, ref_bank, ref_delta = _run_layers(_bank_rows(_installed_layers(False, False)))
+    for a, b in ((prefix, ref_prefix), (delta, ref_delta), (bank, ref_bank)):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)  # fp32 reduction order of the dot products
+    torch.testing.assert_close(bank_ms, kda.attn_res_bank_mean_square(bank, bank.shape[1]))
+    qk_all = layers[0].attn_res_qk_all
+    assert qk_all.shape == (2 * len(layers), bank.shape[-1])
+    assert all(m.attn_res_qk_all is qk_all for m in layers)
+    assert [m.attn_res_qk_cols.tolist() for m in layers[:2]] == [[0, 1], [2, 3]]
+    assert "attn_res_qk_all" not in layers.state_dict() and "0.attn_res_qk_all" not in layers.state_dict()
+    torch.testing.assert_close(bank_qk, kda.attn_res_bank_qk(bank, bank.shape[1], qk_all), rtol=1e-6, atol=1e-6)
+    assert kda.attn_res_bank((bank, bank_ms, bank_qk)) is bank
+
+
+def test_prepare_attn_res_logit_cache_skips_a_model_without_attn_res():
+    assert kda.prepare_attn_res_logit_cache(torch.nn.Linear(2, 2)) == 0
+
+
+def test_installed_layers_with_cached_bank_logits_compile_per_layer_without_extra_breaks_recompiles_or_mutations():
+    """Regional compilation: only the deliberate attention break, the plain path's compile count, no mutated inputs."""
+    import torch._dynamo as dynamo
+    from torch._dynamo.testing import CompileCounter
+
+    def compiled_run(logit_cache):
+        layers = _bank_rows(_installed_layers(True, logit_cache))
+        counter = CompileCounter()
+        dynamo.reset()
+        try:
+            out = _run_layers(layers, wrap=lambda layer: torch.compile(layer, backend=counter))
+        finally:
+            dynamo.reset()
+        return out, counter.frame_count
+
+    expected = _run_layers(_bank_rows(_installed_layers(True, True)))
+    got, frames = compiled_run(True)
+    for a, b in zip(torch.utils._pytree.tree_leaves(got), torch.utils._pytree.tree_leaves(expected)):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-5)
+    assert frames == compiled_run(False)[1]
+
+    layers = _bank_rows(_installed_layers(True, True))
+    g = torch.Generator().manual_seed(2)
+    hidden_states, blocks = torch.randn(5, 16, generator=g), torch.randn(5, 4, 16, generator=g)
+    delta = torch.randn(5, 16, generator=g)
+    qk_all = layers[0].attn_res_qk_all
+    for idx in (0, 1, 4):
+        layer = layers[idx]
+        residual = blocks if idx == 0 else (blocks, kda.attn_res_bank_mean_square(blocks, 4),
+                                            kda.attn_res_bank_qk(blocks, 4, qk_all))
+        inputs = (None, hidden_states, residual, None if idx == 0 else delta)
+        dynamo.reset()
+        try:
+            explained = dynamo.explain(layer)(*inputs)
+        finally:
+            dynamo.reset()
+        reasons = sorted({r.reason.splitlines()[0] for r in explained.break_reasons})
+        assert explained.graph_break_count == 1 and all("_run_self_attn" in r or "disable" in r
+                                                        for r in reasons), reasons
+        assert _mutated_placeholders(lambda backend, layer=layer: torch.compile(layer, backend=backend), inputs) == []

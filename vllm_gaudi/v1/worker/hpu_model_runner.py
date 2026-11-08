@@ -34,7 +34,7 @@ from vllm_gaudi.kimi_k3_gate import is_kimi_k3_model_config
 from vllm_gaudi.patches import ensure_kimi_k3_patches, report_kimi_patches, report_kimi_patches_on_load_failure
 from vllm_gaudi.mm_warmup_inputs import build_dummy_processor_inputs, build_raw_image_processor_inputs
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
-from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cache_groups
+from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, prepare_attn_res_logit_cache, tag_kda_cache_groups
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemoryProfiler, HabanaProfilerCounterHelper,
                                            format_bytes, setup_profiler)
@@ -1001,6 +1001,9 @@ def apply_model_specific_patches(model_runner):
         from vllm_gaudi.ops.hpu_fused_moe import install_inline_moe_forward_entry, prime_moe_runners_for_compile
         install_inline_moe_forward_entry(model_runner.model)
         prime_moe_runners_for_compile(model_runner.model)
+        if gaudi_envs.HPU_KIMI_ATTN_RES_LOGIT_CACHE:
+            logger.info("Kimi-K3 attn_res logit cache: %d decoder layers",
+                        prepare_attn_res_logit_cache(model_runner.model))
 
 
 def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,

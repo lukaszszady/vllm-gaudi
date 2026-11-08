@@ -722,6 +722,13 @@ def attn_res_bank_mean_square(blocks: torch.Tensor, num_valid_blocks: int) -> to
     return torch.cat((valid, valid.new_zeros(num_tokens, num_bank - num_valid_blocks)), dim=1)
 
 
+def attn_res_bank_qk(blocks: torch.Tensor, num_valid_blocks: int, qk_all: torch.Tensor) -> torch.Tensor:
+    """fp32 dot products [M, R, Q] of the first ``num_valid_blocks`` stored blocks with each row of ``qk_all``."""
+    num_tokens, num_bank, _ = blocks.shape
+    valid = torch.matmul(blocks[:, :num_valid_blocks].float(), qk_all.t())
+    return torch.cat((valid, valid.new_zeros(num_tokens, num_bank - num_valid_blocks, qk_all.shape[0])), dim=1)
+
+
 def attn_res_functional_cached(
         prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor, bank_ms: torch.Tensor | None,
         norm_weight: torch.Tensor, qk_weight: torch.Tensor, output_norm_weight: torch.Tensor | None, num_blocks: int,
@@ -731,6 +738,25 @@ def attn_res_functional_cached(
 
     The bank read uses ``bank_ms`` instead of a pass over the bank; a block write also writes its mean square.
     Same numbers as recomputing it from the stored (rounded) block. ``bank_ms=None``: recomputed per read.
+    """
+    new_prefix, new_blocks, new_ms, _, mixed = attn_res_functional_logit_cached(prefix, delta, blocks, bank_ms, None,
+                                                                                None, None, norm_weight, qk_weight,
+                                                                                output_norm_weight, num_blocks,
+                                                                                block_write_idx, eps, output_norm_eps)
+    return new_prefix, new_blocks, new_ms, mixed
+
+
+def attn_res_functional_logit_cached(
+    prefix: torch.Tensor, delta: torch.Tensor | None, blocks: torch.Tensor, bank_ms: torch.Tensor | None,
+    bank_qk: torch.Tensor | None, qk_all: torch.Tensor | None, qk_col: torch.Tensor | None, norm_weight: torch.Tensor,
+    qk_weight: torch.Tensor, output_norm_weight: torch.Tensor | None, num_blocks: int, block_write_idx: int, eps: float,
+    output_norm_eps: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+    """``attn_res_functional_cached`` that also takes and returns ``bank_qk`` [M, R, Q] (see ``attn_res_bank_qk``).
+
+    ``qk_all`` [Q, D] holds the fp32 ``norm_weight * qk_weight`` of every attn_res call of the model and ``qk_col``
+    [1] (int64) the row of this call: the bank read takes the stored dot products instead of a pass over the bank,
+    a block write adds the dot products of the written block. ``bank_qk=None``: computed from the bank per read.
     """
     num_tokens, hidden = prefix.shape
     if delta is not None and delta.shape != prefix.shape:
@@ -747,7 +773,10 @@ def attn_res_functional_cached(
         new_prefix = prefix
         updated = prefix.float()
     own_ms = None
-    new_blocks, new_ms = blocks, bank_ms
+    new_blocks, new_ms, new_qk = blocks, bank_ms, bank_qk
+    if bank_qk is not None and (qk_all is None or qk_col is None
+                                or bank_qk.shape != (*blocks.shape[:2], qk_all.shape[0])):
+        raise ValueError(f"bank dot products {tuple(bank_qk.shape)} do not match the bank {tuple(blocks.shape)}")
     if block_write_idx >= 0:
         written = updated.to(blocks.dtype)
         new_blocks = torch.cat((blocks[:, :block_write_idx], written.unsqueeze(1), blocks[:, block_write_idx + 1:]),
@@ -757,6 +786,9 @@ def attn_res_functional_cached(
             written_ms = own_ms if blocks.dtype == prefix.dtype else torch.square(written.float()).sum(
                 dim=-1, keepdim=True) / hidden
             new_ms = torch.cat((bank_ms[:, :block_write_idx], written_ms, bank_ms[:, block_write_idx + 1:]), dim=1)
+        if bank_qk is not None:
+            written_qk = torch.matmul(written.float(), qk_all.t()).unsqueeze(1)  # [M, 1, Q]
+            new_qk = torch.cat((bank_qk[:, :block_write_idx], written_qk, bank_qk[:, block_write_idx + 1:]), dim=1)
 
     if num_blocks == 0:
         mixed = updated
@@ -766,7 +798,11 @@ def attn_res_functional_cached(
         qk = norm_weight.float() * qk_weight.float()  # [D]
         bank_sq = torch.square(bank.float()).sum(dim=-1) / hidden if new_ms is None else new_ms[:, :num_blocks]
         bank_rstd = torch.rsqrt(bank_sq + eps)  # [M, S]
-        bank_logits = (bank.float() * qk).sum(dim=-1) * bank_rstd
+        if new_qk is None:
+            bank_dot = (bank.float() * qk).sum(dim=-1)
+        else:
+            bank_dot = new_qk[:, :num_blocks].index_select(2, qk_col).squeeze(2)
+        bank_logits = bank_dot * bank_rstd
         if own_ms is None:
             own_ms = torch.square(updated).sum(dim=-1, keepdim=True) / hidden
         own_rstd = torch.rsqrt(own_ms + eps)  # [M, 1]
@@ -780,7 +816,7 @@ def attn_res_functional_cached(
     if output_norm_weight is not None:
         mixed = mixed * torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps)
         mixed = mixed * output_norm_weight.float()
-    return new_prefix, new_blocks, new_ms, mixed.to(prefix.dtype)
+    return new_prefix, new_blocks, new_ms, new_qk, mixed.to(prefix.dtype)
 
 
 _compiled_attn_res_functional: Callable | None = None
@@ -859,17 +895,29 @@ def forward_attn_residual_functional(self,
     Returns ``(prefix_sum, block_residual, mlp_out)`` like upstream; ``block_residual`` is a new tensor in block-write
     layers (a bank copy per write layer). A ``(bank, bank_ms)`` tuple as ``block_residual`` (see
     ``attn_res_functional_cached``) is threaded through and returned as such; ``cache_bank_norm`` turns a plain
-    bank (first layer, pipeline-parallel input) into one.
+    bank (first layer, pipeline-parallel input) into one. A layer prepared by ``prepare_attn_res_logit_cache`` threads
+    ``(bank, bank_ms, bank_qk)`` instead (see ``attn_res_functional_logit_cached``).
     """
-    blocks, bank_ms = block_residual if isinstance(block_residual, tuple) else (block_residual, None)
-    if cache_bank_norm and bank_ms is None:
+    if isinstance(block_residual, tuple):
+        blocks, bank_ms, bank_qk = (*block_residual, None)[:3]
+    else:
+        blocks, bank_ms, bank_qk = block_residual, None, None
+    qk_all = getattr(self, "attn_res_qk_all", None)
+    if qk_all is None:
+        bank_qk = None
+    elif bank_qk is None:
+        bank_qk = attn_res_bank_qk(blocks, self.prev_valid_blocks, qk_all)
+    if (cache_bank_norm or qk_all is not None) and bank_ms is None:
         bank_ms = attn_res_bank_mean_square(blocks, self.prev_valid_blocks)
+    qk_cols = getattr(self, "attn_res_qk_cols", None)
     prefix_sum = hidden_states
     write_idx = self.block_write_idx if self.is_block_write_layer else -1
-    new_prefix, blocks, bank_ms, hidden_states = _layer_attn_res(prefix_sum, blocks, bank_ms,
-                                                                 self.self_attention_res_proj,
-                                                                 self.self_attention_res_norm, self.prev_valid_blocks,
-                                                                 prefix_delta, self.input_layernorm, write_idx)
+    new_prefix, blocks, bank_ms, bank_qk, hidden_states = _layer_attn_res(prefix_sum, blocks, bank_ms, bank_qk, qk_all,
+                                                                          None if qk_all is None else qk_cols[0:1],
+                                                                          self.self_attention_res_proj,
+                                                                          self.self_attention_res_norm,
+                                                                          self.prev_valid_blocks, prefix_delta,
+                                                                          self.input_layernorm, write_idx)
     # in a block-write layer the updated prefix lives in the bank and the attention output starts the new prefix
     prefix_sum = None if self.is_block_write_layer else new_prefix
 
@@ -881,10 +929,14 @@ def forward_attn_residual_functional(self,
         prefix_delta = hidden_states
 
     mlp_valid_blocks = self.prev_valid_blocks + (1 if self.is_block_write_layer else 0)
-    prefix_sum, blocks, bank_ms, hidden_states = _layer_attn_res(prefix_sum, blocks, bank_ms, self.mlp_res_proj,
-                                                                 self.mlp_res_norm, mlp_valid_blocks, prefix_delta,
-                                                                 self.post_attention_layernorm, -1)
+    prefix_sum, blocks, bank_ms, bank_qk, hidden_states = _layer_attn_res(prefix_sum, blocks, bank_ms, bank_qk, qk_all,
+                                                                          None if qk_all is None else qk_cols[1:2],
+                                                                          self.mlp_res_proj, self.mlp_res_norm,
+                                                                          mlp_valid_blocks, prefix_delta,
+                                                                          self.post_attention_layernorm, -1)
     hidden_states = self.mlp(hidden_states)
+    if bank_qk is not None:
+        return prefix_sum, (blocks, bank_ms, bank_qk), hidden_states
     return prefix_sum, blocks if bank_ms is None else (blocks, bank_ms), hidden_states
 
 
@@ -940,7 +992,7 @@ def install_functional_attn_res(linear_mod, cache_bank_norm: bool = False) -> ty
 
 
 def attn_res_bank(block_residual) -> torch.Tensor:
-    """The block bank of a decoder-layer ``block_residual`` output: a plain bank or a ``(bank, bank_ms)`` tuple."""
+    """The block bank of a decoder-layer ``block_residual`` output: a plain bank or a ``(bank, ...)`` tuple."""
     return block_residual[0] if isinstance(block_residual, tuple) else block_residual
 
 
@@ -954,8 +1006,38 @@ def attn_res_layer_variants(modules) -> int:
     return max(1, len(variants))
 
 
-def _layer_attn_res(prefix_sum, blocks, bank_ms, proj, norm, num_valid_blocks, delta, output_norm, block_write_idx):
-    return attn_res_functional_cached(prefix_sum, delta, blocks, bank_ms, norm.weight, proj.weight.squeeze(0),
-                                      None if output_norm is None else output_norm.weight, num_valid_blocks,
-                                      block_write_idx, norm.variance_epsilon,
-                                      0.0 if output_norm is None else output_norm.variance_epsilon)
+def _layer_attn_res(prefix_sum, blocks, bank_ms, bank_qk, qk_all, qk_col, proj, norm, num_valid_blocks, delta,
+                    output_norm, block_write_idx):
+    return attn_res_functional_logit_cached(prefix_sum, delta, blocks, bank_ms, bank_qk, qk_all, qk_col, norm.weight,
+                                            proj.weight.squeeze(0), None if output_norm is None else output_norm.weight,
+                                            num_valid_blocks, block_write_idx, norm.variance_epsilon,
+                                            0.0 if output_norm is None else output_norm.variance_epsilon)
+
+
+def prepare_attn_res_logit_cache(model: torch.nn.Module) -> int:
+    """Give every attn_res decoder layer of ``model`` the shared ``attn_res_qk_all`` [Q, D] and its own
+    ``attn_res_qk_cols`` [2] (attention side, MLP side) buffers, so that the layers thread ``bank_qk``.
+
+    Returns the number of prepared layers; idempotent.
+    """
+    layers = [
+        m for m in model.modules() if getattr(m, "use_attn_residuals", False) and hasattr(m, "prev_valid_blocks")
+        and hasattr(m, "self_attention_res_proj") and hasattr(m, "mlp_res_proj")
+    ]
+    if not layers:
+        return 0
+    rows = []
+    with torch.no_grad():
+        for m in layers:
+            for proj, norm in ((m.self_attention_res_proj, m.self_attention_res_norm), (m.mlp_res_proj,
+                                                                                        m.mlp_res_norm)):
+                rows.append(norm.weight.float() * proj.weight.squeeze(0).float())
+        qk_all = torch.stack(rows)
+    for i, m in enumerate(layers):
+        cols = torch.tensor([2 * i, 2 * i + 1], dtype=torch.int64, device=qk_all.device)
+        for name, value in (("attn_res_qk_all", qk_all), ("attn_res_qk_cols", cols)):
+            if name in m._buffers:
+                m._buffers[name] = value
+            else:
+                m.register_buffer(name, value, persistent=False)
+    return len(layers)
