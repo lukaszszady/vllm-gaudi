@@ -404,7 +404,6 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
         block, num_blocks = num_chunks, 1
     rows = num_blocks * bsz * heads  # explicit sizes: no reshape(-1) divisions in the traced shapes
     eye = torch.eye(kdim, dtype=tw.dtype, device=tw.device)
-    a = eye * gamma_last - tw  # [N,B,H,K,K]
 
     # chunk j * block + i goes to row i * num_blocks + j: one gather instead of pad + transpose copy; the padded
     # tail repeats the last chunk and only feeds discarded starts and the unused carry of the last block
@@ -415,7 +414,8 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
     def to_blocks(x):
         return x.index_select(0, order).reshape(block, rows, kdim, x.shape[-1])
 
-    a_blk, b_blk = to_blocks(a), to_blocks(tu)
+    # maps A = diag(gl) - Tw [N,B,H,K,K] built inline so the natural-order buffer is freed after the gather
+    a_blk, b_blk = to_blocks(eye * gamma_last - tw), to_blocks(tu)
     # prefix maps within the blocks: P_i = A_i P_{i-1}, c_i = A_i c_{i-1} + b_i
     p, c = [a_blk[0]], [b_blk[0]]
     for a_i, b_i in zip(a_blk[1:], b_blk[1:]):
@@ -436,7 +436,8 @@ def _chunk_start_states(s_t: torch.Tensor, tw: torch.Tensor, tu: torch.Tensor, g
     starts = torch.stack(starts, 1)
     starts = starts.reshape(num_blocks * block, bsz, heads, kdim, vdim)[:num_chunks]
     # final state: one step from the last chunk start (the padded maps are not identities)
-    s_t = torch.baddbmm(tu[-1].reshape(bsz * heads, kdim, vdim), a[-1].reshape(bsz * heads, kdim, kdim),
+    a_last = eye * gamma_last[-1] - tw[-1]
+    s_t = torch.baddbmm(tu[-1].reshape(bsz * heads, kdim, vdim), a_last.reshape(bsz * heads, kdim, kdim),
                         starts[-1].reshape(bsz * heads, kdim, vdim))
     return starts, s_t.reshape(bsz, heads, kdim, vdim)
 
