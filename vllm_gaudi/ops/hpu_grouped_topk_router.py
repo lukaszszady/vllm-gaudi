@@ -41,7 +41,10 @@ def _topk(scores: torch.Tensor, k: int, use_sorted: bool) -> tuple[torch.Tensor,
     offsets = torch.arange(groups, device=scores.device, dtype=group_ids.dtype).unsqueeze(-1) * _TOPK_GROUP_SIZE
     group_ids = group_ids + offsets
     values, picked = torch.topk(group_vals.reshape(rows, groups * k), k=k, dim=-1, sorted=use_sorted)
-    return values, _flat_take(group_ids.reshape(rows, groups * k), picked)
+    # expert ids of the picked candidates by a one-hot select over the few candidates instead of a gather
+    slots = torch.arange(groups * k, device=picked.device, dtype=picked.dtype)
+    ids = torch.where(picked.unsqueeze(-1) == slots, group_ids.reshape(rows, 1, groups * k), 0).amax(dim=-1)
+    return values, ids
 
 
 def _grouped_topk_impl(
