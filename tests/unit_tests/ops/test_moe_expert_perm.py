@@ -230,8 +230,19 @@ def test_remap(ids_dtype):
     assert out.tolist() == [[2, 1], [0, 3]]
 
 
-def _integer_gathers(gm):
-    """(op, index dtype) of the integer-indexed gathers (index_select, gather, tensor-indexed getitem) in a graph."""
+_VIEW_OPS = ("to", "view", "reshape", "flatten", "contiguous")
+
+
+def _source(node):
+    """Graph input or attribute behind a chain of view and dtype/device conversions."""
+    while (node.op in ("call_function", "call_method") and getattr(node.target, "__name__", node.target) in _VIEW_OPS
+           and isinstance(node.args[0], torch.fx.Node)):
+        node = node.args[0]
+    return node
+
+
+def _perm_table_gathers(gm):
+    """(op, index dtype) of the gathers (index_select, gather, tensor-indexed getitem) that read _hpu_expert_perm."""
     gathers = []
     for node in gm.graph.nodes:
         if node.op not in ("call_function", "call_method"):
@@ -243,9 +254,10 @@ def _integer_gathers(gm):
             index = node.args[1]
         else:
             continue
+        if not isinstance(node.args[0], torch.fx.Node) or "_hpu_expert_perm" not in _source(node.args[0]).name:
+            continue
         value = index.meta.get("example_value") if isinstance(index, torch.fx.Node) else None
-        if isinstance(value, torch.Tensor) and not value.is_floating_point() and value.dtype != torch.bool:
-            gathers.append((name, value.dtype))
+        gathers.append((name, value.dtype if isinstance(value, torch.Tensor) else None))
     return gathers
 
 
@@ -263,7 +275,7 @@ def test_random_permutation_file_matches_baseline_in_compile(ops, monkeypatch, t
     gathers = []
 
     def backend(gm, example_inputs):
-        gathers.extend(_integer_gathers(gm))
+        gathers.extend(_perm_table_gathers(gm))
         return gm
 
     compiled = [torch.compile(rank, backend=backend, fullgraph=True) for rank in ranks]
@@ -460,3 +472,20 @@ def test_separate_draft_model_is_rejected(monkeypatch, tmp_path):
     path = _file(tmp_path, {"num_experts": NUM_EXPERTS, "layers": {"1": list(range(NUM_EXPERTS))}})
     with pytest.raises(ValueError, match="speculative method 'eagle3'"):
         perm_mod.apply_file(_RoutedExperts(0, "model.layers.1.block_sparse_moe.experts"), path)
+
+
+@pytest.mark.parametrize("file_ep_size, warned", [(EP_SIZE, False), (EP_SIZE * 2, True), (None, False)])
+def test_ep_size_mismatch_is_warned_once(monkeypatch, tmp_path, file_ep_size, warned):
+    _vllm_config(monkeypatch)
+    monkeypatch.setattr(perm_mod, "_warned_ep_size", set())
+    warning = MagicMock()
+    monkeypatch.setattr(perm_mod.logger, "warning", warning)
+    data = {"num_experts": NUM_EXPERTS, "layers": {"1": list(range(NUM_EXPERTS)), "2": list(range(NUM_EXPERTS))}}
+    if file_ep_size is not None:
+        data["ep_size"] = file_ep_size
+    path = _file(tmp_path, data)
+    for index in (1, 2):
+        perm_mod.apply_file(_RoutedExperts(0, f"model.layers.{index}.block_sparse_moe.experts"), path)
+    assert warning.call_count == int(warned)
+    if warned:
+        assert warning.call_args.args[2:] == (EP_SIZE * 2, EP_SIZE)
