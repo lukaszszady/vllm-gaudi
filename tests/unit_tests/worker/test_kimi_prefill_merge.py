@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Merge decision of fresh prefills for hybrid models, gated by VLLM_HPU_KIMI_PREFILL_MERGE."""
+"""Merge decision of fresh prefills for hybrid models, gated by HPU_KIMI_PREFILL_MERGE."""
 
 import pytest
 
@@ -8,20 +8,21 @@ from tests.unit_tests.worker.test_hpu_mm_prefill_batching import _make_batch_con
 from vllm_gaudi.v1.worker import hpu_model_runner
 
 
-def _hybrid_runner(flag, kimi=True, prefix_caching=False, max_bs=2):
+def _hybrid_runner(flag, kimi=True, prefix_caching=False, max_bs=2, merged_prefill=False):
     runner = _make_runner_stub(max_prefill_batch_size=max_bs)
     runner.num_mamba_like_layers = 4
     runner.is_kimi_k3 = kimi
     runner.use_prefix_caching = prefix_caching
-    hpu_model_runner.gaudi_envs.VLLM_HPU_KIMI_PREFILL_MERGE = flag
+    runner.use_merged_prefill = merged_prefill
+    hpu_model_runner.gaudi_envs.HPU_KIMI_PREFILL_MERGE = flag
     return runner
 
 
 @pytest.fixture(autouse=True)
 def _restore_flag():
-    saved = getattr(hpu_model_runner.gaudi_envs, "VLLM_HPU_KIMI_PREFILL_MERGE", False)
+    saved = getattr(hpu_model_runner.gaudi_envs, "HPU_KIMI_PREFILL_MERGE", False)
     yield
-    hpu_model_runner.gaudi_envs.VLLM_HPU_KIMI_PREFILL_MERGE = saved
+    hpu_model_runner.gaudi_envs.HPU_KIMI_PREFILL_MERGE = saved
 
 
 def _pair():
@@ -52,3 +53,7 @@ def test_flag_on_blocks_request_with_history():
     lhs, rhs = _pair()
     rhs.context_lens = [64]
     assert _hybrid_runner(True)._can_merge_prefill_contents(lhs, rhs) is False
+
+
+def test_flag_on_blocks_merged_prefill():
+    assert _hybrid_runner(True, merged_prefill=True)._can_merge_prefill_contents(*_pair()) is False

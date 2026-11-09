@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     VLLM_COMPACT_GDN: bool = False
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_ATTN_RES_RSTD_CACHE: bool = True
-    VLLM_HPU_KIMI_PREFILL_MERGE: bool = False
+    HPU_KIMI_PREFILL_MERGE: bool = False
     HPU_KIMI_MOE_FP8_LAYERS: str = ""
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     HPU_KIMI_KDA_SCAN_BLOCK: str = "8"
@@ -144,8 +144,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("HPU_KIMI_ATTN_RES_RSTD_CACHE", "1").strip().lower() in ("1", "true"),
 
     # Kimi-K3 (no prefix caching): let several fresh prompts share one padded prefill batch
-    "VLLM_HPU_KIMI_PREFILL_MERGE":
-    lambda: os.environ.get("VLLM_HPU_KIMI_PREFILL_MERGE", "0").strip().lower() in ("1", "true"),
+    "HPU_KIMI_PREFILL_MERGE":
+    lambda: os.environ.get("HPU_KIMI_PREFILL_MERGE", "0").strip().lower() in ("1", "true"),
 
     # Kimi-K3 routed experts converted at load from MXFP4 to per-row FP8 for these decoder layers
     # ("" off, "all", or "1-8,40"); needs HPU_KIMI_SITU_IMPL=silu
