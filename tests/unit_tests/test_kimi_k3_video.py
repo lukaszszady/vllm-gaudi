@@ -969,6 +969,26 @@ def test_dp_embed_matches_the_single_rank_path(video, monkeypatch, world_size):
         assert all(not dist.sent[r].any() for r in range(len(DP_GRIDS), world_size))
 
 
+def test_dp_idle_ranks_run_the_tower_on_the_first_chunk(video, monkeypatch):
+    calls = []
+
+    def tower(_tower, pixels, grids, **kw):
+        calls.append(grids.tolist())
+        return _content_tower_forward(_tower, pixels, grids, **kw)
+
+    video.amd_model.vision_tower_forward = tower
+    monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
+    video.mod.install_kimi_k3_video()
+    dist = _dp_distributed(monkeypatch, 16)
+    for rank in range(16):
+        calls.clear()
+        dist.rank = rank
+        _dp_model(video).embed_multimodal(**_dp_inputs(video))
+        assert len(calls) == 1
+        assert calls[0] == ([DP_GRIDS[rank]] if rank < len(DP_GRIDS) else [DP_GRIDS[0]])
+    assert not dist.sent[len(DP_GRIDS)].any()
+
+
 def test_dp_embed_rejects_a_wrong_local_row_count(video, monkeypatch):
     monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
     video.mod.install_kimi_k3_video()

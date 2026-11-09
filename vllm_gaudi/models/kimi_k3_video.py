@@ -276,8 +276,18 @@ def _encode_chunks_data_parallel(amd_model, model, pixel_values, grid_thws, chun
     start, end = ranges[rank]
     out_dim = model.mm_projector.linear_2.output_size
     dtype = next(model.mm_projector.parameters()).dtype
+    offsets = chunk_patch_offsets(grid_list)
+    if start == end:
+        # An idle rank encodes chunk 0 and drops the result, so every rank compiles the tower at warmup
+        # whatever the number of chunks in a call.
+        amd_model.vision_tower_forward(
+            model.vision_tower,
+            pixel_values[offsets[0]:offsets[1]],
+            grid_thws[0:1],
+            mm_projector=model.mm_projector,
+            use_data_parallel=False,
+        )
     if start < end:
-        offsets = chunk_patch_offsets(grid_list)
         local = amd_model.vision_tower_forward(
             model.vision_tower,
             pixel_values[offsets[start]:offsets[end]],
