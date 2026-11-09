@@ -2272,6 +2272,73 @@ def test_attn_res_functional_cached_compiles_to_one_graph(has_delta, num_blocks,
         dynamo.reset()
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# attn_res bank reductions as bf16 matmuls (HPU_KIMI_ATTN_RES_BANK_MM)
+# ---------------------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("value,mode", [("", 0), ("0", 0), (" 1 ", 1), ("2", 2)])
+def test_attn_res_bank_mm_parses_its_modes(value, mode):
+    assert kda.parse_attn_res_bank_mm(value) == mode
+
+
+@pytest.mark.parametrize("value", ["3", "-1", "on", "1,2"])
+def test_attn_res_bank_mm_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="HPU_KIMI_ATTN_RES_BANK_MM"):
+        kda.parse_attn_res_bank_mm(value)
+
+
+def test_attn_res_bank_mm_defaults_to_the_fp32_bank_math(monkeypatch):
+    monkeypatch.delenv("HPU_KIMI_ATTN_RES_BANK_MM", raising=False)
+    assert kda._ATTN_RES_BANK_MM == 0
+    assert kda.parse_attn_res_bank_mm(_load_envs_module(monkeypatch).HPU_KIMI_ATTN_RES_BANK_MM) == 0
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("num_blocks,block_write_idx", [(0, 0), (1, -1), (6, 3), (8, -1), (12, 12)])
+@pytest.mark.parametrize("has_delta", [True, False])
+@pytest.mark.parametrize("output_norm", [True, False])
+def test_attn_res_bank_mm_stays_within_bf16_rounding(monkeypatch, mode, num_blocks, block_write_idx, has_delta,
+                                                     output_norm):
+    g = torch.Generator().manual_seed(500 + num_blocks)
+    tokens, hidden, bank = 64, 512, 13
+    prefix = (torch.randn(tokens, hidden, generator=g) * 3).bfloat16()
+    delta = torch.randn(tokens, hidden, generator=g).bfloat16() if has_delta else None
+    blocks = (torch.randn(tokens, bank, hidden, generator=g) * torch.rand(1, bank, 1, generator=g) * 4).bfloat16()
+    norm_w = torch.rand(hidden, generator=g) + 0.5
+    qk_w = torch.randn(hidden, generator=g) * 0.2
+    out_w = torch.rand(hidden, generator=g) + 0.5 if output_norm else None
+    bank_ms = kda.attn_res_bank_mean_square(blocks, bank)
+    args = (prefix, delta, blocks, bank_ms, norm_w, qk_w, out_w, num_blocks, block_write_idx, 1e-6, 1e-6)
+    ref = kda.attn_res_functional_cached(*args)
+    monkeypatch.setattr(kda, "_ATTN_RES_BANK_MM", mode)
+    got = kda.attn_res_functional_cached(*args)
+    for x, y in zip(got[:3], ref[:3]):
+        assert torch.equal(x, y)
+    # mode 2 also rounds the raw logits to bf16, which shifts a peaked softmax
+    scale = ref[3].float().abs().amax(dim=-1, keepdim=True)
+    assert ((got[3].float() - ref[3].float()).abs() <= (1e-2 if mode == 1 else 5e-2) * scale).all()
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+def test_attn_res_bank_mm_compiles_to_one_graph(monkeypatch, mode):
+    import torch._dynamo as dynamo
+    prefix, delta, blocks, norm_w, qk_w, out_w = _attn_res_case(195, torch.bfloat16)
+    monkeypatch.setattr(kda, "_ATTN_RES_BANK_MM", mode)
+
+    def fn(p, d, b):
+        ms = kda.attn_res_bank_mean_square(b, 3)
+        return kda.attn_res_functional_cached(p, d, b, ms, norm_w, qk_w, out_w, 3, 2, 1e-6, 1e-6)
+
+    dynamo.reset()
+    try:
+        compiled = torch.compile(fn, backend="aot_eager", fullgraph=True, dynamic=False)
+        with dynamo.config.patch(error_on_recompile=True):
+            for p, d, b in ((prefix, delta, blocks), (prefix * 2, delta * 2, blocks + 1)):
+                for x, y in zip(compiled(p, d, b), fn(p, d, b)):
+                    torch.testing.assert_close(x, y, rtol=1e-2, atol=1e-2)
+    finally:
+        dynamo.reset()
+
+
 def _run_installed_layers(cache_bank_norm,
                           wrap=lambda layer: layer,
                           num_layers=14,
