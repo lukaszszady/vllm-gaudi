@@ -2,10 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compute a static expert placement (VLLM_HPU_MOE_EXPERT_PERM_FILE) from per-expert MoE stats.
 
-Reads moe_expert_stats.log (JSON lines written by the MoE load stats: a header with ep_size, local_num_experts and
-layer names, then {layer, bucket, forwards, rows, active, chunks, rows_sq} per layer and token bucket), assigns the
-experts of every layer to the EP ranks with LPT (heaviest expert first, onto the least loaded rank that still has a
-free slot) and writes the permutation file. Rank load is the sum of the chosen feature over the fit buckets.
+The stats file holds JSON lines. The first line is a header:
+
+    {"ep_size": E, "local_num_experts": L, "layers": ["model.layers.1.mlp.experts", ...]}
+
+(other keys are ignored), with the MoE layer names in the order of the "layer" field below. Every further line is
+one record per MoE layer and token-count bucket:
+
+    {"layer": <position in header "layers">, "bucket": "<label, e.g. 17-64>", "forwards": <MoE forwards>,
+     "rows": [...], "active": [...], "chunks": [...]}
+
+where each list has E * L values indexed by global expert id, summed over the forwards of the bucket: routed token
+rows, forwards with at least one row and expert chunks of the fused MoE op (only the --feature list is read).
+Buckets without forwards may be omitted. Stats of a run that already used a permutation are indexed by physical slot
+(pass --applied-perm).
+
+The experts of every layer are assigned to the EP ranks with LPT (heaviest expert first, onto the least loaded rank
+that still has a free slot) and the permutation file is written. Rank load is the sum of the chosen feature over the
+fit buckets.
 
 Reports, per evaluation set, the rank imbalance before (current placement) and after: mean over layers of
 (max - mean) / mean and the sum over layers of the max rank load relative to the sum of the mean loads, next to
