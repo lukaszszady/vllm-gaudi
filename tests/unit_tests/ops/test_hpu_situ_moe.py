@@ -11,8 +11,15 @@ import torch
 _PATH = pathlib.Path(__file__).resolve().parents[3] / "vllm_gaudi" / "ops" / "hpu_situ_moe.py"
 _spec = importlib.util.spec_from_file_location("hpu_situ_moe_under_test", _PATH)
 situ = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = situ  # dynamo imports the globals' module by name
 _spec.loader.exec_module(situ)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _register_situ_module():
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, _spec.name, situ)  # dynamo imports the globals' module by name
+        yield
+
 
 BETA, LINEAR_BETA = 4.0, 25.0  # Kimi-K3 checkpoint config
 

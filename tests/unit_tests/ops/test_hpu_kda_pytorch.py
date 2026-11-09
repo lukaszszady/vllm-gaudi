@@ -19,8 +19,14 @@ import torch
 _MODULE_PATH = pathlib.Path(__file__).resolve().parents[3] / "vllm_gaudi" / "ops" / "hpu_kda_pytorch.py"
 _spec = importlib.util.spec_from_file_location("hpu_kda_pytorch_under_test", _MODULE_PATH)
 kda = importlib.util.module_from_spec(_spec)
-sys.modules[_spec.name] = kda  # dynamo imports the globals' module by name
 _spec.loader.exec_module(kda)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _register_kda_module():
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, _spec.name, kda)  # dynamo imports the globals' module by name
+        yield
 
 
 H, D, W = 3, 8, 4  # heads, head_dim, conv kernel
@@ -911,6 +917,11 @@ def _unparsable_stack_trace_nodes(layer_forward, layer, hidden_states):
 
 
 def _compile_check(mode):
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        return _compile_check_with(mode, monkeypatch)
+
+
+def _compile_check_with(mode, monkeypatch):
     """Runs in a fresh interpreter (see the test): dynamo state from an earlier compile in the same process makes
     the stubbed forward context of a later compile resolve to the earlier metadata."""
     params = _make_params(40)
@@ -918,12 +929,7 @@ def _compile_check(mode):
     caches = _new_caches(4, False)
     metadata = {"value": None}
 
-    class _MonkeyPatch:
-
-        def setitem(self, mapping, key, value):
-            mapping[key] = value
-
-    module = _load_layer_module(_MonkeyPatch(), metadata)
+    module = _load_layer_module(monkeypatch, metadata)
     layer = _FakeLayer(params, hidden, 41, caches)
     g = torch.Generator().manual_seed(42)
     if mode == "prefill":
@@ -958,6 +964,11 @@ _VEC_PREFILL_ENV = dict(KDA_TEST_PREFILL_SETTINGS="4,1")
 
 
 def _decode_graph_check(prefill=False):
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        return _decode_graph_check_with(prefill, monkeypatch)
+
+
+def _decode_graph_check_with(prefill, monkeypatch):
     """Fresh interpreter like ``_compile_check``: compiles the layer decode (or, with ``prefill``, the prefill under
     ``_VEC_PREFILL_ENV``) through aot_autograd with keep_inference_input_mutations=True (input mutations stay
     visible as copy_ on the placeholders) and returns the forward graphs' sizes, the in-place targets on graph
@@ -970,12 +981,7 @@ def _decode_graph_check(prefill=False):
     caches = tuple(cache.copy_(torch.randn(cache.shape, generator=g)) for cache in _new_caches(4, False))
     metadata = {"value": None}
 
-    class _MonkeyPatch:
-
-        def setitem(self, mapping, key, value):
-            mapping[key] = value
-
-    module = _load_layer_module(_MonkeyPatch(), metadata)
+    module = _load_layer_module(monkeypatch, metadata)
     if prefill:  # 2 sequences of 8 tokens (the second one with 5 real ones), both continuing from a cached state
         mask = torch.ones(2, 8)
         mask[1, 5:] = 0.0
