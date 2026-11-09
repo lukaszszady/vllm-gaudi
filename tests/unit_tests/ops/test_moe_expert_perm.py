@@ -230,9 +230,9 @@ def test_remap(ids_dtype):
     assert out.tolist() == [[2, 1], [0, 3]]
 
 
-def _integer_index_dtypes(gm):
-    """dtypes of the integer index tensors of the gathers (index_select, gather, tensor-indexed getitem) in a graph."""
-    dtypes = []
+def _integer_gathers(gm):
+    """(op, index dtype) of the integer-indexed gathers (index_select, gather, tensor-indexed getitem) in a graph."""
+    gathers = []
     for node in gm.graph.nodes:
         if node.op not in ("call_function", "call_method"):
             continue
@@ -245,12 +245,12 @@ def _integer_index_dtypes(gm):
             continue
         value = index.meta.get("example_value") if isinstance(index, torch.fx.Node) else None
         if isinstance(value, torch.Tensor) and not value.is_floating_point() and value.dtype != torch.bool:
-            dtypes.append(value.dtype)
-    return dtypes
+            gathers.append((name, value.dtype))
+    return gathers
 
 
 def test_random_permutation_file_matches_baseline_in_compile(ops, monkeypatch, tmp_path):
-    # int32 index_select returns wrong expert ids in HPU graphs: the compiled remap must gather with int64 indices
+    # index_select of the remap table returns wrong expert ids in HPU graphs: int64 tensor indexing only
     for name, value in (("NUM_EXPERTS", 32), ("LOCAL", 8), ("TOP_K", 4)):
         monkeypatch.setitem(globals(), name, value)
     g = torch.Generator().manual_seed(3)
@@ -260,10 +260,10 @@ def test_random_permutation_file_matches_baseline_in_compile(ops, monkeypatch, t
     w13, w2 = _checkpoint()
     baseline_ranks = [_build_rank(ops, r, w13, w2) for r in range(EP_SIZE)]
     ranks = [_build_rank(ops, r, w13, w2, perms[3]) for r in range(EP_SIZE)]
-    index_dtypes = []
+    gathers = []
 
     def backend(gm, example_inputs):
-        index_dtypes.extend(_integer_index_dtypes(gm))
+        gathers.extend(_integer_gathers(gm))
         return gm
 
     compiled = [torch.compile(rank, backend=backend, fullgraph=True) for rank in ranks]
@@ -271,7 +271,7 @@ def test_random_permutation_file_matches_baseline_in_compile(ops, monkeypatch, t
     baseline = _ep_forward(baseline_ranks, x, topk_ids, topk_weights)
     torch.testing.assert_close(baseline, _dense_reference(x, topk_ids, topk_weights, w13, w2))
     torch.testing.assert_close(_ep_forward(compiled, x, topk_ids, topk_weights), baseline, rtol=1e-12, atol=1e-12)
-    assert index_dtypes and set(index_dtypes) == {torch.int64}
+    assert gathers and set(gathers) == {("getitem", torch.int64)}
 
 
 def test_apply_to_layer_keeps_shared_buffers():
