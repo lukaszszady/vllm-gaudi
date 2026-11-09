@@ -230,6 +230,50 @@ def test_remap(ids_dtype):
     assert out.tolist() == [[2, 1], [0, 3]]
 
 
+def _integer_index_dtypes(gm):
+    """dtypes of the integer index tensors of the gathers (index_select, gather, tensor-indexed getitem) in a graph."""
+    dtypes = []
+    for node in gm.graph.nodes:
+        if node.op not in ("call_function", "call_method"):
+            continue
+        name = getattr(node.target, "__name__", node.target)
+        if name in ("index_select", "gather"):
+            index = node.kwargs.get("index", node.args[2] if len(node.args) > 2 else None)
+        elif name == "getitem":
+            index = node.args[1]
+        else:
+            continue
+        value = index.meta.get("example_value") if isinstance(index, torch.fx.Node) else None
+        if isinstance(value, torch.Tensor) and not value.is_floating_point() and value.dtype != torch.bool:
+            dtypes.append(value.dtype)
+    return dtypes
+
+
+def test_random_permutation_file_matches_baseline_in_compile(ops, monkeypatch, tmp_path):
+    # int32 index_select returns wrong expert ids in HPU graphs: the compiled remap must gather with int64 indices
+    for name, value in (("NUM_EXPERTS", 32), ("LOCAL", 8), ("TOP_K", 4)):
+        monkeypatch.setitem(globals(), name, value)
+    g = torch.Generator().manual_seed(3)
+    perm = torch.randperm(NUM_EXPERTS, generator=g).tolist()
+    path = _file(tmp_path, {"num_experts": NUM_EXPERTS, "layers": {"3": perm}})
+    perms = perm_mod.load(path, NUM_EXPERTS, frozenset({3}))
+    w13, w2 = _checkpoint()
+    baseline_ranks = [_build_rank(ops, r, w13, w2) for r in range(EP_SIZE)]
+    ranks = [_build_rank(ops, r, w13, w2, perms[3]) for r in range(EP_SIZE)]
+    index_dtypes = []
+
+    def backend(gm, example_inputs):
+        index_dtypes.extend(_integer_index_dtypes(gm))
+        return gm
+
+    compiled = [torch.compile(rank, backend=backend, fullgraph=True) for rank in ranks]
+    x, topk_ids, topk_weights = _routing(tokens=16, seed=4)
+    baseline = _ep_forward(baseline_ranks, x, topk_ids, topk_weights)
+    torch.testing.assert_close(baseline, _dense_reference(x, topk_ids, topk_weights, w13, w2))
+    torch.testing.assert_close(_ep_forward(compiled, x, topk_ids, topk_weights), baseline, rtol=1e-12, atol=1e-12)
+    assert index_dtypes and set(index_dtypes) == {torch.int64}
+
+
 def test_apply_to_layer_keeps_shared_buffers():
     shared_mask = torch.ones(NUM_EXPERTS + 1, dtype=torch.int32)
     layer = _RoutedExperts(0)
