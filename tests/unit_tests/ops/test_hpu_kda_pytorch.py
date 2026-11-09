@@ -211,6 +211,28 @@ def test_two_sequences_different_lengths_and_initial_states_do_not_mix():
 
 
 @pytest.mark.parametrize("dim_first", [True, False])
+@pytest.mark.parametrize("lengths", [(9, 5), (8, 8), (12, 3)])
+def test_batched_prefill_equals_two_single_prefills(dim_first, lengths):
+    params = _make_params(20)
+    xa, xb = _make_inputs(21, lengths[0]), _make_inputs(22, lengths[1])
+    bucket = 16
+    fresh = torch.tensor([0, 0])
+
+    caches = _new_caches(6, dim_first)
+    batch, mask = _pad_batch([xa, xb], bucket)
+    out = _run_prefill(params, batch, mask, caches, torch.tensor([1, 4]), fresh)
+
+    singles = _new_caches(6, dim_first)
+    for slot, x, n in ((1, xa, lengths[0]), (4, xb, lengths[1])):
+        b, m = _pad_batch([x], bucket)
+        single_out = _run_prefill(params, b, m, singles, torch.tensor([slot]), torch.tensor([0]))
+        row = 0 if slot == 1 else 1
+        torch.testing.assert_close(out[row, :n], single_out[0, :n], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(caches[0], singles[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(caches[1], singles[1], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("dim_first", [True, False])
 def test_prefill_then_decode_keeps_state_continuity(dim_first):
     params = _make_params(6)
     full = _make_inputs(7, 12)

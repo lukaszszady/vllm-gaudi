@@ -2812,6 +2812,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             return self._bucketize_2d_prompt
 
+    def _kimi_prefill_merge_enabled(self) -> bool:
+        # Kimi-K3 KDA/MLA prefill supports padded [bs, T] batches when there is no history.
+        return bool(gaudi_envs.VLLM_HPU_KIMI_PREFILL_MERGE and self.is_kimi_k3 and not self.use_prefix_caching)
+
     def _can_merge_prefill_contents(self, lhs, rhs):
         # Mamba/hybrid models require single-request prefill batches on HPU: the
         # mamba2 prefill path is built around single-sequence chunks (see the
@@ -2825,7 +2829,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Neither is prefix-caching-specific, so gate on the model type, not on
         # use_prefix_caching (which would also wrongly block merges for plain
         # attention models that CAN merge under prefix caching).
-        if self.num_mamba_like_layers > 0:
+        if self.num_mamba_like_layers > 0 and not self._kimi_prefill_merge_enabled():
             return False
         # --- Logic to handle chunked prefill/prefix caching for HPU ---
         # 1. Check basic states of LHS (accumulated batch) and RHS (incoming request).
