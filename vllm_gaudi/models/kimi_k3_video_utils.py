@@ -26,10 +26,8 @@ K3_VIDEO_PLACEHOLDER = "<|kimi_video_placeholder|>"
 DEFAULT_TEMPORAL_CHUNK_SIZE = 4  # temporal_merge_kernel_size
 DEFAULT_MAX_SAMPLE_FPS = 8.0  # sample_fps
 
-# Request-level video decoding defaults of the K3 chat renderer (--media-io-kwargs and per-request media_io_kwargs take
-# precedence). The loader keeps min(num_frames, source frames, floor(duration * fps)) frames, so these two cap the
-# decoded video at 8 frames per second and at 256 frames; the final sampling and chunking is done by
-# ``plan_video_chunks``.
+# Request-level decoding caps of the K3 chat renderer (media_io_kwargs take precedence); ``plan_video_chunks`` samples
+# and chunks the decoded frames.
 K3_VIDEO_LOADER_FPS = DEFAULT_MAX_SAMPLE_FPS
 K3_VIDEO_LOADER_MAX_FRAMES = 256
 

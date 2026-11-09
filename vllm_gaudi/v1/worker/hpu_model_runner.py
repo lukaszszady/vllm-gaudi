@@ -1362,7 +1362,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         finalize_config()
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
-        # Kimi-K3 only behaviour is gated on this flag (computed once); every other model takes the upstream path.
+        # gates the Kimi-K3-only behaviour
         self.is_kimi_k3 = is_kimi_k3_model_config(self.model_config)
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -2173,9 +2173,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     mm_hash = mm_feature.identifier
                     if mm_hash in self.encoder_cache:
                         continue
-                    # A span fully covered by computed (e.g. prefix-cached) tokens is
-                    # never gathered, and the scheduler strips its pixel payload
-                    # (strip_covered_mm_data), so there is nothing to encode.
+                    # span fully covered by computed tokens: payload is stripped, nothing to encode
                     pos_info = mm_feature.mm_position
                     if mm_feature.data is None or pos_info.offset + pos_info.length <= req_state.num_computed_tokens:
                         continue
@@ -3406,8 +3404,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # set an out of range value for the padding tokens so that they
         # are ignored when inserting into the KV cache.
         slot_mapping = slot_mapping[:padded_batch_size]
-        # decode_block_size is attn_block_size, so the pad row (kernel-block units, see attn_pad_ids) is exactly
-        # decode_block_size slots starting at _PAD_SLOT_ID: cycling over it keeps padding tokens in the pad row.
+        # the pad row is decode_block_size slots from _PAD_SLOT_ID: cycle within it
         dummy_slots = pad_slot_cycle(self._PAD_SLOT_ID, decode_block_size)
         slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
 
@@ -5088,8 +5085,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             ctx = _override_platform_device_type(load_device) \
                 if load_device and load_device != current_platform.device_type \
                 else contextlib.nullcontext()
-            # The shards' page cache would otherwise fill host memory and trip the bridge's host memory
-            # threshold (recipe cache eviction), see hpu_weight_page_cache.
+            # drops the shards' page cache (see hpu_weight_page_cache)
             with ctx, drop_weight_page_cache_during_load(self.model_config):
                 try:
                     ensure_kimi_k3_patches(self.model_config)
@@ -5933,10 +5929,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     min_tokens_per_seq = sw_blocks * decode_block_size
                 else:
                     min_tokens_per_seq = decode_block_size
-                # Contiguous PA buckets by the highest kernel block id + 1, so
-                # place the dummy blocks to make that id bucket - 1, capped at
-                # the physical pool. Under virtual block splitting scheduler
-                # block s holds kernel blocks s * ratio .. s * ratio + ratio - 1.
+                # contiguous PA buckets by the highest kernel block id + 1: place the dummy blocks so it is bucket - 1
                 block_id, min_tokens_per_seq = contiguous_dummy_decode_layout(decode_num_blocks, self._num_attn_blocks,
                                                                               self.kv_cache_config.num_blocks,
                                                                               decode_block_size, min_tokens_per_seq,
@@ -6389,8 +6382,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.bucketing_manager.skip_decode_block_clamp = (self.attn_block_size != self.block_size
                                                               or self.num_gdn > 0 or self.num_mamba_like_layers > 0
                                                               or self.interleaved_sliding_window)
-            # Hybrids run contiguous PA without the defragmenter (see
-            # OnlineDefragmenter), so any decode batch may reach the pool size.
+            # no defragmenter for hybrids: any decode batch may reach the pool size
             self.bucketing_manager.decode_full_block_range = (self.is_kimi_k3 and self.use_contiguous_pa
                                                               and self.num_mamba_like_layers > 0)
             if self.attn_block_size != self.block_size:
@@ -6858,8 +6850,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # block table), so only the tensor identity can separate layers inside a
         # group. Key by position to restore the pre-#51718 sharing.
         mamba_state_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
-        # Real attention rows (excluding the pad row) when virtual block
-        # splitting allocates the attention caches in kernel blocks.
+        # attention rows without the pad row (virtual block splitting)
         num_attn_kernel_blocks: Optional[int] = None
 
         def _mamba_state_tensors(spec: MambaSpec, layer_pos: int, num_slots: int) -> tuple[torch.Tensor, ...]:
@@ -7140,11 +7131,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         assert layer_names == set(kv_caches.keys()), "Some layers are not correctly initialized"
         bind_kv_cache(kv_caches, self.vllm_config.compilation_config.static_forward_context, self.kv_caches)
 
-        # Attention block ids and decode block buckets are in kernel blocks of
-        # attn_block_size. Under hybrid virtual block splitting the scheduler
-        # id num_blocks is a real kernel block (the first one of scheduler block
-        # num_blocks / blocks_per_kv_block), so padding tokens must target the
-        # trailing pad row instead, or they overwrite a live request's KV.
+        # block ids are in kernel blocks; with virtual block splitting padding must target the trailing pad row
         num_attn_blocks, self._PAD_BLOCK_ID, self._PAD_SLOT_ID = attn_pad_ids(
             num_blocks, num_attn_kernel_blocks if self.is_kimi_k3 else None, self.attn_block_size)
         self._num_attn_blocks = num_attn_blocks
