@@ -277,25 +277,24 @@ def _encode_chunks_data_parallel(amd_model, model, pixel_values, grid_thws, chun
     out_dim = model.mm_projector.linear_2.output_size
     dtype = next(model.mm_projector.parameters()).dtype
     offsets = chunk_patch_offsets(grid_list)
-    if start == end:
-        # An idle rank encodes chunk 0 and drops the result, so every rank compiles the tower at warmup
-        # whatever the number of chunks in a call.
-        amd_model.vision_tower_forward(
-            model.vision_tower,
-            pixel_values[offsets[0]:offsets[1]],
-            grid_thws[0:1],
-            mm_projector=model.mm_projector,
-            use_data_parallel=False,
-        )
+
+    def encode(first: int, last: int):
+        # One chunk per tower call: the compiled shape does not depend on the number of chunks of a rank.
+        return [
+            amd_model.vision_tower_forward(
+                model.vision_tower,
+                pixel_values[offsets[i]:offsets[i + 1]],
+                grid_thws[i:i + 1],
+                mm_projector=model.mm_projector,
+                use_data_parallel=False,
+            )[0] for i in range(first, last)
+        ]
+
+    if start == end and grid_list:
+        # An idle rank encodes chunk 0 and drops the result, so every rank compiles the tower at warmup.
+        encode(0, 1)
     if start < end:
-        local = amd_model.vision_tower_forward(
-            model.vision_tower,
-            pixel_values[offsets[start]:offsets[end]],
-            grid_thws[start:end],
-            mm_projector=model.mm_projector,
-            use_data_parallel=False,
-        )
-        local = torch.cat(list(local), dim=0)
+        local = torch.cat(encode(start, end), dim=0)
         if tuple(local.shape) != (rows[rank], out_dim):
             raise ValueError(f"Kimi-K3 video DP: rank {rank} encoded chunks [{start}, {end}) into "
                              f"{tuple(local.shape)}, expected ({rows[rank]}, {out_dim})")

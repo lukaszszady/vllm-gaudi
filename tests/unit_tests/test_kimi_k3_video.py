@@ -989,12 +989,44 @@ def test_dp_idle_ranks_run_the_tower_on_the_first_chunk(video, monkeypatch):
     assert not dist.sent[len(DP_GRIDS)].any()
 
 
+@pytest.mark.parametrize("num_chunks", [17, 32])
+def test_dp_tower_gets_one_chunk_per_call_beyond_world_size(video, monkeypatch, num_chunks):
+    world_size = 16
+    grids = [DP_GRIDS[i % len(DP_GRIDS)] for i in range(num_chunks)]
+    torch.manual_seed(0)
+    inputs = {
+        video.mod.VIDEO_PIXEL_VALUES: torch.randn(sum(t * h * w for t, h, w in grids), 3),
+        video.mod.VIDEO_GRID_THWS: torch.tensor(grids),
+        video.mod.VIDEO_NUM_CHUNKS: torch.tensor([num_chunks]),
+    }
+    seen = []
+
+    def tower(_tower, pixels, g, **kw):
+        seen.append(g.shape[0])
+        return _content_tower_forward(_tower, pixels, g, **kw)
+
+    video.amd_model.vision_tower_forward = _content_tower_forward
+    monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
+    video.mod.install_kimi_k3_video()
+    dist = _dp_distributed(monkeypatch, world_size)
+    reference = _dp_model(video, use_data_parallel=False).embed_multimodal(**inputs)
+    video.amd_model.vision_tower_forward = tower
+    for rank in range(world_size):
+        dist.rank = rank
+        _dp_model(video).embed_multimodal(**inputs)
+    assert set(seen) == {1}
+    dist.replay = dict(dist.sent)
+    dist.rank = 0
+    (out, ) = _dp_model(video).embed_multimodal(**inputs)
+    torch.testing.assert_close(out, reference[0], rtol=0, atol=0)
+
+
 def test_dp_embed_rejects_a_wrong_local_row_count(video, monkeypatch):
     monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
     video.mod.install_kimi_k3_video()
     video.amd_model.vision_tower_forward = lambda tower, pixels, grids, **kw: [torch.zeros(4 * 6, DP_DIM)]
     _dp_distributed(monkeypatch, 2)
-    with pytest.raises(ValueError, match=r"rank 0 encoded chunks \[0, 3\) into \(24, 12\), expected \(12, 12\)"):
+    with pytest.raises(ValueError, match=r"rank 0 encoded chunks \[0, 3\) into \(72, 12\), expected \(12, 12\)"):
         _dp_model(video).embed_multimodal(**_dp_inputs(video))
 
 
