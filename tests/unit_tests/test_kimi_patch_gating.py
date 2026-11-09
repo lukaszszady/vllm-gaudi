@@ -153,6 +153,19 @@ def test_k3_runner_is_not_swapped_twice(patches):
     assert not any(c.__dict__.get("_hpu_kimi_k3_runner") for c in k3_cls.__mro__[1:])
 
 
+def test_k3_runner_does_not_expose_the_quant_method_of_its_routed_experts(patches):
+    runner = _build(patches, 0, ["KimiK3ForConditionalGeneration"])
+    runner.routed_experts.quant_method = object()
+    model = torch.nn.Module()
+    model.experts = runner
+
+    # the weight loaders run process_weights_after_loading on every module that has a quant_method
+    owners = [name for name, module in model.named_modules() if getattr(module, "quant_method", None) is not None]
+
+    assert owners == ["experts.routed_experts"]
+    assert runner.w13_weight_packed is runner.routed_experts.w13_weight_packed
+
+
 def test_patching_twice_wraps_init_once(patches):
     base = patches.test_classes[0]
     init = base.__init__
@@ -646,6 +659,41 @@ def test_apply_attn_res_replacement_accepts_quant_key_none_and_rejects_a_quant_k
     assert apply_attn_res(*args, quant_key=None).shape == baseline.shape
     with pytest.raises(NotImplementedError, match="quant_key"):
         apply_attn_res(*args, quant_key="fp8_dynamic_token_sym")
+
+
+def test_apply_attn_res_replacement_reads_the_bank_of_a_cached_norm_tuple(arch_modules):
+    arch_modules._patch_kimi_attn_res()
+    apply_attn_res = arch_modules.test_linear._apply_attn_res
+    dim = 8
+    prefix, blocks = torch.randn(3, dim), torch.randn(3, 2, dim)
+    proj = types.SimpleNamespace(weight=torch.randn(1, dim))
+    norm = types.SimpleNamespace(weight=torch.ones(dim), variance_epsilon=1e-6)
+
+    expected = apply_attn_res(prefix.clone(), blocks, proj, norm, 2)
+    got = apply_attn_res(prefix.clone(), (blocks, blocks.pow(2).mean(dim=-1)), proj, norm, 2)
+    torch.testing.assert_close(got, expected)
+
+
+def test_linear_model_forward_wrapper_sends_the_plain_bank_to_the_next_pipeline_stage(arch_modules):
+    bank = torch.randn(4, 2, 8)
+
+    class Intermediate:
+
+        def __init__(self, tensors):
+            self.tensors = tensors
+
+        def __setitem__(self, key, value):
+            self.tensors[key] = value
+
+    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+        return Intermediate({"hidden_states": torch.zeros(4, 8), "residual": (bank, torch.zeros(4, 2))})
+
+    arch_modules.test_linear.KimiLinearModel.forward = forward
+    model_cls = _forward_wrapper(arch_modules)
+    model = model_cls()
+    model._hpu_kimi_k3 = True
+
+    assert model.forward(torch.arange(4), torch.arange(4)).tensors["residual"] is bank
 
 
 class _KimiK3MergedQKVGateLinear(torch.nn.Module):

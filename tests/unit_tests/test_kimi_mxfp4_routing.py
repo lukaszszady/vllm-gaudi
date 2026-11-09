@@ -287,6 +287,31 @@ def test_kimi_method_process_weights_in_graph_call_only_for_kimi_configs(mxfp4):
     assert created[0].kwargs["in_graph_call"] is False
 
 
+def test_kimi_method_process_weights_runs_once_per_layer(mxfp4):
+    created = []
+    mxfp4.VllmMixtureOfExpertsOpMXFP4 = _fake_op_class(created)
+    mxfp4.state["kimi"] = True
+    method = mxfp4.HPUKimiK3Mxfp4MoEMethod(types.SimpleNamespace(max_capture_size=8))
+    layer = _layer()
+
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
+
+    assert len(created) == 1
+
+
+def test_kimi_method_process_weights_skips_a_module_without_the_expert_weights(mxfp4):
+    import torch
+    created = []
+    mxfp4.VllmMixtureOfExpertsOpMXFP4 = _fake_op_class(created)
+    mxfp4.state["kimi"] = True
+    method = mxfp4.HPUKimiK3Mxfp4MoEMethod(types.SimpleNamespace(max_capture_size=8))
+
+    method.process_weights_after_loading(torch.nn.Module())
+
+    assert not created
+
+
 def test_moe_layers_under_the_nested_submodel_config_get_the_hpu_method(mxfp4, monkeypatch):
     """K3 builds its language model under a Kimi-Linear submodel config; only the K3 build context tells them apart."""
     gate_source = _SOURCE.parents[1] / "kimi_k3_gate.py"
