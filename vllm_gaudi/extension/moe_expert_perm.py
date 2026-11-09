@@ -82,9 +82,8 @@ def local_expert_map(perm: list, ep_rank: int, local_num_experts: int) -> list:
 
 def remap(perm: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
     """Routing table of global expert ids -> physical slots."""
-    # int64 flat index_select, same pattern as the HPU grouped topk router
-    flat = perm.index_select(0, topk_ids.reshape(-1).long())
-    return flat.view(topk_ids.shape).to(topk_ids.dtype)
+    # int64 tensor indexing: index_select of this table gives wrong expert ids in HPU graphs
+    return perm[topk_ids.long()].to(topk_ids.dtype)
 
 
 def apply_to_layer(layer, perm: list) -> None:
