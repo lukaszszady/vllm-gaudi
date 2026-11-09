@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     VLLM_COMPACT_GDN: bool = False
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_ATTN_RES_RSTD_CACHE: bool = True
+    HPU_KIMI_ATTN_RES_BANK_MM: str = "0"
     HPU_KIMI_PREFILL_MERGE: bool = False
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     HPU_KIMI_KDA_SCAN_BLOCK: str = "8"
@@ -142,6 +143,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 attn_res: keep the mean square of each stored block next to the bank instead of recomputing it per read
     "HPU_KIMI_ATTN_RES_RSTD_CACHE":
     lambda: os.environ.get("HPU_KIMI_ATTN_RES_RSTD_CACHE", "1").strip().lower() in ("1", "true"),
+
+    # Kimi-K3 attn_res: bank reductions as bf16 matmuls ("0" = fp32 math, "1" = weighted sum, "2" = also the logits)
+    "HPU_KIMI_ATTN_RES_BANK_MM":
+    lambda: os.environ.get("HPU_KIMI_ATTN_RES_BANK_MM", "0"),
 
     # Kimi-K3 (no prefix caching): let several fresh prompts share one padded prefill batch
     "HPU_KIMI_PREFILL_MERGE":

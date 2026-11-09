@@ -1604,8 +1604,15 @@ def _patch_kimi_k3_arch() -> None:
         from vllm_gaudi.extension.logger import logger as _ext_logger
         import vllm_gaudi.envs as gaudi_envs
         from vllm_gaudi.ops.hpu_kda_pytorch import (KIMI_DECODER_LAYER_CLASSES, effective_intra_sub_chunk,
-                                                    install_functional_attn_res, parse_intra_sub_chunk,
-                                                    parse_prefill_settings, parse_scan_block)
+                                                    install_functional_attn_res, parse_attn_res_bank_mm,
+                                                    parse_intra_sub_chunk, parse_prefill_settings, parse_scan_block,
+                                                    set_attn_res_bank_mm)
+        try:
+            set_attn_res_bank_mm(parse_attn_res_bank_mm(gaudi_envs.HPU_KIMI_ATTN_RES_BANK_MM))
+        except ValueError as e:
+            _ext_logger().warning("Kimi-K3 attn_res: %s, keeping the fp32 bank math", e)
+        else:
+            _ext_logger().info("Kimi-K3 attn_res: bank matmul mode %s", gaudi_envs.HPU_KIMI_ATTN_RES_BANK_MM)
         if install_functional_attn_res(_amd_linear, cache_bank_norm=gaudi_envs.HPU_KIMI_ATTN_RES_RSTD_CACHE) is None:
             _ext_logger().warning(
                 "Kimi-K3: none of %s with forward_attn_residual in %s, the in-place upstream "
