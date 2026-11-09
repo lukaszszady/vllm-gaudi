@@ -18,6 +18,7 @@ import torch
 # vLLM installs handlers on the "vllm" logger tree only
 logger = logging.getLogger("vllm.gaudi.moe_expert_perm")
 _logged = False
+_warned_ep_size: set = set()
 
 _LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
@@ -51,10 +52,25 @@ def parse(data: dict, num_experts: int, expected_layers: Optional[set] = None, s
 
 
 @functools.lru_cache(maxsize=4)
-def load(path: str, num_experts: int, expected_layers: Optional[frozenset] = None) -> dict:
+def read(path: str) -> dict:
     with open(path) as f:
-        data = json.load(f)
-    return parse(data, num_experts, expected_layers, source=path)
+        return json.load(f)
+
+
+@functools.lru_cache(maxsize=4)
+def load(path: str, num_experts: int, expected_layers: Optional[frozenset] = None) -> dict:
+    return parse(read(path), num_experts, expected_layers, source=path)
+
+
+def warn_ep_size_mismatch(path: str, ep_size: int) -> None:
+    """Warn once per file whose ep_size differs from the layer's EP size (the balance it was fitted for is lost)."""
+    data = read(path)
+    file_ep_size = data.get("ep_size") if isinstance(data, dict) else None
+    if file_ep_size is None or file_ep_size == ep_size or path in _warned_ep_size:
+        return
+    _warned_ep_size.add(path)
+    logger.warning("MoE expert permutation %s was computed for EP size %s, the model runs with EP size %d", path,
+                   file_ep_size, ep_size)
 
 
 def decoder_layer_index(layer_name: str) -> int:
@@ -154,6 +170,7 @@ def apply_file(layer, path: str) -> None:
     perms = load(path, layer.global_num_experts, moe_layer_indices(hf_config))
     if index not in perms:
         raise ValueError(f"{path}: no permutation for decoder layer {index} ({layer.layer_name})")
+    warn_ep_size_mismatch(path, layer.global_num_experts // layer.local_num_experts)
     apply_to_layer(layer, perms[index])
     global _logged
     if not _logged:
