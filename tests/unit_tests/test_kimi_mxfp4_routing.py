@@ -94,9 +94,8 @@ def mxfp4(monkeypatch):
            dispatch_hidden_states=None,
            dispatch_tensor=None,
            get_hpu_dp_metadata=None)
-    module("vllm_gaudi.patches",
-           _current_config_is_kimi_k3=lambda: state["kimi"],
-           _hpu_mxfp4_routed_apply=lambda *args: state["apply_calls"].append(args) or "out")
+    module("vllm_gaudi.kimi_k3_gate", current_config_is_kimi_k3=lambda: state["kimi"])
+    module("vllm_gaudi.patches", _hpu_mxfp4_routed_apply=lambda *args: state["apply_calls"].append(args) or "out")
 
     spec = importlib.util.spec_from_file_location("hpu_mxfp4_under_test", _SOURCE)
     mod = importlib.util.module_from_spec(spec)
@@ -324,8 +323,9 @@ def test_moe_layers_under_the_nested_submodel_config_get_the_hpu_method(mxfp4, m
     config_mod.get_current_vllm_config_or_none = lambda: nested
     monkeypatch.setitem(sys.modules, "vllm.config", config_mod)
 
-    # the routing wrapper reads the predicate through the stubbed vllm_gaudi.patches: use the real one
-    monkeypatch.setattr(sys.modules["vllm_gaudi.patches"], "_current_config_is_kimi_k3", gate.current_config_is_kimi_k3)
+    # the routing wrapper reads the predicate through the stubbed vllm_gaudi.kimi_k3_gate: use the real one
+    monkeypatch.setattr(sys.modules["vllm_gaudi.kimi_k3_gate"], "current_config_is_kimi_k3",
+                        gate.current_config_is_kimi_k3)
     monkeypatch.setattr(mxfp4.upstream.Mxfp4Config, "_make_moe_method", _original_make(mxfp4), raising=True)
     mxfp4.upstream.Mxfp4Config._hpu_kimi_k3_routed = False
     mxfp4._route_kimi_k3_moe_method()

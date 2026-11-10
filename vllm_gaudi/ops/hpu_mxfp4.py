@@ -86,7 +86,7 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         # carries w13_bias/w2_bias, route through bias_mxfp4_fused_weights.
         has_bias = hasattr(layer, "w13_bias") and hasattr(layer, "w2_bias")
 
-        from vllm_gaudi.patches import _current_config_is_kimi_k3
+        from vllm_gaudi.kimi_k3_gate import current_config_is_kimi_k3
         layer.moe_op = VllmMixtureOfExpertsOpMXFP4(
             layer.global_num_experts,
             num_experts,
@@ -95,7 +95,7 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
             block_size=self.MXFP4_BLOCK_SIZE,
             has_bias=has_bias,
             dispatch_fn=dispatch_fn,
-            in_graph_call=_current_config_is_kimi_k3(),
+            in_graph_call=current_config_is_kimi_k3(),
         )
 
         for expert_id in range(num_experts):
@@ -154,7 +154,7 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
         # The fused kernel has no SiTU: exact unfused routed experts (see ops/hpu_situ_moe.py).
-        # Env reads and the SiTU helper run only for SiTU layers; every other model calls the fused op directly.
+        # The SiTU env reads and helper run only for SiTU layers; any other activation calls the fused op directly.
         output = None
         if getattr(layer.activation, "value", layer.activation) == "situ":
             output = maybe_situ_moe(layer, x, topk_ids, topk_weights, situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL),
@@ -262,14 +262,14 @@ def _route_kimi_k3_moe_method() -> None:
     Kimi-K3 patches having been installed. Other models, and ``GptOssMxfp4Config`` (which overrides the method),
     keep the upstream behaviour.
     """
-    from vllm_gaudi.patches import _current_config_is_kimi_k3
+    from vllm_gaudi.kimi_k3_gate import current_config_is_kimi_k3
     config_cls = mxfp4_module.Mxfp4Config
     if getattr(config_cls, "_hpu_kimi_k3_routed", False):
         return
     orig = config_cls._make_moe_method
 
     def _make_moe_method(self, moe):
-        if _current_config_is_kimi_k3():
+        if current_config_is_kimi_k3():
             return HPUKimiK3Mxfp4MoEMethod(moe)
         return orig(self, moe)
 

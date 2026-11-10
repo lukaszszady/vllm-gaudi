@@ -999,15 +999,6 @@ def _is_kimi_k3_model(model) -> bool:
     return any(c.__module__.startswith(_KIMI_K3_MODULE) for c in type(model).__mro__)
 
 
-def _is_kimi_k3_config(model_config) -> bool:
-    return is_kimi_k3_model_config(model_config)
-
-
-def _current_config_is_kimi_k3() -> bool:
-    """True when the vllm config being built/used right now is for a Kimi-K3 model (False when there is none)."""
-    return current_config_is_kimi_k3()
-
-
 def _kimi_patches_live() -> dict[str, bool]:
     """Whether the patches that matter to a model worker are on the objects the model will really use.
 
@@ -1048,7 +1039,7 @@ def ensure_kimi_k3_patches(model_config) -> None:
     run on HPU and crash in a worker (``assert isinstance(attn_metadata_raw, dict)``), so that case raises.
     Non-Kimi-K3 configs are not touched.
     """
-    if not _is_kimi_k3_config(model_config):
+    if not is_kimi_k3_model_config(model_config):
         return
     if not _KIMI_PATCHES_FAILED and all(_kimi_patches_live().values()):
         return
@@ -1101,7 +1092,7 @@ def report_kimi_patches(model) -> None:
 def report_kimi_patches_on_load_failure(model_config) -> None:
     """``get_model`` raised: no model exists, so say which patches are missing (the likely cause) before re-raising."""
     global _KIMI_PATCHES_REPORTED
-    if _KIMI_PATCHES_REPORTED or not _is_kimi_k3_config(model_config):
+    if _KIMI_PATCHES_REPORTED or not is_kimi_k3_model_config(model_config):
         return
     _KIMI_PATCHES_REPORTED = True
     _kimi_patches_log_failed()
@@ -1116,7 +1107,7 @@ def _report_kimi_config_patches(model_config) -> None:
     only matter to model workers (kda_forward, attn_res_*, ...) are left to ``report_kimi_patches``.
     """
     global _KIMI_CONFIG_REPORTED
-    if _KIMI_CONFIG_REPORTED or not _is_kimi_k3_config(model_config):
+    if _KIMI_CONFIG_REPORTED or not is_kimi_k3_model_config(model_config):
         return
     _KIMI_CONFIG_REPORTED = True
     _kimi_patches_log_failed(only=_KIMI_CONFIG_PATCHES)
@@ -1177,7 +1168,7 @@ def _patch_mla_prefill_selector() -> None:
 
         def hpu_get_prefill(vllm_config):
             from vllm.platforms import current_platform
-            if orig_fn and not _is_kimi_k3_config(getattr(vllm_config, "model_config", None)):
+            if orig_fn and not is_kimi_k3_model_config(getattr(vllm_config, "model_config", None)):
                 return orig_fn(vllm_config)
             if getattr(current_platform, "device_type", None) == "hpu" or getattr(current_platform, "device_name",
                                                                                   None) == "hpu":
@@ -1212,18 +1203,16 @@ def _patch_kimi_k3_hybrid_config() -> None:
             def _hpu_post_init(self, *args, **kwargs):
                 orig_post_init(self, *args, **kwargs)
                 _report_kimi_config_patches(self)
-                if _is_kimi_k3_config(self):
-                    mark_kimi_k3_seen()
+                if not is_kimi_k3_model_config(self):
+                    return
+                mark_kimi_k3_seen()
                 # Ensure KimiMoE does not pad moe_intermediate_size from 3072 to 4096 under EP
                 # (saves device memory on every card)
-                if _is_kimi_k3_config(self):
-                    for cfg_obj in (getattr(self, "hf_text_config", None), getattr(self, "hf_config", None)):
-                        if cfg_obj is not None:
-                            cfg_obj.min_moe_intermediate_per_partition = 1
-                lac = None
-                if _is_kimi_k3_config(self):
-                    lac = getattr(self.hf_text_config, "linear_attn_config", None) or getattr(
-                        self.hf_config, "linear_attn_config", None)
+                for cfg_obj in (getattr(self, "hf_text_config", None), getattr(self, "hf_config", None)):
+                    if cfg_obj is not None:
+                        cfg_obj.min_moe_intermediate_per_partition = 1
+                lac = getattr(self.hf_text_config, "linear_attn_config", None) or getattr(
+                    self.hf_config, "linear_attn_config", None)
                 if lac is not None and not getattr(self.hf_text_config, "layer_types", None):
                     full_set = set(
                         lac.get("full_attn_layers", []) if isinstance(lac, dict
@@ -1314,7 +1303,7 @@ def _patch_moe_runner_delegation() -> None:
             if cls.__dict__.get("_hpu_kimi_k3_runner") or any(
                     getattr(c, "_hpu_kimi_k3_runner", False) for c in cls.__mro__):
                 return  # already a Kimi-K3 runner: no double swap
-            if _current_config_is_kimi_k3():
+            if current_config_is_kimi_k3():
                 self.__class__ = _kimi_k3_runner_class(cls)
 
         MoERunner.__init__ = _init
@@ -1760,7 +1749,7 @@ def _patch_compressed_tensors_mxfp4() -> None:
                 block_size=self.group_size,
                 has_bias=has_bias,
                 dispatch_fn=dispatch_fn,  # type: ignore[arg-type]
-                in_graph_call=_current_config_is_kimi_k3(),
+                in_graph_call=current_config_is_kimi_k3(),
             )
 
             for expert_id in range(num_experts):
