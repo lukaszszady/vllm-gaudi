@@ -135,6 +135,7 @@ def grouped_topk(
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
+    is_padding: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK and current_platform.is_cuda() and num_expert_group <= 32 and topk <= 32
             and e_score_correction_bias is not None):
@@ -148,11 +149,17 @@ def grouped_topk(
             topk_group=topk_group,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
+            is_padding=is_padding,
         )
 
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
-    return _grouped_topk_impl(gating_output, topk, renormalize, num_expert_group, topk_group, scoring_func,
-                              routed_scaling_factor, e_score_correction_bias, hidden_states.dtype)
+    topk_weights, topk_ids = _grouped_topk_impl(gating_output, topk, renormalize, num_expert_group, topk_group,
+                                                scoring_func, routed_scaling_factor, e_score_correction_bias,
+                                                hidden_states.dtype)
+    if is_padding is not None:
+        topk_weights = topk_weights.masked_fill(is_padding.unsqueeze(1), 0)
+        topk_ids = topk_ids.masked_fill(is_padding.unsqueeze(1), -1)
+    return topk_weights, topk_ids
 
 
 # --8<-- [start:grouped_topk]

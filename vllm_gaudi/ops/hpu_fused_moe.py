@@ -752,7 +752,8 @@ def _hpu_apply_moe_dp1(
     # Apply the gate if the runner holds it (mirrors _forward_impl).
     if self.gate is not None:
         if self._fse_fuse_gate:
-            self._maybe_fuse_gate_weights()
+            if self._combined_gate_weight is None:
+                self.process_weights_after_loading()
             router_logits = torch.nn.functional.linear(hidden_states, self._combined_gate_weight)
         else:
             router_logits, _ = self.gate(hidden_states)

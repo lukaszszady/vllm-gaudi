@@ -249,3 +249,22 @@ def test_kimi_k3_routing_compiles_to_one_graph_for_all_token_counts(router):
     assert counter.frame_count == 1
     assert not any("gather" in name for name in targets)
     dynamo.reset()
+
+
+def test_grouped_topk_accepts_is_padding_like_upstream(router):
+    """Upstream GroupedTopKRouter calls grouped_topk(..., is_padding=mask): padded rows get weight 0 and id -1."""
+    logits, bias = _kimi_like_inputs(6, 6, 256)
+    hidden = torch.zeros(6, 4, dtype=torch.bfloat16)
+    is_padding = torch.tensor([False, True, False, False, True, False])
+    kwargs = dict(topk=8,
+                  renormalize=True,
+                  num_expert_group=8,
+                  topk_group=4,
+                  scoring_func="sigmoid",
+                  routed_scaling_factor=2.5,
+                  e_score_correction_bias=bias)
+    ref_weights, ref_ids = router.grouped_topk(hidden, logits, **kwargs)
+    weights, ids = router.grouped_topk(hidden, logits, is_padding=is_padding, **kwargs)
+    keep = ~is_padding
+    assert torch.equal(ids[keep], ref_ids[keep]) and torch.equal(weights[keep], ref_weights[keep])
+    assert (ids[is_padding] == -1).all() and (weights[is_padding] == 0).all()
