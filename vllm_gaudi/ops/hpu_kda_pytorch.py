@@ -724,45 +724,6 @@ def attn_res_functional(prefix: torch.Tensor, delta: torch.Tensor | None, blocks
     return new_prefix, new_blocks, mixed
 
 
-# 0: fp32 bank math, 1: weighted sum of the blocks as a bf16 matmul, 2: also the block logits as a bf16 matmul
-_ATTN_RES_BANK_MM = 0
-
-
-def parse_attn_res_bank_mm(value: str) -> int:
-    """``HPU_KIMI_ATTN_RES_BANK_MM``: "0" (or empty) = fp32 bank math, "1" = matmul mix, "2" = matmul mix + logits."""
-    value = value.strip() or "0"
-    if value not in ("0", "1", "2"):
-        raise ValueError(f"HPU_KIMI_ATTN_RES_BANK_MM must be 0, 1 or 2, got {value!r}")
-    return int(value)
-
-
-def set_attn_res_bank_mm(mode: int) -> None:
-    global _ATTN_RES_BANK_MM
-    if mode not in (0, 1, 2):
-        raise ValueError(f"attn_res bank matmul mode must be 0, 1 or 2, got {mode!r}")
-    _ATTN_RES_BANK_MM = mode
-
-
-def _split_bf16(x: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-    """fp32 ``x`` as ``hi + lo`` in ``dtype``: a matmul of both against exact ``dtype`` values keeps ~fp32 weights."""
-    hi = x.to(dtype)
-    return hi, (x - hi.float()).to(dtype)
-
-
-def attn_res_bank_mix(probs: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
-    """fp32 ``sum_r probs[:, r] * bank[:, r]`` of probs [M, S] and bank [M, S, D] without an fp32 copy of the bank."""
-    hi, lo = _split_bf16(probs, bank.dtype)
-    out = torch.bmm(torch.stack((hi, lo), dim=1), bank)  # [M, 2, D]
-    return out[:, 0].float() + out[:, 1].float()
-
-
-def attn_res_bank_dot(bank: torch.Tensor, qk: torch.Tensor) -> torch.Tensor:
-    """fp32-weight ``(bank * qk).sum(-1)`` of bank [M, S, D] and fp32 qk [D] without an fp32 copy of the bank."""
-    hi, lo = _split_bf16(qk, bank.dtype)
-    out = torch.matmul(bank, torch.stack((hi, lo), dim=1))  # [M, S, 2]
-    return out[..., 0].float() + out[..., 1].float()
-
-
 def attn_res_bank_mean_square(blocks: torch.Tensor, num_valid_blocks: int) -> torch.Tensor:
     """fp32 ``mean(v^2)`` of the first ``num_valid_blocks`` stored blocks of ``blocks`` [M, R, D]; zeros after."""
     num_tokens, num_bank, hidden = blocks.shape
@@ -810,29 +771,22 @@ def attn_res_functional_cached(
         mixed = updated
     else:
         # The stored blocks are read in their own dtype (no cat with the prefix); the updated prefix is a
-        # separate [M, D] term and reductions accumulate in fp32. _ATTN_RES_BANK_MM moves the bank reductions
-        # to bf16 matmuls (rounded bf16 outputs) instead of fp32 elementwise passes over the bank.
+        # separate [M, D] term and reductions accumulate in fp32.
         bank = new_blocks[:, :num_blocks]  # [M, S, D]
         qk = norm_weight.float() * qk_weight.float()  # [D]
         bank_sq = torch.square(bank.float()).sum(dim=-1) / hidden if new_ms is None else new_ms[:, :num_blocks]
         bank_rstd = torch.rsqrt(bank_sq + eps)  # [M, S]
-        if _ATTN_RES_BANK_MM >= 2:
-            bank_logits = attn_res_bank_dot(bank, qk) * bank_rstd
-        else:
-            bank_logits = (bank.float() * qk).sum(dim=-1) * bank_rstd
+        bank_logits = (bank.float() * qk).sum(dim=-1) * bank_rstd
         if own_ms is None:
             own_ms = torch.square(updated).sum(dim=-1, keepdim=True) / hidden
         own_rstd = torch.rsqrt(own_ms + eps)  # [M, 1]
         own_logit = (updated * qk).sum(dim=-1, keepdim=True) * own_rstd
         probs = torch.softmax(torch.cat((bank_logits, own_logit), dim=-1), dim=-1)  # [M, S + 1]
-        if _ATTN_RES_BANK_MM >= 1:
-            mixed = attn_res_bank_mix(probs[:, :num_blocks], bank) + probs[:, num_blocks:] * updated
-        else:
-            # fp32 weighted sum over the stored blocks as elementwise ops (no M=1 bmm), in the kernel's order
-            mixed = probs[:, :1] * bank[:, 0].float()
-            for r in range(1, num_blocks):
-                mixed = mixed + probs[:, r:r + 1] * bank[:, r].float()
-            mixed = mixed + probs[:, num_blocks:] * updated
+        # fp32 weighted sum over the stored blocks as elementwise ops (no M=1 bmm), in the kernel's order
+        mixed = probs[:, :1] * bank[:, 0].float()
+        for r in range(1, num_blocks):
+            mixed = mixed + probs[:, r:r + 1] * bank[:, r].float()
+        mixed = mixed + probs[:, num_blocks:] * updated
     if output_norm_weight is not None:
         mixed = mixed * torch.rsqrt(mixed.pow(2).mean(dim=-1, keepdim=True) + output_norm_eps)
         mixed = mixed * output_norm_weight.float()
@@ -905,12 +859,7 @@ def attn_res_torch(prefix: torch.Tensor,
     return mixed
 
 
-def forward_attn_residual_functional(self,
-                                     positions,
-                                     hidden_states,
-                                     block_residual,
-                                     prefix_delta,
-                                     cache_bank_norm: bool = False):
+def forward_attn_residual_functional(self, positions, hidden_states, block_residual, prefix_delta):
     """``KimiLinearDecoderLayer.forward_attn_residual`` without in-place updates of its inputs.
 
     Upstream relies on ``attn_res`` mutating ``prefix_sum`` and ``block_residual`` across layer boundaries; with
@@ -919,7 +868,7 @@ def forward_attn_residual_functional(self,
     layers (the bank copy costs ``tokens * bank * hidden`` elements per write layer).
     """
     blocks, bank_ms = block_residual if isinstance(block_residual, tuple) else (block_residual, None)
-    if cache_bank_norm and bank_ms is None:
+    if bank_ms is None:
         bank_ms = attn_res_bank_mean_square(blocks, self.prev_valid_blocks)
     prefix_sum = hidden_states
     write_idx = self.block_write_idx if self.is_block_write_layer else -1
@@ -942,16 +891,11 @@ def forward_attn_residual_functional(self,
                                                                  self.mlp_res_norm, mlp_valid_blocks, prefix_delta,
                                                                  self.post_attention_layernorm, -1)
     hidden_states = self.mlp(hidden_states)
-    return prefix_sum, blocks if bank_ms is None else (blocks, bank_ms), hidden_states
+    return prefix_sum, (blocks, bank_ms), hidden_states
 
 
 # upstream vllm/models/kimi_k3/amd/linear.py names it KimiDecoderLayer; KimiLinearDecoderLayer is the older name
 KIMI_DECODER_LAYER_CLASSES = ("KimiDecoderLayer", "KimiLinearDecoderLayer")
-
-
-def find_kimi_decoder_layer_class(linear_mod) -> type | None:
-    """The decoder layer class of the Kimi-K3 ``linear`` module under any of its known names, or None."""
-    return next((getattr(linear_mod, n) for n in KIMI_DECODER_LAYER_CLASSES if hasattr(linear_mod, n)), None)
 
 
 def kimi_decoder_layer_class(linear_mod) -> type | None:
@@ -963,12 +907,12 @@ def kimi_decoder_layer_class(linear_mod) -> type | None:
     return None
 
 
-def install_functional_attn_res(linear_mod, cache_bank_norm: bool = False) -> type | None:
+def install_functional_attn_res(linear_mod) -> type | None:
     """Replace ``forward_attn_residual`` of the Kimi-K3 decoder layer with the out-of-place version.
 
     Returns the patched class (idempotent), or None when ``linear_mod`` has no such class; the caller must report
     that loudly: without the patch the in-place upstream version runs inside the per-layer compiled graphs.
-    ``cache_bank_norm``: the layers pass the block bank on as ``(bank, bank_ms)`` (see ``attn_res_functional_cached``).
+    The layers pass the block bank on as ``(bank, bank_ms)`` (see ``attn_res_functional_cached``).
     """
     cls: Any = kimi_decoder_layer_class(linear_mod)
     if cls is None or getattr(cls.forward_attn_residual, "_hpu_functional_attn_res", False):
@@ -988,8 +932,7 @@ def install_functional_attn_res(linear_mod, cache_bank_norm: bool = False) -> ty
             # later attn_res mix, so fail loudly instead.
             raise RuntimeError(f"Kimi-K3 block residual bank {tuple(blocks.shape)} does not match "
                                f"the hidden states {tuple(hidden_states.shape)}")
-        return forward_attn_residual_functional(self, positions, hidden_states, block_residual, prefix_delta,
-                                                cache_bank_norm)
+        return forward_attn_residual_functional(self, positions, hidden_states, block_residual, prefix_delta)
 
     forward_attn_residual._hpu_functional_attn_res = True  # type: ignore[attr-defined]
     cls.forward_attn_residual = forward_attn_residual
