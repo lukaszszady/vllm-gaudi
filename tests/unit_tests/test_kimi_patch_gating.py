@@ -346,6 +346,17 @@ def test_k3_mla_model_gets_the_dummy_prefill_backend(config_patches):
     assert config_patches.test_selector.get_mla_prefill_backend(vllm_config) is config_patches.test_dummy
 
 
+@pytest.mark.parametrize("architectures,expected", [(["KimiK3ForConditionalGeneration"], 1),
+                                                    (["Kimi_K25ForConditionalGeneration"], 0),
+                                                    (["Llama4ForConditionalGeneration"], 0)])
+def test_settings_are_logged_only_for_k3_configs(config_patches, monkeypatch, architectures, expected):
+    calls = []
+    monkeypatch.setattr(config_patches, "_log_kimi_k3_settings", lambda: calls.append(1))
+    config_patches.test_model_config(architectures)
+
+    assert len(calls) == expected
+
+
 def test_hybrid_config_patch_does_not_wrap_post_init_twice(config_patches):
     wrapped = config_patches.test_model_config.__post_init__
     config_patches._patch_kimi_k3_hybrid_config()

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     HPU_KIMI_PREFILL_MERGE: bool = False
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     VLLM_HPU_TWO_STAGE_TOPK: bool = True
+    VLLM_HPU_MIN_PREFILL_CHUNK: str = ""
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -140,6 +141,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Grouped top-k router: top-k of wide expert rows (>= 512 experts) as a top-k per 128 experts, then over the winners
     "VLLM_HPU_TWO_STAGE_TOPK":
     lambda: os.environ.get("VLLM_HPU_TWO_STAGE_TOPK", "1").strip().lower() in ("1", "true"),
+
+    # Async scheduler: smallest first chunk of a new prefill that may join a step already carrying another prefill
+    # (integer, empty or 0 = off)
+    "VLLM_HPU_MIN_PREFILL_CHUNK":
+    lambda: os.environ.get("VLLM_HPU_MIN_PREFILL_CHUNK", ""),
 }
 
 # end-env-vars-definition

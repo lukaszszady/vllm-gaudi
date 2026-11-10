@@ -415,5 +415,11 @@ def install_kimi_k3_video() -> None:
         "fps": K3_VIDEO_LOADER_FPS,
     })
     setattr(model_cls, _INSTALLED_FLAG, True)
-    logger.info("Kimi-K3 video input enabled (loader fps=%s, max frames=%s, %s=%d)", K3_VIDEO_LOADER_FPS,
-                K3_VIDEO_LOADER_MAX_FRAMES, ENV_VIT_DP, int(_vit_dp_requested()))
+
+
+def log_video_settings() -> None:
+    """Logs the video input settings when ``install_kimi_k3_video`` has installed the modality."""
+    import vllm.models.kimi_k3.amd.model as amd_model
+    if getattr(amd_model.KimiK3ForConditionalGeneration, _INSTALLED_FLAG, False):
+        logger.info("Kimi-K3 video input enabled (loader fps=%s, max frames=%s, %s=%d)", K3_VIDEO_LOADER_FPS,
+                    K3_VIDEO_LOADER_MAX_FRAMES, ENV_VIT_DP, int(_vit_dp_requested()))

@@ -1206,6 +1206,7 @@ def _patch_kimi_k3_hybrid_config() -> None:
                 if not is_kimi_k3_model_config(self):
                     return
                 mark_kimi_k3_seen()
+                _log_kimi_k3_settings()
                 # Ensure KimiMoE does not pad moe_intermediate_size from 3072 to 4096 under EP
                 # (saves device memory on every card)
                 for cfg_obj in (getattr(self, "hf_text_config", None), getattr(self, "hf_config", None)):
@@ -1474,6 +1475,24 @@ def _patch_kimi_attn_res() -> None:
         _kimi_patch_failed("attn_res")
 
 
+_kimi_k3_settings_logged = False
+
+
+def _log_kimi_k3_settings() -> None:
+    """Log the Kimi-K3 KDA prefill and video settings once per process, only when the served model is Kimi-K3."""
+    global _kimi_k3_settings_logged
+    if _kimi_k3_settings_logged:
+        return
+    _kimi_k3_settings_logged = True
+    try:
+        from vllm_gaudi.models.kimi_k3_kda import log_prefill_settings
+        from vllm_gaudi.models.kimi_k3_video import log_video_settings
+        log_prefill_settings()
+        log_video_settings()
+    except Exception:
+        _kimi_patch_logger().debug("Kimi-K3 settings log failed", exc_info=True)
+
+
 def _mark_kimi_k3_construction(model_cls: type, shared_layer_classes: tuple[type, ...]) -> None:
     """Build ``model_cls`` inside the Kimi-K3 build context and tag its instances of ``shared_layer_classes``.
 
@@ -1591,7 +1610,6 @@ def _patch_kimi_k3_arch() -> None:
         # out-of-place attn_res on the decoder layer (2D inputs, bank shape check): the in-place updates of the
         # upstream version do not survive the per-layer graph boundaries of torch.compile mode
         from vllm_gaudi.extension.logger import logger as _ext_logger
-        from vllm_gaudi.models.kimi_k3_kda import log_prefill_settings
         from vllm_gaudi.ops.hpu_kda_pytorch import KIMI_DECODER_LAYER_CLASSES, install_functional_attn_res
         if install_functional_attn_res(_amd_linear) is None:
             _ext_logger().warning(
@@ -1599,7 +1617,6 @@ def _patch_kimi_k3_arch() -> None:
                 "attn_res stays active", KIMI_DECODER_LAYER_CLASSES, _amd_linear.__name__)
         else:
             _kimi_patch_installed("functional_attn_res")
-        log_prefill_settings()
 
         # Monkey-patch KimiMoE.forward to ensure inputs are safely 2D
         orig_moe_forward = getattr(_amd_linear.KimiMoE, "forward", None)

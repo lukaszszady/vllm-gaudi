@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 from collections.abc import Iterable
 from functools import cached_property
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.request import Request, RequestStatus
+
+import vllm_gaudi.envs as gaudi_envs
 
 logger = init_logger("vllm.gaudi.hpu_async_scheduler")
 
@@ -49,7 +50,7 @@ class HPUAsyncScheduler(AsyncScheduler):
     def _min_prefill_chunk(self) -> int:
         """``VLLM_HPU_MIN_PREFILL_CHUNK``: smallest first chunk of a new prefill
         that may join a step already carrying another prefill (0 = off)."""
-        value = os.environ.get("VLLM_HPU_MIN_PREFILL_CHUNK", "").strip()
+        value = gaudi_envs.VLLM_HPU_MIN_PREFILL_CHUNK.strip()
         if not value:
             return 0
         try:
