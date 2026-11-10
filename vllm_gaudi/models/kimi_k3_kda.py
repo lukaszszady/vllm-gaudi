@@ -12,9 +12,10 @@ read from and written to a single slot per request.
 
 import torch
 
+from vllm_gaudi.extension.logger import logger
 from vllm_gaudi.ops.hpu_kda_pytorch import (effective_intra_sub_chunk, gated_rmsnorm_sigmoid, kda_decode_step,
                                             kda_prefill_step, parse_intra_sub_chunk, parse_prefill_settings,
-                                            parse_scan_block, write_kda_decode_state)
+                                            write_kda_decode_state)
 
 
 # The state update mutates the cache tensors in place: HPU compile silently drops in-place index_copy_ on aliased
@@ -104,10 +105,21 @@ def _intra_sub_chunk() -> int:
                                      parse_intra_sub_chunk(gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK))
 
 
-@torch.compiler.assume_constant_result
-def _scan_block() -> int:
+def log_prefill_settings() -> None:
+    """Logs the effective KDA prefill settings, or why they are invalid."""
     from vllm_gaudi import envs as gaudi_envs
-    return parse_scan_block(gaudi_envs.HPU_KIMI_KDA_SCAN_BLOCK)
+    try:
+        chunk_size, vec_chunks = _prefill_settings()
+        sub_chunk = parse_intra_sub_chunk(gaudi_envs.HPU_KIMI_KDA_INTRA_SUB_CHUNK)
+    except ValueError as e:
+        logger().warning("Kimi-K3 KDA prefill settings: %s", e)
+        return
+    effective = effective_intra_sub_chunk(chunk_size, sub_chunk)
+    if sub_chunk != effective:
+        logger().warning(
+            "HPU_KIMI_KDA_INTRA_SUB_CHUNK=%d ignored: it must divide the KDA prefill chunk %d into "
+            "at least two blocks; using the full pairwise path", sub_chunk, chunk_size)
+    logger().info("Kimi-K3 KDA prefill: chunk %d,%d, intra sub-chunk %d", chunk_size, vec_chunks, effective)
 
 
 def _state_indices(self, attn_metadata) -> torch.Tensor:
@@ -178,7 +190,6 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                     mask = mask.reshape(num_seqs, seq_len)
                 chunk_size, vec_chunks = _prefill_settings()
                 sub_chunk = _intra_sub_chunk()
-                scan_block = _scan_block()
                 # a strided view would cross the graph break below (strided_view fails in Synapse)
                 gate_proj = gate_proj.contiguous()
                 core, slots, conv_rows, ssm_rows = kda_prefill_step(mixed_qkv.reshape(num_seqs, seq_len, -1),
@@ -191,7 +202,6 @@ def hpu_kda_forward(self, hidden_states: torch.Tensor, positions: torch.Tensor =
                                                                     chunk_size=chunk_size,
                                                                     vec_chunks=vec_chunks,
                                                                     sub_chunk=sub_chunk,
-                                                                    scan_block=scan_block,
                                                                     **common)
                 core = _write_state(core, conv_cache, ssm_cache, slots, conv_rows, ssm_rows)
                 # Keep post-processing out of the statement that calls the disabled write: ops chained on its last

@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_PREFILL_MERGE: bool = False
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
-    HPU_KIMI_KDA_SCAN_BLOCK: str = "8"
     VLLM_HPU_TWO_STAGE_TOPK: bool = True
 
 # The begin-* and end* here are used by the documentation generator
@@ -133,10 +132,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 KDA prefill: rows per block of the blockwise intra-chunk A / Aqk ("0" = full pairwise decay)
     "HPU_KIMI_KDA_INTRA_SUB_CHUNK":
     lambda: os.environ.get("HPU_KIMI_KDA_INTRA_SUB_CHUNK", "0"),
-
-    # Kimi-K3 KDA prefill: chunks per block of the scanned state recurrence ("0" or "1" = one step per chunk)
-    "HPU_KIMI_KDA_SCAN_BLOCK":
-    lambda: os.environ.get("HPU_KIMI_KDA_SCAN_BLOCK", "8"),
 
     # Kimi-K3 (no prefix caching): let several fresh prompts share one padded prefill batch
     "HPU_KIMI_PREFILL_MERGE":
