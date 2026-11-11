@@ -505,13 +505,14 @@ def test_install_skips_a_failing_patch_unless_strict(kda_modules, monkeypatch):
         raise ImportError("partially initialised")
 
     for name in ("_patch_kimi_kda", "_patch_kimi_attn_res", "_patch_kimi_linear_weights", "_patch_mla_prefill_selector",
-                 "_patch_moe_runner_delegation", "_patch_latent_moe_runner_forward", "_patch_kimi_k3_hybrid_config",
-                 "_patch_kimi_k3_arch", "_patch_kimi_k3_video", "_patch_compressed_tensors_mxfp4"):
+                 "_patch_mla_bind_kv_cache", "_patch_moe_runner_delegation", "_patch_latent_moe_runner_forward",
+                 "_patch_kimi_k3_hybrid_config", "_patch_kimi_k3_arch", "_patch_kimi_k3_video",
+                 "_patch_compressed_tensors_mxfp4"):
         monkeypatch.setattr(kda_modules, name, lambda name=name: calls.append(name))
     monkeypatch.setattr(kda_modules, "_patch_kimi_kda", boom)
 
     kda_modules._install_kimi_k3_patches()
-    assert len(calls) == 9  # the others still ran
+    assert len(calls) == 10  # the others still ran
     with pytest.raises(ImportError):
         kda_modules._install_kimi_k3_patches(strict=True)
 
@@ -526,6 +527,19 @@ def test_ensure_raises_when_kda_forward_is_not_active(kda_modules, monkeypatch):
 
     kda_modules._patch_kimi_kda()
     kda_modules.ensure_kimi_k3_patches(cfg)
+
+
+def test_warns_when_k3_config_patch_is_not_active(config_patches, caplog):
+    k3 = types.SimpleNamespace(model_config=types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]))
+    other = types.SimpleNamespace(model_config=types.SimpleNamespace(architectures=["LlamaForCausalLM"]))
+
+    with caplog.at_level("WARNING"):
+        config_patches.warn_if_kimi_k3_config_patches_inactive(k3)  # patch installed by the fixture
+        config_patches.test_model_config.__post_init__ = lambda self: None
+        config_patches.warn_if_kimi_k3_config_patches_inactive(other)
+        assert not caplog.records
+        config_patches.warn_if_kimi_k3_config_patches_inactive(k3)
+    assert "config patches are not active" in caplog.text
 
 
 # The "only the gpt-oss alias is installed upstream" check is behavioural and lives in test_kimi_mxfp4_routing.py

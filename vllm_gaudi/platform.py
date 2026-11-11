@@ -203,6 +203,8 @@ class HpuPlatform(Platform):
         cls.set_compile_env_defaults()
         if is_kimi_k3_vllm_config(vllm_config):
             mark_kimi_k3_seen()
+            from vllm_gaudi.patches import warn_if_kimi_k3_config_patches_inactive
+            warn_if_kimi_k3_config_patches_inactive(vllm_config)
         cls._maybe_disable_synapse_input_reuse(vllm_config)
         parallel_config = vllm_config.parallel_config
 

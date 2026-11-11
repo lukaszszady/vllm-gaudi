@@ -262,7 +262,7 @@ def kda_chunked_steps_vec(state: torch.Tensor,
                           beta: torch.Tensor,
                           chunk_size: int = 64,
                           vec_chunks: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
-    """Chunk-parallel (WY / UT form) delta rule, equal to ``kda_recurrent_steps``.
+    """Chunk-parallel (WY / UT form) delta rule, equal to the token-by-token recurrence.
 
     q,k [B,L,H,K] (normalized, q scaled); v [B,L,H,V]; g [B,L,H,K] LOG forget gate (<= 0); beta [B,L,H];
     state [B,H,V,K]. Tokens past the real length must have g = 0 and beta = 0 (exact no-ops); the sequence is

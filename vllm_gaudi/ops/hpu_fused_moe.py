@@ -856,8 +856,6 @@ def prime_moe_runners_for_compile(model: torch.nn.Module) -> int:
         routed_experts = getattr(module, "routed_experts", None)
         if routed_experts is not None and hasattr(routed_experts, "_ensure_moe_quant_config_init"):
             routed_experts._ensure_moe_quant_config_init()
-        if getattr(module, "_logged_sharded_tail", True) is False:
-            module._logged_sharded_tail = True
         primed += 1
     return primed
 

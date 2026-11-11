@@ -97,8 +97,8 @@ import gc
 import inspect
 from typing import Callable, Optional
 
-from vllm_gaudi.kimi_k3_gate import (current_config_is_kimi_k3, is_kimi_k3_model_config, kimi_k3_build_context,
-                                     mark_kimi_k3_seen)
+from vllm_gaudi.kimi_k3_gate import (current_config_is_kimi_k3, is_kimi_k3_model_config, is_kimi_k3_vllm_config,
+                                     kimi_k3_build_context, mark_kimi_k3_seen)
 
 import torch
 
@@ -926,8 +926,9 @@ def _patch_sdpa_attention_forward() -> None:
 def _install_kimi_k3_patches(strict: bool = False) -> None:
     """Install the Kimi-K3 patches (idempotent). Non-strict: a failing patch is skipped (partially initialised vllm)."""
     for patch in (_patch_kimi_kda, _patch_kimi_attn_res, _patch_kimi_linear_weights, _patch_mla_prefill_selector,
-                  _patch_moe_runner_delegation, _patch_latent_moe_runner_forward, _patch_kimi_k3_hybrid_config,
-                  _patch_kimi_k3_arch, _patch_kimi_k3_video, _patch_compressed_tensors_mxfp4):
+                  _patch_mla_bind_kv_cache, _patch_moe_runner_delegation, _patch_latent_moe_runner_forward,
+                  _patch_kimi_k3_hybrid_config, _patch_kimi_k3_arch, _patch_kimi_k3_video,
+                  _patch_compressed_tensors_mxfp4):
         try:
             patch()
         except Exception:
@@ -950,6 +951,17 @@ def ensure_kimi_k3_patches(model_config) -> None:
     from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
     if not getattr(KimiK3DeltaAttention.forward, "_hpu_kda_forward", False):
         raise RuntimeError("Kimi-K3 patch 'kda_forward' is not active, the upstream KDA forward cannot run on HPU")
+
+
+def warn_if_kimi_k3_config_patches_inactive(vllm_config) -> None:
+    """Warn when a Kimi-K3 config is built while the K3 ModelConfig patch is not installed (non-strict pass failed)."""
+    if not is_kimi_k3_vllm_config(vllm_config):
+        return
+    from vllm.config import ModelConfig
+    if not getattr(ModelConfig.__post_init__, "_hpu_kimi_post_init", False):
+        from vllm_gaudi.extension.logger import logger
+        logger().warning("Kimi-K3 config detected but the Kimi-K3 config patches are not active; "
+                         "layer_types and the K3 model registration may be missing")
 
 
 def _patch_kimi_kda() -> None:
@@ -1262,7 +1274,8 @@ def _log_kimi_k3_settings() -> None:
         from vllm_gaudi.models.kimi_k3_video import log_video_settings
         log_video_settings()
     except Exception:  # a settings log must not fail the config build
-        pass
+        from vllm_gaudi.extension.logger import logger
+        logger().debug("Kimi-K3 settings log failed", exc_info=True)
 
 
 def _mark_kimi_k3_construction(model_cls: type, shared_layer_classes: tuple[type, ...]) -> None:
