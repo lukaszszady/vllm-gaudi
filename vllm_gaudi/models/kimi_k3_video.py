@@ -20,8 +20,9 @@ Video tensors use their own keyword names (``video_pixel_values`` / ``video_grid
 model can tell a video group from an image group. The vision tower is not eager on HPU: in torch.compile mode regional
 compilation compiles every ``nn.ModuleList`` of the model, including ``vision_tower.encoder.blocks``, and in lazy mode
 the tower runs in an HPU graph. A video chunk (T=4, 36x62 patches for 864x480) is a new input shape, so it creates new
-graphs. The multimodal warmup precompiles them from the video shape of ``--limit-mm-per-prompt`` (see
-``docs/features/kimi_k3_video.md``); a video shape that was not warmed up compiles on the first request.
+graphs. The multimodal warmup precompiles them from the video shape of ``--limit-mm-per-prompt``, e.g.
+``{"video": {"count": 1, "width": 864, "height": 480, "num_frames": 20}}``; a video shape that was not warmed up
+compiles on the first request.
 
 The K3 classes cannot be imported while the plugin loads, so everything that subclasses them is built by
 ``install_kimi_k3_video`` when the K3 patches are applied.
