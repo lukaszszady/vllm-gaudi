@@ -25,6 +25,35 @@ _FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -
 MXFP4_BLOCK = 32
 
 
+def resolve_situ_impl(value: str | None) -> str:
+    """HPU_KIMI_SITU_IMPL: "exact" (default) or "silu" (approximate, fused kernel). Raises on anything else."""
+    impl = (value or "exact").strip().lower()
+    if impl not in ("exact", "silu"):
+        raise ValueError(f"HPU_KIMI_SITU_IMPL must be 'exact' or 'silu', got {value!r}")
+    return impl
+
+
+def situ_impl_or_exact(value: str | None, log_error: Callable[[str], None] | None = None) -> str:
+    """Like ``resolve_situ_impl`` but an invalid value is reported through ``log_error`` and replaced by "exact"."""
+    try:
+        return resolve_situ_impl(value)
+    except ValueError as exc:
+        if log_error is not None:
+            log_error(f"{exc}; using the exact SiTU path")
+        return "exact"
+
+
+def situ_fused_alias() -> str | None:
+    """Activation the fused Habana MoE op must use for "situ", read from HPU_KIMI_SITU_IMPL at call time.
+
+    "silu" only with HPU_KIMI_SITU_IMPL=silu (approximate); None otherwise, so that a "situ" reaching the fused
+    op in "exact" mode fails loudly. Evaluated lazily (no import-time work) so that it cannot hit the circular
+    imports of the vLLM plugin load.
+    """
+    import vllm_gaudi.envs as gaudi_envs
+    return "silu" if situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL) == "silu" else None
+
+
 def situ_activation(gate_up: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
     """SituAndMul.forward_native on a fused [..., 2 * d] tensor (first half = gate, second half = up)."""
     d = gate_up.shape[-1] // 2
@@ -72,6 +101,19 @@ def dequant_mxfp4(packed: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype
     return values.reshape(*lead, rows, groups * MXFP4_BLOCK)
 
 
+def dequant_mxfp4_reference(packed: torch.Tensor,
+                            scales: torch.Tensor,
+                            dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """Straightforward fp32 stack + ldexp version (as in models/gptoss_mxfp4.py); the LUT version must equal it."""
+    *lead, rows, half = packed.shape
+    groups = scales.shape[-1]
+    lut = torch.tensor(_FP4_VALUES, dtype=torch.float32, device=packed.device)
+    values = torch.stack((lut[(packed & 0x0F).long()], lut[(packed >> 4).long()]), dim=-1)
+    values = values.reshape(*lead, rows, groups, MXFP4_BLOCK)
+    values = torch.ldexp(values, (scales.to(torch.int32) - 127).unsqueeze(-1))
+    return values.reshape(*lead, rows, groups * MXFP4_BLOCK).to(dtype)
+
+
 def situ_moe_experts(x: torch.Tensor,
                      topk_ids: torch.Tensor,
                      topk_weights: torch.Tensor,
@@ -114,7 +156,8 @@ def situ_moe_experts(x: torch.Tensor,
     tile = tokens if token_tile <= 0 or token_tile >= tokens else token_tile
     starts = list(range(0, tokens, tile))
     accs = [torch.zeros(min(tile, tokens - t0), hidden, dtype=torch.float32, device=x.device) for t0 in starts]
-    # Expert chunks are the outer loop: a chunk is dequantized once and reused by every token tile.
+    # Expert chunks are the OUTER loop: the weights of a chunk are dequantized once and reused by every token tile
+    # (tile-outer order repeated the whole dequant per tile: 16x the ops for an 8k prefill).
     for c0 in range(0, total, expert_chunk):
         chunk_ids = ids[c0:c0 + expert_chunk]
         w13 = get_w13(chunk_ids)  # [c, 2I, H]
@@ -150,16 +193,17 @@ def maybe_situ_moe(layer,
                    x: torch.Tensor,
                    topk_ids: torch.Tensor,
                    topk_weights: torch.Tensor,
+                   impl: str,
                    group_size: int = MXFP4_BLOCK,
                    token_tile: int = 512) -> torch.Tensor | None:
     """Exact SiTU experts for a layer holding packed MXFP4 weights, or None when the fused op should be used.
 
-    Handles layers whose ``activation`` is "situ"; reads ``beta`` / ``linear_beta`` from
+    Handles layers whose ``activation`` is "situ" while ``impl`` is "exact"; reads ``beta`` / ``linear_beta`` from
     ``layer.moe_config`` and the stacked per-rank tensors ``w13_weight``, ``w13_weight_scale``, ``w2_weight``,
     ``w2_weight_scale`` (the ones the fused MXFP4 op is built from). Shared by both MXFP4 MoE methods.
     """
     activation = getattr(layer.activation, "value", layer.activation)
-    if activation != "situ":
+    if activation != "situ" or impl != "exact":
         return None
     if group_size != MXFP4_BLOCK:
         raise ValueError(f"SiTU experts expect MXFP4 groups of {MXFP4_BLOCK}, got {group_size}")

@@ -13,11 +13,6 @@ _spec = importlib.util.spec_from_file_location("hpu_situ_moe_under_test", _PATH)
 situ = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(situ)
 
-_ref_spec = importlib.util.spec_from_file_location("situ_reference_under_test",
-                                                   pathlib.Path(__file__).with_name("situ_reference.py"))
-situ_ref = importlib.util.module_from_spec(_ref_spec)
-_ref_spec.loader.exec_module(situ_ref)
-
 
 @pytest.fixture(autouse=True, scope="module")
 def _register_situ_module():
@@ -182,18 +177,36 @@ def test_exact_path_differs_from_the_silu_approximation():
     assert not torch.allclose(exact, approx, rtol=0.05, atol=0.05)
 
 
+def test_flag_resolution():
+    assert situ.resolve_situ_impl(None) == "exact"
+    assert situ.resolve_situ_impl("") == "exact"
+    assert situ.resolve_situ_impl(" SILU ") == "silu"
+    assert situ.resolve_situ_impl("exact") == "exact"
+    with pytest.raises(ValueError, match="HPU_KIMI_SITU_IMPL"):
+        situ.resolve_situ_impl("fused")
+
+
+def test_env_registry_default_and_override(monkeypatch):
+    spec = importlib.util.spec_from_file_location("vllm_gaudi_envs_situ_test", _PATH.parents[1] / "envs.py")
+    envs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(envs)
+    monkeypatch.delenv("HPU_KIMI_SITU_IMPL", raising=False)
+    assert envs.HPU_KIMI_SITU_IMPL == "exact"
+    monkeypatch.setenv("HPU_KIMI_SITU_IMPL", "SiLU")
+    assert envs.HPU_KIMI_SITU_IMPL == "silu"
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_lut_dequant_equals_the_reference_dequant_for_every_byte_and_scale(dtype):
     g = torch.Generator().manual_seed(31)
     rows, groups = 8, 6
     packed = torch.randint(0, 256, (3, rows, groups * 16), generator=g, dtype=torch.uint8)
     scales = torch.randint(1, 255, (3, rows, groups), generator=g, dtype=torch.uint8)  # 0 / 255 are not real scales
-    assert torch.equal(situ.dequant_mxfp4(packed, scales, dtype),
-                       situ_ref.dequant_mxfp4_reference(packed, scales, dtype))
+    assert torch.equal(situ.dequant_mxfp4(packed, scales, dtype), situ.dequant_mxfp4_reference(packed, scales, dtype))
     # every one of the 256 byte values and realistic scale exponents (2^-20 .. 2^8)
     all_bytes = torch.arange(256, dtype=torch.uint8).reshape(1, 16, 16).repeat(1, 1, 2).reshape(1, 16, 32)
     sc = torch.arange(107, 135, dtype=torch.uint8)[:2].reshape(1, 1, 2).repeat(1, 16, 1)
-    assert torch.equal(situ.dequant_mxfp4(all_bytes, sc, dtype), situ_ref.dequant_mxfp4_reference(all_bytes, sc, dtype))
+    assert torch.equal(situ.dequant_mxfp4(all_bytes, sc, dtype), situ.dequant_mxfp4_reference(all_bytes, sc, dtype))
 
 
 class _FakeLayer:
@@ -229,7 +242,7 @@ def test_maybe_situ_moe_dispatch_for_the_mxfp4_moe_methods(activation):
     ids, weights = _route(3, 4 * 3, 2, 42)  # rank 1 of 3 owns experts 4..7
     x = torch.randn(3, 64, generator=torch.Generator().manual_seed(43))
 
-    out = situ.maybe_situ_moe(layer, x, ids, weights)
+    out = situ.maybe_situ_moe(layer, x, ids, weights, "exact")
 
     w13 = situ.dequant_mxfp4(layer.w13_weight.data, layer.w13_weight_scale.data, torch.float32)
     w2 = situ.dequant_mxfp4(layer.w2_weight.data, layer.w2_weight_scale.data, torch.float32)
@@ -240,11 +253,20 @@ def test_maybe_situ_moe_dispatch_for_the_mxfp4_moe_methods(activation):
 def test_maybe_situ_moe_leaves_other_cases_to_the_fused_kernel_and_validates_inputs():
     x = torch.randn(2, 64)
     ids, weights = _route(2, 12, 2, 44)
-    assert situ.maybe_situ_moe(_FakeLayer("silu"), x, ids, weights) is None
+    assert situ.maybe_situ_moe(_FakeLayer("silu"), x, ids, weights, "exact") is None
+    assert situ.maybe_situ_moe(_FakeLayer("situ"), x, ids, weights, "silu") is None
     with pytest.raises(ValueError, match="groups of 32"):
-        situ.maybe_situ_moe(_FakeLayer("situ"), x, ids, weights, group_size=16)
+        situ.maybe_situ_moe(_FakeLayer("situ"), x, ids, weights, "exact", group_size=16)
     with pytest.raises(ValueError, match="activation_situ_beta"):
-        situ.maybe_situ_moe(_FakeLayer("situ", beta=None), x, ids, weights)
+        situ.maybe_situ_moe(_FakeLayer("situ", beta=None), x, ids, weights, "exact")
+
+
+def test_invalid_impl_falls_back_to_exact_and_reports():
+    errors = []
+    assert situ.situ_impl_or_exact("fused", errors.append) == "exact"
+    assert len(errors) == 1 and "HPU_KIMI_SITU_IMPL" in errors[0]
+    assert situ.situ_impl_or_exact("silu", errors.append) == "silu"
+    assert len(errors) == 1
 
 
 def test_gather_is_used_for_any_token_count_below_the_hit_bound():
@@ -266,6 +288,27 @@ def test_gather_is_used_for_any_token_count_below_the_hit_bound():
                                naive_reference(x, ids, weights, w13, w2, 0, BETA, LINEAR_BETA),
                                rtol=1e-4,
                                atol=1e-4)
+
+
+def test_fused_alias_follows_the_env_at_call_time(monkeypatch):
+    monkeypatch.delenv("HPU_KIMI_SITU_IMPL", raising=False)
+    assert situ.situ_fused_alias() is None  # exact: a "situ" reaching the fused op must fail loudly
+    monkeypatch.setenv("HPU_KIMI_SITU_IMPL", "silu")
+    assert situ.situ_fused_alias() == "silu"
+    monkeypatch.setenv("HPU_KIMI_SITU_IMPL", "bogus")
+    assert situ.situ_fused_alias() is None
+
+
+def test_normalizer_source_uses_the_lazy_alias():
+    # The activation normalizers must not rely on import-time mutation of the alias dicts (circular plugin load).
+    import inspect
+    import pathlib
+    root = pathlib.Path(inspect.getfile(situ)).parents[1]
+    for rel in ("extension/ops.py", "ops/hpu_fused_moe.py"):
+        text = (root / rel).read_text()
+        assert "situ_fused_alias" in text and '"situ": "silu"' not in text
+    patches = (root / "patches.py").read_text()
+    assert "importlib.import_module(module_name)._MOE_ACTIVATION_ALIASES" not in patches
 
 
 def _dense_case(tokens):
@@ -368,7 +411,7 @@ def test_maybe_situ_moe_on_a_layer_traces_as_one_graph_in_compile_mode():
     weights = torch.rand(20, 2, generator=gen)
 
     def fn(x, ids, weights):
-        return situ.maybe_situ_moe(layer, x, ids, weights, token_tile=8)
+        return situ.maybe_situ_moe(layer, x, ids, weights, "exact", token_tile=8)
 
     graphs = []
 
