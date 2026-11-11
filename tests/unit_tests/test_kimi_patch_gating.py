@@ -517,6 +517,36 @@ def test_install_skips_a_failing_patch_unless_strict(kda_modules, monkeypatch):
         kda_modules._install_kimi_k3_patches(strict=True)
 
 
+def test_strict_install_warns_for_a_failing_video_patch_and_raises_for_kda(kda_modules, monkeypatch, caplog):
+    names = ("_patch_kimi_kda", "_patch_kimi_attn_res", "_patch_kimi_linear_weights", "_patch_mla_prefill_selector",
+             "_patch_mla_bind_kv_cache", "_patch_moe_runner_delegation", "_patch_latent_moe_runner_forward",
+             "_patch_kimi_k3_hybrid_config", "_patch_kimi_k3_arch", "_patch_kimi_k3_video",
+             "_patch_compressed_tensors_mxfp4")
+
+    def make(name, fail=False):
+
+        def patch():
+            if fail:
+                raise ImportError("not available")
+
+        patch.__name__ = name
+        monkeypatch.setattr(kda_modules, name, patch)
+
+    for name in names:
+        make(name)
+    make("_patch_kimi_k3_video", fail=True)
+
+    with caplog.at_level("WARNING"):
+        installed = kda_modules._install_kimi_k3_patches(strict=True)
+    assert len(installed) == 10 and "kimi_k3_video" not in installed
+    assert "_patch_kimi_k3_video is not active" in caplog.text
+
+    make("_patch_kimi_k3_video")
+    make("_patch_kimi_kda", fail=True)
+    with pytest.raises(ImportError):
+        kda_modules._install_kimi_k3_patches(strict=True)
+
+
 def test_ensure_raises_when_kda_forward_is_not_active(kda_modules, monkeypatch):
     monkeypatch.setattr(kda_modules, "_install_kimi_k3_patches", lambda strict=False: [])
     cfg = types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])

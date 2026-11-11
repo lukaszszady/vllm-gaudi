@@ -928,7 +928,8 @@ def _patch_sdpa_attention_forward() -> None:
 def _install_kimi_k3_patches(strict: bool = False) -> list[str]:
     """Install the Kimi-K3 patches (idempotent); returns the names of the installed ones.
 
-    Non-strict: a failing patch is skipped (partially initialised vllm).
+    Non-strict: a failing patch is skipped (partially initialised vllm). Strict: a failing KDA patch is re-raised,
+    any other failing patch is skipped with a WARNING.
     """
     installed = []
     for patch in (_patch_kimi_kda, _patch_kimi_attn_res, _patch_kimi_linear_weights, _patch_mla_prefill_selector,
@@ -939,10 +940,13 @@ def _install_kimi_k3_patches(strict: bool = False) -> list[str]:
             patch()
             installed.append(patch.__name__.removeprefix("_patch_"))
         except Exception:
-            if strict:
+            if strict and patch is _patch_kimi_kda:
                 raise
             from vllm_gaudi.extension.logger import logger
-            logger().debug("Kimi-K3 patch %s failed in this attempt", patch.__name__, exc_info=True)
+            if strict:
+                logger().warning("Kimi-K3 patch %s is not active", patch.__name__, exc_info=True)
+            else:
+                logger().debug("Kimi-K3 patch %s failed in this attempt", patch.__name__, exc_info=True)
     return installed
 
 
