@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER_RATIO: float = 0.4
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
     VLLM_COMPACT_GDN: bool = False
-    HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_PREFILL_MERGE: bool = False
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     VLLM_HPU_TWO_STAGE_TOPK: bool = True
@@ -119,12 +118,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it lazily rather than caching it at import time.
     "VLLM_COMPACT_GDN":
     lambda: os.environ.get("VLLM_COMPACT_GDN", "0").strip().lower() in ("1", "true"),
-
-    # Kimi-K3 routed experts use the SiTU activation (beta*tanh(gate/beta)*sigmoid(gate)*up, soft-clipped up), which
-    # the Habana fused MoE op does not have. "exact" computes the experts unfused with the real activation (MXFP4
-    # weights dequantized per expert chunk); "silu" maps SiTU to silu in the fused kernel (fast, APPROXIMATE).
-    "HPU_KIMI_SITU_IMPL":
-    lambda: os.environ.get("HPU_KIMI_SITU_IMPL", "exact").strip().lower(),
 
     # Kimi-K3 KDA prefill "<chunk_size>,<vec_chunks>" (see kda_chunked_steps_vec)
     "HPU_KIMI_KDA_PREFILL_CHUNK":

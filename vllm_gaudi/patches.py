@@ -1351,29 +1351,8 @@ def _patch_latent_moe_runner_forward() -> None:
                  os.getpid())
 
 
-def _configure_situ_aliases() -> str:
-    """Validate HPU_KIMI_SITU_IMPL and return the effective implementation (debug note for "silu").
-
-    SiTU (Kimi-K3 routed experts): the fused Habana op only knows silu/gelu. "exact" (default) computes the
-    experts unfused (ops/hpu_situ_moe.py); "silu" maps "situ" to silu in the activation normalizers
-    (situ_fused_alias, evaluated at use time: no module is imported here because the plugin load is circular). An
-    invalid value is logged as an error and treated as "exact"; this runs outside of the broad try/except of
-    the other Kimi patches so that it can neither be skipped by nor skip them.
-    """
-    import vllm_gaudi.envs as gaudi_envs
-    from vllm_gaudi.extension.logger import logger as _ext_logger
-    from vllm_gaudi.ops.hpu_situ_moe import situ_impl_or_exact
-
-    situ_impl = situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL, _ext_logger().error)
-    if situ_impl == "silu":
-        _ext_logger().debug("HPU_KIMI_SITU_IMPL=silu: the Kimi-K3 routed experts use silu instead of SiTU "
-                            "(beta*tanh(gate/beta)*sigmoid(gate)*up); model outputs are APPROXIMATE")
-    return situ_impl
-
-
 def _patch_kimi_linear_weights() -> None:
     """Ensure KimiMoE safely accesses w13_weight and w2_weight without evaluating bool(Tensor)."""
-    _configure_situ_aliases()
     try:
         import vllm.models.kimi_k3.amd.linear as k3_linear
 
@@ -1654,7 +1633,7 @@ def _hpu_mxfp4_routed_apply(layer, x, topk_weights, topk_ids, group_size):
     # imported at call time: these modules are not importable yet while the patches are applied
     import vllm_gaudi.envs as gaudi_envs
     from vllm_gaudi.ops.hpu_fused_moe import _normalize_moe_activation
-    from vllm_gaudi.ops.hpu_situ_moe import maybe_situ_moe, situ_impl_or_exact
+    from vllm_gaudi.ops.hpu_situ_moe import maybe_situ_moe
 
     input_shape = x.shape
     x = x.view(-1, x.shape[-1])
@@ -1663,27 +1642,21 @@ def _hpu_mxfp4_routed_apply(layer, x, topk_weights, topk_ids, group_size):
         topk_ids = topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(x.dtype)
 
-    if layer.moe_config.dp_size > 1:
+    dp = layer.moe_config.dp_size > 1
+    if dp:
         from vllm_gaudi.v1.worker.hpu_dp_utils import get_hpu_dp_metadata, dispatch_tensor
         dp_metadata = get_hpu_dp_metadata()
-        hidden_states_across_dp = dp_metadata.hidden_states_across_dp if dp_metadata is not None else None
-        x = dispatch_tensor(x, hidden_states_across_dp, layer.moe_config.is_sequence_parallel)
-
-        topk_ids_across_dp = dp_metadata.topk_ids_across_dp if dp_metadata is not None else None
-        topk_ids = dispatch_tensor(topk_ids, topk_ids_across_dp, layer.moe_config.is_sequence_parallel)
-
-        topk_weights_across_dp = dp_metadata.topk_weights_across_dp if dp_metadata is not None else None
-        topk_weights = dispatch_tensor(topk_weights, topk_weights_across_dp, layer.moe_config.is_sequence_parallel)
+        sequence_parallel = layer.moe_config.is_sequence_parallel
+        x, topk_ids, topk_weights = (dispatch_tensor(t, getattr(dp_metadata, name, None), sequence_parallel)
+                                     for t, name in ((x, "hidden_states_across_dp"), (topk_ids, "topk_ids_across_dp"),
+                                                     (topk_weights, "topk_weights_across_dp")))
 
     topk_ids = topk_ids.view(-1, topk_ids.shape[-1])
     topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
     # no SiTU in the fused kernel: exact unfused experts over the same packed MXFP4 tensors
-    output = maybe_situ_moe(layer, x, topk_ids, topk_weights, situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL),
-                            group_size, gaudi_envs.VLLM_MINIMAX_M3_MOE_TOKEN_TILE)
+    output = maybe_situ_moe(layer, x, topk_ids, topk_weights, group_size, gaudi_envs.VLLM_MINIMAX_M3_MOE_TOKEN_TILE)
     if output is None:
-        # the layer's own activation (was hard-coded "silu"); a name the fused op does not know fails
-        # loudly. "situ" only gets here with HPU_KIMI_SITU_IMPL=silu, where the alias maps it to silu.
         output = layer.moe_op(
             x,
             topk_ids,
@@ -1692,10 +1665,9 @@ def _hpu_mxfp4_routed_apply(layer, x, topk_weights, topk_ids, group_size):
             activation=_normalize_moe_activation(layer.activation),
         )
 
-    if layer.moe_config.dp_size > 1:
+    if dp:
         return output.view(*(output.size(0), *input_shape[1:]))
-    else:
-        return output.view(*input_shape)
+    return output.view(*input_shape)
 
 
 def _patch_compressed_tensors_mxfp4() -> None:

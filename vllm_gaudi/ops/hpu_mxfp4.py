@@ -19,7 +19,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import GptOssMxfp4MoEMethod, 
 
 from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpMXFP4
 from vllm_gaudi.extension.runtime import get_config
-from vllm_gaudi.ops.hpu_situ_moe import MXFP4_BLOCK, maybe_situ_moe, situ_impl_or_exact
+from vllm_gaudi.ops.hpu_situ_moe import MXFP4_BLOCK, maybe_situ_moe
 from vllm_gaudi.ops.hpu_fused_moe import (
     _normalize_moe_activation,
     is_plain_softmax_topk,
@@ -154,11 +154,10 @@ class HPUGptOssMxfp4MoEMethod(GptOssMxfp4MoEMethod):
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
         # The fused kernel has no SiTU: exact unfused routed experts (see ops/hpu_situ_moe.py).
-        # The SiTU env reads and helper run only for SiTU layers; any other activation calls the fused op directly.
         output = None
         if getattr(layer.activation, "value", layer.activation) == "situ":
-            output = maybe_situ_moe(layer, x, topk_ids, topk_weights, situ_impl_or_exact(gaudi_envs.HPU_KIMI_SITU_IMPL),
-                                    MXFP4_BLOCK, gaudi_envs.VLLM_MINIMAX_M3_MOE_TOKEN_TILE)
+            output = maybe_situ_moe(layer, x, topk_ids, topk_weights, MXFP4_BLOCK,
+                                    gaudi_envs.VLLM_MINIMAX_M3_MOE_TOKEN_TILE)
         if output is None:
             output = layer.moe_op(
                 x,
