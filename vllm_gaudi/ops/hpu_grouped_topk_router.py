@@ -22,11 +22,6 @@ def _flat_take(src: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     return src.reshape(-1).index_select(0, (index + offsets).reshape(-1)).reshape(index.shape)
 
 
-def _use_two_stage_topk(num_experts: int, topk: int) -> bool:
-    return (_TWO_STAGE_TOPK and num_experts % _TOPK_GROUP_SIZE == 0 and num_experts // _TOPK_GROUP_SIZE >= 4
-            and topk <= _TOPK_GROUP_SIZE)
-
-
 def _topk(scores: torch.Tensor, k: int, use_sorted: bool) -> tuple[torch.Tensor, torch.Tensor]:
     """``torch.topk(scores, k, dim=-1)`` of a 2-D tensor; wide rows go through a top-k per column group first.
 
@@ -34,7 +29,8 @@ def _topk(scores: torch.Tensor, k: int, use_sorted: bool) -> tuple[torch.Tensor,
     among tied values).
     """
     rows, cols = scores.shape
-    if not _use_two_stage_topk(cols, k):
+    if not (_TWO_STAGE_TOPK and cols % _TOPK_GROUP_SIZE == 0 and cols // _TOPK_GROUP_SIZE >= 4
+            and k <= _TOPK_GROUP_SIZE):
         return torch.topk(scores, k=k, dim=-1, sorted=use_sorted)
     groups = cols // _TOPK_GROUP_SIZE
     group_vals, group_ids = torch.topk(scores.reshape(rows, groups, _TOPK_GROUP_SIZE), k=k, dim=-1, sorted=False)

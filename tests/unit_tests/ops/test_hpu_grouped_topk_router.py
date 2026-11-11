@@ -135,7 +135,6 @@ def test_flat_take_is_gather(router):
 def test_two_stage_topk_selects_the_same_entries_as_torch_topk(router, experts, tokens):
     g = torch.Generator().manual_seed(experts + tokens)
     scores = torch.randn(tokens, experts, generator=g)
-    assert router._use_two_stage_topk(experts, 16)
     values, ids = router._topk(scores, 16, True)
     ref_values, ref_ids = torch.topk(scores, 16, dim=-1, sorted=True)
     assert torch.equal(values, ref_values) and torch.equal(ids, ref_ids)
@@ -156,7 +155,6 @@ def test_two_stage_topk_with_ties_selects_the_same_values(router):
 
 @pytest.mark.parametrize("experts", [256, 384, 500])
 def test_narrow_rows_keep_one_topk(router, experts):
-    assert not router._use_two_stage_topk(experts, 8)
     scores = torch.randn(9, experts)
     values, ids = router._topk(scores, 8, False)
     ref_values, ref_ids = torch.topk(scores, 8, dim=-1, sorted=False)
