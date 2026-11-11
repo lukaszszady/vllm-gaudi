@@ -539,7 +539,7 @@ def test_strict_install_warns_for_a_failing_video_patch_and_raises_for_kda(kda_m
     with caplog.at_level("WARNING"):
         installed = kda_modules._install_kimi_k3_patches(strict=True)
     assert len(installed) == 10 and "kimi_k3_video" not in installed
-    assert "_patch_kimi_k3_video is not active" in caplog.text
+    assert "kimi_k3_video is not active" in caplog.text
 
     make("_patch_kimi_k3_video")
     make("_patch_kimi_kda", fail=True)

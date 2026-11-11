@@ -944,7 +944,9 @@ def _install_kimi_k3_patches(strict: bool = False) -> list[str]:
                 raise
             from vllm_gaudi.extension.logger import logger
             if strict:
-                logger().warning("Kimi-K3 patch %s is not active", patch.__name__, exc_info=True)
+                logger().warning("Kimi-K3 patch %s is not active",
+                                 patch.__name__.removeprefix("_patch_"),
+                                 exc_info=True)
             else:
                 logger().debug("Kimi-K3 patch %s failed in this attempt", patch.__name__, exc_info=True)
     return installed

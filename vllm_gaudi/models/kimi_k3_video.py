@@ -397,8 +397,7 @@ def _patch_model_class(model_cls, amd_model) -> None:
 def install_kimi_k3_video() -> None:
     """Add the ``video`` modality to ``vllm.models.kimi_k3.amd.model.KimiK3ForConditionalGeneration`` (K3 only).
 
-    Raises on any problem; ``patches._install_kimi_k3_patches`` skips the patch and, before the model is built, logs a
-    WARNING.
+    Raises on any problem; ``patches._install_kimi_k3_patches`` skips the patch (WARNING in the strict pass).
     """
     import vllm.models.kimi_k3.amd.model as amd_model
     import vllm.renderers.kimi_k3 as k3_renderer
