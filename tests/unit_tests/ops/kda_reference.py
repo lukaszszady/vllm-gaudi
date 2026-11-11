@@ -107,17 +107,3 @@ def kda_chunked_steps(state: torch.Tensor,
     out = torch.stack(outs, dim=2)  # [B,H,N,C,V]
     out = out.permute(0, 2, 3, 1, 4).reshape(bsz, num_chunks * chunk, heads, vdim)
     return out[:, :seq_len], state
-
-
-def kda_recurrent_steps(state: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, decay: torch.Tensor,
-                        beta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Token loop (reference for the chunked forms). q,k [B,L,H,K]; v [B,L,H,V]; decay=exp(g) [B,L,H,K];
-    beta [B,L,H]; state [B,H,V,K]. Returns (o [B,L,H,V], new_state)."""
-    outs = []
-    for t in range(q.shape[1]):
-        state = state * decay[:, t].unsqueeze(-2)
-        proj = torch.matmul(state, k[:, t].unsqueeze(-1)).squeeze(-1)  # S @ k
-        delta = (v[:, t] - proj) * beta[:, t].unsqueeze(-1)
-        state = state + delta.unsqueeze(-1) * k[:, t].unsqueeze(-2)
-        outs.append(torch.matmul(state, q[:, t].unsqueeze(-1)).squeeze(-1))  # S @ q
-    return torch.stack(outs, dim=1), state

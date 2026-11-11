@@ -518,7 +518,7 @@ def test_install_skips_a_failing_patch_unless_strict(kda_modules, monkeypatch):
 
 
 def test_ensure_raises_when_kda_forward_is_not_active(kda_modules, monkeypatch):
-    monkeypatch.setattr(kda_modules, "_install_kimi_k3_patches", lambda strict=False: None)
+    monkeypatch.setattr(kda_modules, "_install_kimi_k3_patches", lambda strict=False: [])
     cfg = types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
 
     kda_modules.ensure_kimi_k3_patches(types.SimpleNamespace(architectures=["LlamaForCausalLM"]))  # not K3: untouched
