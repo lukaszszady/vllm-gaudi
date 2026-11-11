@@ -1464,9 +1464,7 @@ def _log_kimi_k3_settings() -> None:
         return
     _kimi_k3_settings_logged = True
     try:
-        from vllm_gaudi.models.kimi_k3_kda import log_prefill_settings
         from vllm_gaudi.models.kimi_k3_video import log_video_settings
-        log_prefill_settings()
         log_video_settings()
     except Exception:
         _kimi_patch_logger().debug("Kimi-K3 settings log failed", exc_info=True)

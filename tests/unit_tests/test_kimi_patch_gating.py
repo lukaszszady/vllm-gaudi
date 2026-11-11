@@ -575,7 +575,6 @@ def arch_modules(kda_modules, monkeypatch):
     module("vllm.models.kimi_k3.amd.ops.attn_res", attn_res=None)
     deferred = types.ModuleType("vllm_gaudi.models.kimi_k3_kda")
     deferred.run_with_deferred_kda_state = lambda model, forward, *args, **kwargs: forward(*args, **kwargs)
-    deferred.log_prefill_settings = lambda: None
     monkeypatch.setitem(sys.modules, "vllm_gaudi.models.kimi_k3_kda", deferred)
     kda_modules.test_linear = linear
     kda_modules.test_k3_model = KimiK3ForConditionalGeneration

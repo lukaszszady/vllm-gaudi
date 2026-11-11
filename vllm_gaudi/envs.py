@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
     VLLM_COMPACT_GDN: bool = False
     HPU_KIMI_PREFILL_MERGE: bool = False
-    HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     VLLM_HPU_TWO_STAGE_TOPK: bool = True
     VLLM_HPU_MIN_PREFILL_CHUNK: str = ""
 
@@ -118,14 +117,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it lazily rather than caching it at import time.
     "VLLM_COMPACT_GDN":
     lambda: os.environ.get("VLLM_COMPACT_GDN", "0").strip().lower() in ("1", "true"),
-
-    # Kimi-K3 KDA prefill "<chunk_size>,<vec_chunks>" (see kda_chunked_steps_vec)
-    "HPU_KIMI_KDA_PREFILL_CHUNK":
-    lambda: os.environ.get("HPU_KIMI_KDA_PREFILL_CHUNK", "64,16"),
-
-    # Kimi-K3 KDA prefill: rows per block of the blockwise intra-chunk A / Aqk ("0" = full pairwise decay)
-    "HPU_KIMI_KDA_INTRA_SUB_CHUNK":
-    lambda: os.environ.get("HPU_KIMI_KDA_INTRA_SUB_CHUNK", "0"),
 
     # Kimi-K3 (no prefix caching): let several fresh prompts share one padded prefill batch
     "HPU_KIMI_PREFILL_MERGE":
