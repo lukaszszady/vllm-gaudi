@@ -28,7 +28,6 @@ The K3 classes cannot be imported while the plugin loads, so everything that sub
 """
 
 import logging
-import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -249,7 +248,8 @@ def _make_classes():
 
 
 def _vit_dp_requested() -> bool:
-    return os.environ.get(ENV_VIT_DP, "0").strip().lower() in ("1", "true", "on", "yes")
+    import vllm_gaudi.envs as gaudi_envs
+    return gaudi_envs.HPU_KIMI_VIT_DP
 
 
 def _encode_chunks_data_parallel(amd_model, model, pixel_values, grid_thws, chunk_rows: list[int]):

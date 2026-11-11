@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
     VLLM_COMPACT_GDN: bool = False
     HPU_KIMI_SITU_IMPL: str = "exact"
+    HPU_KIMI_VIT_DP: bool = False
     HPU_KIMI_PREFILL_MERGE: bool = False
     VLLM_HPU_TWO_STAGE_TOPK: bool = True
     VLLM_HPU_MIN_PREFILL_CHUNK: str = ""
@@ -124,6 +125,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weights dequantized per expert chunk); "silu" maps SiTU to silu in the fused kernel (fast, APPROXIMATE).
     "HPU_KIMI_SITU_IMPL":
     lambda: os.environ.get("HPU_KIMI_SITU_IMPL", "exact").strip().lower(),
+
+    # Kimi-K3 video: shard the video chunks of the vision tower across the TP ranks
+    "HPU_KIMI_VIT_DP":
+    lambda: os.environ.get("HPU_KIMI_VIT_DP", "0").strip().lower() in ("1", "true", "on", "yes"),
 
     # Kimi-K3 (no prefix caching): let several fresh prompts share one padded prefill batch
     "HPU_KIMI_PREFILL_MERGE":
