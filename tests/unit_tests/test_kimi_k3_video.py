@@ -42,9 +42,6 @@ def _load(name, path):
     return mod
 
 
-video_ref = _load("kimi_k3_video_reference", Path(__file__).resolve().parent / "kimi_k3_video_reference.py")
-
-
 @pytest.fixture
 def utils(monkeypatch):
     monkeypatch.delitem(sys.modules, UTILS_NAME, raising=False)
@@ -57,9 +54,8 @@ def utils(monkeypatch):
 
 
 def test_ibm_shape_is_five_chunks_of_558_tokens(utils):
-    assert video_ref.navit_chunk_tokens(IBM_WIDTH, IBM_HEIGHT, K3_CFG) == IBM_CHUNK_TOKENS
-    assert video_ref.video_vision_tokens(utils, IBM_WIDTH, IBM_HEIGHT, IBM_FRAMES, IBM_FPS,
-                                         K3_CFG) == IBM_VISION_TOKENS == 2790
+    assert utils.navit_chunk_tokens(IBM_WIDTH, IBM_HEIGHT, K3_CFG) == IBM_CHUNK_TOKENS
+    assert utils.video_vision_tokens(IBM_WIDTH, IBM_HEIGHT, IBM_FRAMES, IBM_FPS, K3_CFG) == IBM_VISION_TOKENS == 2790
 
 
 def test_sampling_keeps_every_frame_of_a_low_fps_video(utils):
@@ -154,7 +150,7 @@ class _Info:
 
     def media_tokens_calculator(self, media):
         frame = media["video_chunk"][0]
-        return video_ref.navit_chunk_tokens(frame.size[0], frame.size[1], K3_CFG)
+        return self.utils.navit_chunk_tokens(frame.size[0], frame.size[1], K3_CFG)
 
     def _merge_mm_kwargs(self, kwargs):
         # MultiModalConfig.merge_mm_processor_kwargs: device normalization forces both host flags off
@@ -813,3 +809,213 @@ def test_device_normalize_off_passes_per_request_flags_to_the_processor(video):
     # hf_kwargs must reach get_merged_mm_kwargs: dropping them would silently restore the defaults (True, True)
     proc, _ = _video_pixels(video, device_normalize=False, hf_kwargs={"do_normalize": False, "do_rescale": True})
     assert proc.info.preprocess_flags == (True, False)
+
+
+# ------------------------------------------------------- data-parallel vision tower (HPU_KIMI_VIT_DP)
+
+
+@pytest.mark.parametrize("num_chunks, world_size, expected", [
+    (16, 16, [(i, i + 1) for i in range(16)]),
+    (5, 16, [(i, i + 1) for i in range(5)] + [(5, 5)] * 11),
+    (7, 3, [(0, 3), (3, 5), (5, 7)]),
+    (64, 16, [(4 * i, 4 * i + 4) for i in range(16)]),
+    (0, 2, [(0, 0), (0, 0)]),
+    (3, 1, [(0, 3)]),
+])
+def test_split_chunks_across_ranks_is_contiguous_and_balanced(utils, num_chunks, world_size, expected):
+    ranges = utils.split_chunks_across_ranks(num_chunks, world_size)
+    assert ranges == expected
+    assert [i for start, end in ranges for i in range(start, end)] == list(range(num_chunks))
+
+
+def test_split_chunks_across_ranks_rejects_bad_sizes(utils):
+    with pytest.raises(ValueError):
+        utils.split_chunks_across_ranks(3, 0)
+    with pytest.raises(ValueError):
+        utils.split_chunks_across_ranks(-1, 2)
+
+
+def test_rank_row_counts_and_patch_offsets(utils):
+    assert utils.rank_row_counts([6, 2, 4], [(0, 2), (2, 3), (3, 3)]) == [8, 4, 0]
+    assert utils.chunk_patch_offsets([[4, 4, 6], [4, 2, 4], [2, 4, 4]]) == [0, 96, 128, 160]
+
+
+DP_DIM = 12  # 4 patches x 3 channels after the stub 2x2 merge
+
+
+def _content_tower_forward(tower, pixels, grids, *, use_data_parallel=False, **kw):
+    """Content-dependent stand-in for vision_tower_forward: temporal mean pool, then 2x2 merge of [patches, 3] rows."""
+    assert not use_data_parallel
+    out, start = [], 0
+    for t, h, w in grids.tolist():
+        seq = pixels[start:start + t * h * w]
+        start += t * h * w
+        out.append(seq.view(t, h * w, 3).mean(0).reshape(h * w // 4, DP_DIM))
+    assert start == pixels.shape[0], "the tower got a pixel slice that does not match its grids"
+    return out
+
+
+class _Linear:
+    output_size = DP_DIM
+
+
+class _Projector:
+    linear_2 = _Linear()
+
+    def parameters(self):
+        return iter([torch.zeros(1, dtype=torch.float32)])
+
+
+def _dp_model(video, use_data_parallel=True):
+    model = video.K3Model()
+    model.vision_tower, model.mm_projector, model.use_data_parallel = _Tower(), _Projector(), use_data_parallel
+    return model
+
+
+def _dp_distributed(monkeypatch, world_size):
+    """Stub vllm.distributed for one simulated rank at a time; all_gather records or replays the local tensors."""
+    dist = types.SimpleNamespace(rank=0, world_size=world_size, sent={}, replay=None)
+    mod: Any = types.ModuleType("vllm.distributed")
+    mod.get_tensor_model_parallel_rank = lambda: dist.rank
+    mod.get_tensor_model_parallel_world_size = lambda: dist.world_size
+
+    def all_gather(tensor, dim=-1):
+        assert dim == 0
+        dist.sent[dist.rank] = tensor.clone()
+        if dist.replay is None:
+            return torch.zeros(dist.world_size * tensor.shape[0], *tensor.shape[1:], dtype=tensor.dtype)
+        return torch.cat([dist.replay[r] for r in range(dist.world_size)], dim=0)
+
+    mod.tensor_model_parallel_all_gather = all_gather
+    if "vllm" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.distributed", mod)
+    return dist
+
+
+DP_GRIDS = [[4, 4, 6], [4, 2, 4], [2, 4, 4], [4, 4, 6], [1, 2, 2]]  # uneven t and sizes, rows 6, 2, 4, 6, 1
+DP_NUM_CHUNKS = [3, 2]
+
+
+def _dp_inputs(video):
+    grids = torch.tensor(DP_GRIDS)
+    num_patches = sum(t * h * w for t, h, w in DP_GRIDS)
+    torch.manual_seed(0)
+    return {
+        video.mod.VIDEO_PIXEL_VALUES: torch.randn(num_patches, 3),
+        video.mod.VIDEO_GRID_THWS: grids,
+        video.mod.VIDEO_NUM_CHUNKS: torch.tensor(DP_NUM_CHUNKS),
+    }
+
+
+@pytest.mark.parametrize("world_size", [2, 3, 4, 16])
+def test_dp_embed_matches_the_single_rank_path(video, monkeypatch, world_size):
+    video.amd_model.vision_tower_forward = _content_tower_forward
+    inputs = _dp_inputs(video)
+    monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")  # read at install time
+    video.mod.install_kimi_k3_video()
+    dist = _dp_distributed(monkeypatch, world_size)
+    reference = _dp_model(video, use_data_parallel=False).embed_multimodal(**inputs)  # plain tower, all chunks
+    assert dist.sent == {}
+    for rank in range(world_size):  # pass 1: every rank encodes its share
+        dist.rank = rank
+        _dp_model(video).embed_multimodal(**inputs)
+    dist.replay = dict(dist.sent)
+    outputs = []
+    for rank in range(world_size):  # pass 2: the all-gather returns the real per-rank tensors
+        dist.rank = rank
+        outputs.append(_dp_model(video).embed_multimodal(**inputs))
+
+    for out in outputs:
+        assert [t.shape for t in out] == [t.shape for t in reference]
+        for got, want in zip(out, reference):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    # Padded to the largest share; idle ranks send zeros.
+    max_rows = max(t.shape[0] for t in dist.sent.values())
+    assert all(t.shape == (max_rows, DP_DIM) for t in dist.sent.values())
+    if world_size > len(DP_GRIDS):
+        assert all(not dist.sent[r].any() for r in range(len(DP_GRIDS), world_size))
+
+
+def test_dp_idle_ranks_run_the_tower_on_the_first_chunk(video, monkeypatch):
+    calls = []
+
+    def tower(_tower, pixels, grids, **kw):
+        calls.append(grids.tolist())
+        return _content_tower_forward(_tower, pixels, grids, **kw)
+
+    video.amd_model.vision_tower_forward = tower
+    monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
+    video.mod.install_kimi_k3_video()
+    dist = _dp_distributed(monkeypatch, 16)
+    for rank in range(16):
+        calls.clear()
+        dist.rank = rank
+        _dp_model(video).embed_multimodal(**_dp_inputs(video))
+        assert len(calls) == 1
+        assert calls[0] == ([DP_GRIDS[rank]] if rank < len(DP_GRIDS) else [DP_GRIDS[0]])
+    assert not dist.sent[len(DP_GRIDS)].any()
+
+
+@pytest.mark.parametrize("num_chunks", [17, 32])
+def test_dp_tower_gets_one_chunk_per_call_beyond_world_size(video, monkeypatch, num_chunks):
+    world_size = 16
+    grids = [DP_GRIDS[i % len(DP_GRIDS)] for i in range(num_chunks)]
+    torch.manual_seed(0)
+    inputs = {
+        video.mod.VIDEO_PIXEL_VALUES: torch.randn(sum(t * h * w for t, h, w in grids), 3),
+        video.mod.VIDEO_GRID_THWS: torch.tensor(grids),
+        video.mod.VIDEO_NUM_CHUNKS: torch.tensor([num_chunks]),
+    }
+    seen = []
+
+    def tower(_tower, pixels, g, **kw):
+        seen.append(g.shape[0])
+        return _content_tower_forward(_tower, pixels, g, **kw)
+
+    video.amd_model.vision_tower_forward = _content_tower_forward
+    monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
+    video.mod.install_kimi_k3_video()
+    dist = _dp_distributed(monkeypatch, world_size)
+    reference = _dp_model(video, use_data_parallel=False).embed_multimodal(**inputs)
+    video.amd_model.vision_tower_forward = tower
+    for rank in range(world_size):
+        dist.rank = rank
+        _dp_model(video).embed_multimodal(**inputs)
+    assert set(seen) == {1}
+    dist.replay = dict(dist.sent)
+    dist.rank = 0
+    (out, ) = _dp_model(video).embed_multimodal(**inputs)
+    torch.testing.assert_close(out, reference[0], rtol=0, atol=0)
+
+
+def test_dp_embed_rejects_a_wrong_local_row_count(video, monkeypatch):
+    monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
+    video.mod.install_kimi_k3_video()
+    video.amd_model.vision_tower_forward = lambda tower, pixels, grids, **kw: [torch.zeros(4 * 6, DP_DIM)]
+    _dp_distributed(monkeypatch, 2)
+    with pytest.raises(ValueError, match=r"rank 0 encoded chunks \[0, 3\) into \(72, 12\), expected \(12, 12\)"):
+        _dp_model(video).embed_multimodal(**_dp_inputs(video))
+
+
+@pytest.mark.parametrize("use_data_parallel, world_size", [(False, 4), (True, 1)])
+def test_dp_env_falls_back_to_the_plain_tower(video, monkeypatch, caplog, use_data_parallel, world_size):
+    monkeypatch.setenv(video.mod.ENV_VIT_DP, "1")
+    video.mod.install_kimi_k3_video()
+    video.amd_model.vision_tower_forward = _content_tower_forward
+    dist = _dp_distributed(monkeypatch, world_size)
+    with caplog.at_level(logging.WARNING, logger="vllm.gaudi.kimi_k3_video"):
+        out = _dp_model(video, use_data_parallel).embed_multimodal(**_dp_inputs(video))
+    assert [t.shape[0] for t in out] == [12, 7]
+    assert dist.sent == {}
+    assert "HPU_KIMI_VIT_DP=1 ignored" in caplog.text
+
+
+def test_dp_env_unset_never_touches_the_tp_group(video, monkeypatch):
+    monkeypatch.delenv(video.mod.ENV_VIT_DP, raising=False)
+    video.mod.install_kimi_k3_video()
+    video.amd_model.vision_tower_forward = _content_tower_forward
+    dist = _dp_distributed(monkeypatch, 4)
+    out = _dp_model(video).embed_multimodal(**_dp_inputs(video))
+    assert [t.shape[0] for t in out] == [12, 7]
+    assert dist.sent == {}
