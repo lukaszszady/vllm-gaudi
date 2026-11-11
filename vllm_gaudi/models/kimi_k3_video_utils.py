@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pure helpers of the Kimi-K3 video input path (no vLLM or torch imports).
 
-Kept apart from ``kimi_k3_video.py`` so that frame sampling, chunking, timestamps, prompt construction and the vision
-token count can be unit-tested on a CPU host without the Kimi-K3 classes of vLLM.
+Kept apart from ``kimi_k3_video.py`` so that frame sampling, chunking, timestamps and prompt construction can be
+unit-tested on a CPU host without the Kimi-K3 classes of vLLM.
 
 Kimi-K3 publishes no video prompt format. The helpers follow the Kimi-K2.5/K2.6 one, because K3 reuses the K2.5 vision
 tower, its image processor (``KimiK25FusedVisionProcessor``) and the ``<|media_*|>`` special tokens: the video is
@@ -15,8 +15,7 @@ mean-pools each chunk over time into one picture worth of tokens) and every chun
 Only the ``<|media_pad|>`` positions carry vision embeddings.
 """
 
-import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Sequence
 
 # Modality placeholder the chat parser inserts for a ``video_url`` content part. Like the image one it is ordinary text
 # (not a special token); the processor replaces it with the chunk blocks below.
@@ -107,38 +106,6 @@ def plan_video_chunks(
     return chunks, starts
 
 
-def navit_chunk_tokens(
-    width: int,
-    height: int,
-    media_proc_cfg: Mapping[str, object],
-) -> int:
-    """Vision tokens of ONE video chunk, whatever its length (the tower pools the frames of a chunk over time).
-
-    Re-implements the size arithmetic of ``navit_resize_video`` for a chunk (``nframes`` = chunk length, avg fps 1,
-    unlimited sample fps) so the count can be checked without vLLM. The patch limit per frame is
-    ``min(in_patch_limit_each_frame, in_patch_limit_video / sampled_frames)``; the second term never binds for 4-frame
-    chunks with the K3 config, so it is not modelled. The processor itself counts with the checkpoint image processor;
-    this is the reference for the unit tests.
-    """
-    patch_size = int(media_proc_cfg["patch_size"])  # type: ignore[call-overload]
-    merge = int(media_proc_cfg["merge_kernel_size"])  # type: ignore[call-overload]
-    per_frame_limit = media_proc_cfg.get("in_patch_limit_each_frame") or media_proc_cfg["in_patch_limit"]
-    side_limit = int(media_proc_cfg["patch_limit_on_one_side"])  # type: ignore[call-overload]
-
-    s1 = math.sqrt(per_frame_limit /
-                   (max(1.0, width // patch_size) * max(1.0, height // patch_size)))  # type: ignore[operator]
-    s2 = side_limit * patch_size / width
-    s3 = side_limit * patch_size / height
-    scale = min(1.0, s1, s2, s3)
-    new_w = min(max(1, int(width * scale)), side_limit * patch_size)
-    new_h = min(max(1, int(height * scale)), side_limit * patch_size)
-
-    factor = merge * patch_size
-    pad_w = (factor - new_w % factor) % factor
-    pad_h = (factor - new_h % factor) % factor
-    return ((new_h + pad_h) // factor) * ((new_w + pad_w) // factor)
-
-
 def build_video_prompt(
     chunk_starts: Sequence[float],
     tokens_per_chunk: Sequence[int],
@@ -149,52 +116,3 @@ def build_video_prompt(
         raise ValueError("chunk_starts and tokens_per_chunk must have the same length")
     return "".join(f"{format_timestamp(start)}<|media_begin|>video<|media_content|>"
                    f"{media_token * tokens}<|media_end|>" for start, tokens in zip(chunk_starts, tokens_per_chunk))
-
-
-def video_vision_tokens(
-    width: int,
-    height: int,
-    num_frames: int,
-    source_fps: float,
-    media_proc_cfg: Mapping[str, object],
-    chunk_tokens_fn: Callable[[int, int, Mapping[str, object]], int] = navit_chunk_tokens,
-) -> int:
-    """Total ``<|media_pad|>`` count of a ``num_frames`` video (what the scheduler reserves for the item)."""
-    chunk_size = int(media_proc_cfg.get("temporal_merge_kernel_size",
-                                        DEFAULT_TEMPORAL_CHUNK_SIZE))  # type: ignore[call-overload]
-    max_fps = float(media_proc_cfg.get("sample_fps", DEFAULT_MAX_SAMPLE_FPS))  # type: ignore[arg-type]
-    chunks, _ = plan_video_chunks(num_frames, num_frames, source_fps, None, max_fps, chunk_size)
-    return len(chunks) * chunk_tokens_fn(width, height, media_proc_cfg)
-
-
-def split_chunks_across_ranks(num_chunks: int, world_size: int) -> list[tuple[int, int]]:
-    """Contiguous ``[start, end)`` chunk range of every rank for the data-parallel vision tower (``HPU_KIMI_VIT_DP``).
-
-    Balanced: the first ``num_chunks % world_size`` ranks get one chunk more. Ranks beyond ``num_chunks`` get an empty
-    range. Contiguous ranges keep the chunk order when the per-rank outputs are concatenated in rank order.
-    """
-    if world_size < 1:
-        raise ValueError(f"world_size must be >= 1, got {world_size}")
-    if num_chunks < 0:
-        raise ValueError(f"num_chunks must be >= 0, got {num_chunks}")
-    base, extra = divmod(num_chunks, world_size)
-    ranges = []
-    start = 0
-    for rank in range(world_size):
-        end = start + base + (1 if rank < extra else 0)
-        ranges.append((start, end))
-        start = end
-    return ranges
-
-
-def rank_row_counts(chunk_rows: Sequence[int], ranges: Sequence[tuple[int, int]]) -> list[int]:
-    """Embedding rows each rank produces for its chunk range (``chunk_rows[i]`` rows for chunk ``i``)."""
-    return [sum(chunk_rows[start:end]) for start, end in ranges]
-
-
-def chunk_patch_offsets(grid_thws: Sequence[Sequence[int]]) -> list[int]:
-    """Start row of every chunk in the flattened ``pixel_values`` (``t * h * w`` patches per chunk), plus the total."""
-    offsets = [0]
-    for t, h, w in grid_thws:
-        offsets.append(offsets[-1] + t * h * w)
-    return offsets

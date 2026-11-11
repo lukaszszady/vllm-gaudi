@@ -35,15 +35,6 @@ warm up the video shape pass it explicitly:
 
 Without a per-modality override the dummy video used for profiling and warmup is 20 frames of 864x480 at 2 fps.
 
-## Data-parallel vision tower (experimental)
-
-By default every TP rank encodes all chunks of a video. With `HPU_KIMI_VIT_DP=1` (read when the patch is installed)
-each rank encodes a contiguous share of the chunks (the first `chunks % TP` ranks get one more) and the per-rank
-embeddings are all-gathered over the TP group in chunk order. It applies only when the tower weights are replicated
-(`use_data_parallel`, for example `--mm-encoder-tp-mode data`) and TP > 1; otherwise a warning is logged and the default
-path is used. The all-gather runs outside the compiled tower blocks. Each chunk goes through the tower in its own call, so the
-blocks always see a single chunk and an idle rank encodes chunk 0 to compile the same shape at warmup.
-
 ## Failure handling
 
 If the patch cannot be installed, a warning from the `vllm.gaudi.kimi_patches` logger names the patch (`k3_video`)
