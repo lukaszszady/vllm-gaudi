@@ -489,7 +489,9 @@ def _patch_mla_bind_kv_cache() -> None:
     """Install the HPU-safe ``MLAAttention.bind_kv_cache`` replacement."""
     try:
         from vllm.model_executor.layers.attention.mla_attention import MLAAttention
-    except ImportError:
+    except ImportError as exc:
+        from vllm_gaudi.extension.logger import logger
+        logger().debug("MLAAttention.bind_kv_cache patch skipped: %s", exc)
         return
 
     upstream = getattr(MLAAttention, "bind_kv_cache", None)
@@ -968,8 +970,9 @@ def warn_if_kimi_k3_config_patches_inactive(vllm_config) -> None:
     from vllm.config import ModelConfig
     if not getattr(ModelConfig.__post_init__, "_hpu_kimi_post_init", False):
         from vllm_gaudi.extension.logger import logger
-        logger().warning("Kimi-K3 config detected but the Kimi-K3 config patches are not active; "
-                         "layer_types and the K3 model registration may be missing")
+        logger().warning(
+            "Kimi-K3 config detected but the ModelConfig.__post_init__ (hybrid_config) patch is not active; "
+            "layer_types may be missing")
 
 
 def _patch_kimi_kda() -> None:

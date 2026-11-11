@@ -539,7 +539,7 @@ def test_warns_when_k3_config_patch_is_not_active(config_patches, caplog):
         config_patches.warn_if_kimi_k3_config_patches_inactive(other)
         assert not caplog.records
         config_patches.warn_if_kimi_k3_config_patches_inactive(k3)
-    assert "config patches are not active" in caplog.text
+    assert "hybrid_config) patch is not active" in caplog.text
 
 
 # The "only the gpt-oss alias is installed upstream" check is behavioural and lives in test_kimi_mxfp4_routing.py

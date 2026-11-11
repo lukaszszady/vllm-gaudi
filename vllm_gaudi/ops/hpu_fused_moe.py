@@ -90,9 +90,30 @@ def _unfused_swigluoai_moe(
 ) -> torch.Tensor:
     """Unfused expert MLP with SwiGLU-OAI activation for MiniMax-M3 on HPU.
 
-    Dense pass (every token through every local expert, masked by the routing weight) as an expert-chunked ``bmm``
-    to keep static shapes. Returns the per-rank (pre-all-reduce) partial of the fused op; the SwiGLU-OAI activation
-    runs in fp32.
+    Replaces a single ``moe_op(x, topk_ids, topk_weights, activation=...)`` fused
+    call for the ``swigluoai_uninterleave`` activation (unsupported by the Habana
+    MoE kernel). Returns the same per-rank (pre-all-reduce) partial as the fused
+    op, so the surrounding MoERunner reduction/combine pipeline is unchanged.
+
+    A dense pass is used (every token through every local expert, masked by the
+    routing weight) to keep static shapes, which the HPU graph compiler requires
+    -- data-dependent gather/indexing would produce dynamic shapes. It is
+    vectorized as a sync-free expert-chunked ``bmm`` over the stacked expert
+    weights rather than a per-expert Python loop: the loop issues one matmul per
+    expert and serializes the HPU graph (~0.3-1.4 tok/s), while the chunked
+    ``bmm`` batches experts with static shapes (~11 tok/s). The SwiGLU-OAI
+    activation is computed in fp32 for accuracy (matches
+    ``minimax_m3_sparse.swiglu_oai``).
+
+    Args:
+        layer: the ``FusedMoE``/``RoutedExperts`` layer. Reads the stacked
+            per-rank expert weights ``layer.w13_weight`` [E_local, 2*I, H] and
+            ``layer.w2_weight`` [E_local, H, I] (the same tensors that seed
+            ``moe_op.w13_list``) and ``layer.moe_config.ep_rank`` /
+            ``layer.local_num_experts`` for this rank's expert-id offset.
+        x: [T, H] flattened activations.
+        topk_ids: [T, K] selected (global) expert ids.
+        topk_weights: [T, K] routing weights.
     """
     w13 = layer.w13_weight  # [E_local, 2*I, H]
     w2 = layer.w2_weight  # [E_local, H, I]
@@ -287,8 +308,19 @@ def _swigluoai_moe(
 def model_has_quant_config() -> bool:
     """Whether the active model runs with a MoE quantization config.
 
-    Resolved from the global vLLM config (``RoutedExperts`` has no ``vllm_config``), so call it at build time and
-    cache the result for the forward path. ``False`` if no config context is active.
+    After upstream PR #41184 the ``layer`` reaching ``apply_monolithic`` is a
+    ``RoutedExperts`` instance, which no longer carries ``vllm_config`` (that
+    field belonged to the old top-level ``FusedMoE``). The model config must
+    therefore be resolved from the global vLLM config instead of off ``layer``.
+
+    This MUST be called at build time (e.g. in ``__init__`` /
+    ``process_weights_after_loading``), where the vLLM config context is set:
+    the result is static per run, so callers cache it and read the cached flag
+    on the forward hot path. ``get_current_vllm_config_or_none`` is used so the
+    function degrades to ``False`` instead of raising if no context is active.
+
+    Returns:
+        ``True`` when the active model config declares a MoE quant config.
     """
     vllm_config = get_current_vllm_config_or_none()
     model_config = vllm_config.model_config if vllm_config is not None else None
@@ -340,8 +372,23 @@ def select_experts_from_routed(layer, hidden_states: torch.Tensor,
                                router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Route tokens to experts for every routing that is not plain softmax top-k.
 
-    ``RoutedExperts`` carries the routing parameters but no ``.router``, so upstream's ``select_experts`` is used.
-    It is imported lazily because ``router.cpu_router`` pulls CPU custom ops at import time.
+    After upstream PR #41184 the ``layer`` passed to ``apply_monolithic`` is a
+    ``RoutedExperts`` instance, which no longer owns a ``.router`` object (the
+    router moved onto ``MoERunner``). ``RoutedExperts`` does, however, carry all
+    the routing parameters, so we reproduce upstream's behaviour via the
+    standalone ``select_experts`` helper. It is imported lazily because
+    ``router.cpu_router`` pulls CPU custom ops from ``vllm._custom_ops`` at
+    module import time.
+
+    Upstream PR #55355 relocated ``select_experts`` from
+    ``fused_moe.experts.cpu_moe`` to ``fused_moe.router.cpu_router`` (the
+    signature is unchanged; the module split factored CPU MoE routing out of
+    the monolithic experts file).
+
+    Args:
+        layer: The ``RoutedExperts`` instance holding the routing parameters.
+        hidden_states: Flattened input activations.
+        router_logits: Gate logits for the current tokens.
 
     Returns:
         A ``(topk_weights, topk_ids)`` tuple.
@@ -637,11 +684,25 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
 
 def _launch_shared_experts_overlap(runner: MoERunnerBase, shared_experts_input: torch.Tensor | None) -> bool:
-    """Start the shared-expert multi-stream overlap, tolerating either upstream API spelling.
+    """Start the shared-expert multi-stream overlap, tolerating either upstream API.
 
-    Falls through to "no overlap" on an unrecognised shape, which is correct on Gaudi (upstream gates the
-    multi-stream path on ``is_cuda_alike()``). Returns True iff the launch was asynchronous, i.e. the caller must
-    pass ``shared_experts_overlapping=True`` to ``_apply_quant_method``.
+    Upstream keeps flip-flopping on how the aux-stream launch is spelled: vllm#51838
+    added ``SharedExperts.maybe_forward_async`` plus a ``shared_experts_overlapping``
+    kwarg on ``MoERunner._apply_quant_method``, vllm#52024 reverted to
+    ``MoERunner._maybe_sync_shared_experts_stream``, and vllm#52033 re-landed the
+    #51838 shape. Feature-detect so the next flip does not break the HPU fast path.
+
+    On Gaudi every shape is a no-op — upstream gates the multi-stream path on
+    ``current_platform.is_cuda_alike()`` — so falling through to "no overlap" on an
+    unrecognised future shape stays functionally correct.
+
+    Args:
+        runner: The upstream ``MoERunner`` (``self`` of the patched forward).
+        shared_experts_input: Shared-expert input, or None when there are none.
+
+    Returns:
+        True iff the launch was asynchronous, meaning the caller must pass
+        ``shared_experts_overlapping=True`` down to ``_apply_quant_method``.
     """
     sync_stream = getattr(runner, "_maybe_sync_shared_experts_stream", None)
     if sync_stream is not None:
@@ -719,11 +780,23 @@ def patched_fused_moe_forward(
     router_logits: torch.Tensor,
     input_ids: torch.Tensor | None = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Patched forward that avoids graph breaks from ForwardContext lookups and per-layer string guards.
+    """Patched forward that avoids graph breaks from ForwardContext lookups
+    and dynamo per-layer string guards.
 
-    For dp_size==1 it inlines the quant-config init, gate, ``_apply_quant_method`` and ``_maybe_combine`` instead
-    of ``_forward_impl``. ``self`` is the MoERunner (upstream PR #41184); the post-forward reduction mirrors
-    upstream ``MoERunner.forward``.
+    Instead of calling _forward_impl (which uses _sequence_parallel_context
+    and _maybe_dispatch — both of which access ForwardContext and cause
+    torch.compile graph breaks), for dp_size==1 we inline the quant-config
+    init, gate application, _apply_quant_method and _maybe_combine directly.
+    This also bypasses self.layer_name (a per-layer string) so dynamo no
+    longer emits per-layer string guards that trigger recompilation.
+
+    After upstream PR #41184 (FusedMoE/MoERunner inversion), `self` IS the
+    MoERunner: the expert weights and quant_method live on
+    self.routed_experts, quant init moved to
+    routed_experts._ensure_moe_quant_config_init(), and _apply_quant_method
+    no longer takes a `layer` argument. The post-forward reduction sequence
+    mirrors upstream MoERunner.forward so we stay in sync with the shared/
+    fused output combination logic.
     """
     hidden_states, shared_experts_input = self.apply_routed_input_transform(hidden_states)
     # Upstream _maybe_pad_hidden_states returns a 3-tuple: the (possibly padded)
@@ -924,12 +997,67 @@ def create_fused_moe_router(
     # sequence-parallel padding parameters (upstream vLLM PR 56079+)
     skip_padding: bool = False,
 ) -> FusedMoERouter:
-    """Create the FusedMoERouter subclass matching the parameters.
+    """
+    Factory function to create the appropriate FusedMoERouter subclass based on
+    the provided parameters.
 
-    Priority: RoutingSimulatorRouter (VLLM_MOE_ROUTING_SIMULATION_STRATEGY set), ZeroExpertRouter, GroupedTopKRouter,
-    CustomRoutingRouter, FusedTopKBiasRouter, FusedTopKRouter. ``shared_expert_weight`` and ``skip_padding`` are
-    accepted for signature parity and unused on HPU; ``bias_vl`` and ``image_sentinel_lo`` go to
-    FusedTopKBiasRouter.
+    The selection logic follows this priority order:
+    1. RoutingSimulatorRouter - if VLLM_MOE_ROUTING_SIMULATION_STRATEGY env var is set
+    2. ZeroExpertRouter - if zero_expert_type is not None
+    3. GroupedTopKRouter - if use_grouped_topk is True
+    4. CustomRoutingRouter - if custom_routing_function is not None
+    5. FusedTopKBiasRouter - if e_score_correction_bias is not None
+    6. FusedTopKRouter - default fallback
+
+    Common arguments:
+        top_k: Number of experts to select per token
+        global_num_experts: Total number of experts in the model
+        renormalize: Whether to renormalize the routing weights
+
+    Grouped topk arguments:
+        use_grouped_topk: Whether to use grouped top-k routing
+        num_expert_group: Number of expert groups (for grouped routing)
+        topk_group: Top-k within each group (for grouped routing)
+        scoring_func: Scoring function to use ("softmax" or "sigmoid")
+        num_fused_shared_experts: Number of fused shared experts (for ROCm AITER)
+        shared_expert_weight: Weight of the fused shared-expert slot (upstream
+            vLLM d039c171+). Accepted for signature parity; unused on HPU since
+            the fused-shared-expert path is not taken (default 1.0 no-op).
+
+    Grouped topk and fused topk bias arguments:
+        routed_scaling_factor: Scaling factor for routed weights
+        e_score_correction_bias: Optional bias correction for expert scores
+
+    Custom routing arguments:
+        custom_routing_function: Optional custom routing function
+
+    EPLB arguments:
+        eplb_state: EPLB (Expert Parallelism Load Balancing) state
+
+    Zero expert arguments:
+        zero_expert_type: Type of zero expert (e.g. identity). If not None,
+            creates a ZeroExpertRouter.
+        num_logical_experts: Number of real (non-zero) experts. Required when
+            zero_expert_type is not None.
+
+    Hash Indices Table:
+        hash_indices_table: Used to map input_ids to experts, needed for
+            Deepseek V4
+
+    Sequence-parallel padding arguments (upstream vLLM PR 56079+):
+        skip_padding: Whether grouped routing should invalidate padding rows.
+            Forwarded to GroupedTopKRouter for signature parity; the guard it
+            enables (VLLM_MOE_SKIP_PADDING + a DeepEP-v2-kernel forward
+            context) is not exercised on HPU, so this is a no-op here.
+
+    Vision routing bias arguments (upstream vLLM PR 54566+):
+        bias_vl: Vision routing bias for image tokens (Deepseek V4).
+        image_sentinel_lo: First of five consecutive in-vocab image sentinel
+            ids (0 = vision routing disabled). Both are forwarded to
+            FusedTopKBiasRouter, which owns the vision-bias routing path.
+
+    Returns:
+        An instance of the appropriate FusedMoERouter subclass
     """
 
     routing_strategy = envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY

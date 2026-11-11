@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     HPU_KIMI_SITU_IMPL: str = "exact"
     HPU_KIMI_VIT_DP: bool = False
     HPU_KIMI_PREFILL_MERGE: bool = False
+    HPU_KIMI_KDA_PREFILL_CHUNK: str = "64,16"
     HPU_KIMI_KDA_INTRA_SUB_CHUNK: str = "0"
     VLLM_HPU_TWO_STAGE_TOPK: bool = True
     VLLM_HPU_MIN_PREFILL_CHUNK: str = ""
