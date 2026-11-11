@@ -54,8 +54,6 @@ def patches(monkeypatch):
 
     monkeypatch.delitem(sys.modules, "vllm_gaudi.patches", raising=False)
     mod = importlib.import_module("vllm_gaudi.patches")
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_FAILED", {})
     mod._patch_moe_runner_delegation()
     mod.test_current = current
     mod.test_classes = (MoERunner, ROCmLatentMoERunner)
@@ -72,11 +70,6 @@ def _experts_with_packed_weights():
 def _build(patches, runner_cls_index, architectures):
     patches.test_current["config"] = _Config(architectures)
     return patches.test_classes[runner_cls_index](_experts_with_packed_weights())
-
-
-def test_delegation_patch_is_recorded_as_installed(patches):
-    assert patches._KIMI_PATCHES_INSTALLED == ["moe_runner_delegation"]
-    assert not patches._KIMI_PATCHES_FAILED
 
 
 def test_upstream_runner_classes_get_no_getattr(patches):
@@ -302,8 +295,6 @@ def config_patches(monkeypatch):
 
     monkeypatch.delitem(sys.modules, "vllm_gaudi.patches", raising=False)
     mod = importlib.import_module("vllm_gaudi.patches")
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_FAILED", {})
     mod._patch_kimi_k3_hybrid_config()
     mod._patch_mla_prefill_selector()
     mod.test_model_config = ModelConfig
@@ -311,11 +302,6 @@ def config_patches(monkeypatch):
     mod.test_dummy = dummy_backend
     yield mod
     sys.modules.pop("vllm_gaudi.patches", None)
-
-
-def test_config_patches_install(config_patches):
-    assert not config_patches._KIMI_PATCHES_FAILED
-    assert "mla_prefill_selector" in config_patches._KIMI_PATCHES_INSTALLED
 
 
 @pytest.mark.parametrize(
@@ -408,6 +394,8 @@ def kda_modules(config_patches, monkeypatch):
         mod = types.ModuleType(full)
         for attr in attrs:
             setattr(mod, attr, fused_check)
+        if name == "kda":
+            mod.KimiK3DeltaAttention = type("KimiK3DeltaAttention", (), {"forward": lambda self: None})
         monkeypatch.setitem(sys.modules, full, mod)
         mods[name] = mod
     config_patches.test_kda_modules = mods
@@ -427,7 +415,8 @@ def test_k3_kda_patch_makes_both_fused_checks_return_false_everywhere(kda_module
 
 
 def test_k3_arch_patch_does_not_replace_the_rocm_module(kda_modules):
-    kda_modules._patch_kimi_k3_arch()
+    with pytest.raises(ImportError):  # the amd.linear module is not stubbed here
+        kda_modules._patch_kimi_k3_arch()
 
     assert sys.modules["vllm.platforms.rocm"] is kda_modules.test_rocm
     assert not hasattr(kda_modules.test_rocm, "on_gfx9")
@@ -488,38 +477,55 @@ def test_apply_twice_wraps_load_general_plugins_once(kda_modules, monkeypatch):
     assert deferred_calls == [1]  # and the deferred patches ran once per call
 
 
-def test_kda_patch_import_failure_of_one_module_does_not_skip_the_others(kda_modules, monkeypatch):
-    # the chunk ops module cannot be imported; the rest must still be patched
+def test_kda_patch_leaves_the_shared_gdn_layer_alone(kda_modules):
     gdn_cls, gdn_original = kda_modules.test_gdn_cls, kda_modules.test_gdn_original
-    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.ops.kda_chunk", None)
-    monkeypatch.setattr(kda_modules, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(kda_modules, "_KIMI_PATCHES_FAILED", {})
 
     kda_modules._patch_kimi_kda()
 
     mods = kda_modules.test_kda_modules
+    assert mods["ops.kda_chunk"].is_fused_kda_chunk_supported() is False
     assert mods["ops.kda_decode"].is_fused_kda_decode_supported() is False
     assert mods["kda"].is_fused_kda_chunk_supported() is False
     assert mods["kda"].is_fused_kda_decode_supported() is False
-    assert "kda_forward" in kda_modules._KIMI_PATCHES_INSTALLED
-    assert "kda_fused_checks" not in kda_modules._KIMI_PATCHES_INSTALLED
-    assert "kimi_gdn_forward" not in kda_modules._KIMI_PATCHES_INSTALLED
-    assert list(kda_modules._KIMI_PATCHES_FAILED) == ["kda_fused_checks[ops.kda_chunk]"]
     # the shared Kimi-Linear GDN layer keeps its own forward (its low-rank gate layout is not the K3 one)
     assert gdn_cls.forward is gdn_original
 
 
-def test_kda_patch_failure_is_logged_through_the_vllm_logger_tree(kda_modules, monkeypatch, caplog):
-    import logging
-    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.kda", None)
-    monkeypatch.setattr(kda_modules, "_KIMI_PATCHES_FAILED", {})
+def test_kda_patch_import_failure_raises(kda_modules, monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.ops.kda_chunk", None)
 
-    with caplog.at_level(logging.DEBUG, logger="vllm"):
+    with pytest.raises(ImportError):
         kda_modules._patch_kimi_kda()
 
-    records = [r for r in caplog.records if "'kda_forward' failed" in r.getMessage()]
-    assert records and records[0].name.startswith("vllm.")
-    assert "kda_forward" in kda_modules._KIMI_PATCHES_FAILED
+
+def test_install_skips_a_failing_patch_unless_strict(kda_modules, monkeypatch):
+    calls = []
+
+    def boom():
+        raise ImportError("partially initialised")
+
+    for name in ("_patch_kimi_kda", "_patch_kimi_attn_res", "_patch_kimi_linear_weights", "_patch_mla_prefill_selector",
+                 "_patch_moe_runner_delegation", "_patch_latent_moe_runner_forward", "_patch_kimi_k3_hybrid_config",
+                 "_patch_kimi_k3_arch", "_patch_kimi_k3_video", "_patch_compressed_tensors_mxfp4"):
+        monkeypatch.setattr(kda_modules, name, lambda name=name: calls.append(name))
+    monkeypatch.setattr(kda_modules, "_patch_kimi_kda", boom)
+
+    kda_modules._install_kimi_k3_patches()
+    assert len(calls) == 9  # the others still ran
+    with pytest.raises(ImportError):
+        kda_modules._install_kimi_k3_patches(strict=True)
+
+
+def test_ensure_raises_when_kda_forward_is_not_active(kda_modules, monkeypatch):
+    monkeypatch.setattr(kda_modules, "_install_kimi_k3_patches", lambda strict=False: None)
+    cfg = types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+
+    kda_modules.ensure_kimi_k3_patches(types.SimpleNamespace(architectures=["LlamaForCausalLM"]))  # not K3: untouched
+    with pytest.raises(RuntimeError, match="kda_forward"):
+        kda_modules.ensure_kimi_k3_patches(cfg)
+
+    kda_modules._patch_kimi_kda()
+    kda_modules.ensure_kimi_k3_patches(cfg)
 
 
 # The "only the gpt-oss alias is installed upstream" check is behavioural and lives in test_kimi_mxfp4_routing.py
@@ -583,9 +589,8 @@ def arch_modules(kda_modules, monkeypatch):
 
 
 def _forward_wrapper(arch_modules):
-    """Runs _patch_kimi_k3_arch; its patches that need real vllm are skipped by their own try blocks."""
+    """Runs _patch_kimi_k3_arch."""
     arch_modules._patch_kimi_k3_arch()
-    assert "linear_model_tokens_1d" in arch_modules._KIMI_PATCHES_INSTALLED
     return arch_modules.test_linear.KimiLinearModel
 
 

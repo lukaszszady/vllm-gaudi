@@ -397,38 +397,6 @@ def test_image_requests_take_the_unchanged_path(video):
     assert video.K3Model().embed_multimodal(pixel_values=torch.zeros(1), grid_thws=torch.zeros(1, 3)) == "image-path"
 
 
-def test_failed_install_is_logged_as_a_warning(video, monkeypatch, caplog):
-    """_patch_kimi_k3_arch swallows exceptions; the video patch must not stay silent."""
-    for name in ("vllm", "vllm.envs"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-    monkeypatch.setitem(sys.modules, "vllm.config", types.SimpleNamespace(get_current_vllm_config_or_none=lambda: None))
-    monkeypatch.delitem(sys.modules, "vllm_gaudi.patches", raising=False)
-    patches = importlib_import("vllm_gaudi.patches")
-    monkeypatch.setattr(patches, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(patches, "_KIMI_PATCHES_FAILED", {})
-    monkeypatch.setattr(patches, "_KIMI_PATCHES_WARNED", set())
-
-    def boom():
-        raise RuntimeError("no video for you")
-
-    monkeypatch.setattr(video.mod, "install_kimi_k3_video", boom)
-    patches._patch_kimi_k3_video()
-    assert "k3_video" in patches._KIMI_PATCHES_FAILED
-    with caplog.at_level(logging.WARNING, logger="vllm.gaudi.kimi_patches"):
-        patches._kimi_patches_log_failed(only=patches._KIMI_CONFIG_PATCHES)
-    assert any("k3_video" in r.getMessage() and "no video for you" in r.getMessage() for r in caplog.records)
-
-    monkeypatch.setattr(video.mod, "install_kimi_k3_video", lambda: None)
-    patches._patch_kimi_k3_video()
-    assert "k3_video" not in patches._KIMI_PATCHES_FAILED
-    assert "k3_video" in patches._KIMI_PATCHES_INSTALLED
-
-
-def importlib_import(name):
-    import importlib
-    return importlib.import_module(name)
-
-
 # --------------------------------------------------------- processor and model
 
 

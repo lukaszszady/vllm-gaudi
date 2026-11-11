@@ -30,7 +30,7 @@ import torch.nn as nn
 import vllm_gaudi.envs as gaudi_envs
 import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.kimi_k3_gate import is_kimi_k3_model_config
-from vllm_gaudi.patches import ensure_kimi_k3_patches, report_kimi_patches, report_kimi_patches_on_load_failure
+from vllm_gaudi.patches import ensure_kimi_k3_patches
 from vllm_gaudi.mm_warmup_inputs import build_dummy_processor_inputs, build_raw_image_processor_inputs
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cache_groups
@@ -5091,13 +5091,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             # The shards' page cache would otherwise fill host memory and trip the bridge's host memory
             # threshold (recipe cache eviction), see hpu_weight_page_cache.
             with ctx, drop_weight_page_cache_during_load(self.model_config):
-                try:
-                    ensure_kimi_k3_patches(self.model_config)
-                    self.model = get_model(vllm_config=self.vllm_config)
-                except Exception:
-                    report_kimi_patches_on_load_failure(self.model_config)
-                    raise
-            report_kimi_patches(self.model)
+                ensure_kimi_k3_patches(self.model_config)
+                self.model = get_model(vllm_config=self.vllm_config)
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_device_memory

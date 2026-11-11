@@ -156,8 +156,6 @@ def patches(monkeypatch):
     module("vllm.config", get_current_vllm_config_or_none=lambda: current["config"], ModelConfig=ModelConfig)
     monkeypatch.delitem(sys.modules, "vllm_gaudi.patches", raising=False)
     mod = importlib.import_module("vllm_gaudi.patches")
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_FAILED", {})
     mod.test_current = current
     mod.test_model_config = ModelConfig
     yield mod
@@ -202,14 +200,6 @@ def test_mla_bind_kv_cache_gated_by_data_type(patches, monkeypatch):
     assert layer.kv_cache == ("k", "v") and calls == []
     layer.bind_kv_cache("tensor")
     assert calls == ["tensor"]
-
-
-def test_remote_tokenizer_filter_only_after_k3(patches, monkeypatch):
-    f = patches._RemoteTokenizerNoticeFilter()
-    rec = logging.LogRecord("transformers_modules.x", logging.INFO, "", 0, "Calling super().encode with x", (), None)
-    assert f.filter(rec)
-    patches.test_current["config"] = _cfg(K3)
-    assert not f.filter(rec)
 
 
 def test_pad_ids_without_virtual_split_equal_scheduler_blocks():
