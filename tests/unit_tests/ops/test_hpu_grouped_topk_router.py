@@ -118,10 +118,19 @@ def _kimi_like_inputs(seed, tokens, experts):
     return logits, bias
 
 
-def _impl(router, logits, topk, renormalize, num_expert_group, topk_group, scoring_func, routed_scaling_factor, bias,
-          out_dtype):
+def _impl(router,
+          logits,
+          topk,
+          renormalize,
+          num_expert_group,
+          topk_group,
+          scoring_func,
+          routed_scaling_factor,
+          bias,
+          out_dtype,
+          fn="kimi_k3_grouped_topk"):
     hidden = torch.zeros(logits.shape[0], 1, dtype=out_dtype)
-    return router.grouped_topk(hidden, logits, topk, renormalize, num_expert_group, topk_group, scoring_func,
+    return getattr(router, fn)(hidden, logits, topk, renormalize, num_expert_group, topk_group, scoring_func,
                                routed_scaling_factor, bias)
 
 
@@ -256,7 +265,34 @@ def test_kimi_k3_routing_compiles_to_one_graph_for_all_token_counts(router):
     dynamo.reset()
 
 
-def test_grouped_topk_accepts_is_padding_like_upstream(router):
+@pytest.mark.parametrize("tokens", [3, 1100])
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("shape", [(896, 16, 1, 1), (256, 8, 8, 4)])
+def test_grouped_topk_without_kimi_flag_is_the_upstream_implementation(router, monkeypatch, tokens, with_bias, shape):
+    """The shared grouped_topk keeps the plain group mask + one torch.topk for every group count."""
+    experts, topk, groups, topk_group = shape
+    monkeypatch.setattr(router, "_kimi_k3_routing", False)
+    logits, bias = _kimi_like_inputs(tokens, tokens, experts)
+    args = (logits, topk, True, groups, topk_group, "sigmoid", 2.5, bias if with_bias else None)
+    weights, ids = _impl(router, *args, torch.float32, fn="grouped_topk_entry")
+    ref_weights, ref_ids = reference_grouped_topk(*args, False)
+    assert ids.dtype == torch.int64
+    assert torch.equal(ids, ref_ids) and torch.equal(weights, ref_weights)
+
+
+def test_grouped_topk_entry_dispatches_on_the_kimi_flag(router, monkeypatch):
+    monkeypatch.setattr(router, "_kimi_k3_routing", False)
+    calls = []
+    monkeypatch.setattr(router, "grouped_topk", lambda *a, **k: calls.append("shared"))
+    monkeypatch.setattr(router, "kimi_k3_grouped_topk", lambda *a, **k: calls.append("kimi"))
+    router.grouped_topk_entry()
+    router.enable_kimi_k3_grouped_topk()
+    router.grouped_topk_entry()
+    assert calls == ["shared", "kimi"]
+
+
+@pytest.mark.parametrize("fn", ["grouped_topk", "kimi_k3_grouped_topk"])
+def test_grouped_topk_accepts_is_padding_like_upstream(router, fn):
     """Upstream GroupedTopKRouter calls grouped_topk(..., is_padding=mask): padded rows get weight 0 and id -1."""
     logits, bias = _kimi_like_inputs(6, 6, 256)
     hidden = torch.zeros(6, 4, dtype=torch.bfloat16)
@@ -268,8 +304,8 @@ def test_grouped_topk_accepts_is_padding_like_upstream(router):
                   scoring_func="sigmoid",
                   routed_scaling_factor=2.5,
                   e_score_correction_bias=bias)
-    ref_weights, ref_ids = router.grouped_topk(hidden, logits, **kwargs)
-    weights, ids = router.grouped_topk(hidden, logits, is_padding=is_padding, **kwargs)
+    ref_weights, ref_ids = getattr(router, fn)(hidden, logits, **kwargs)
+    weights, ids = getattr(router, fn)(hidden, logits, is_padding=is_padding, **kwargs)
     keep = ~is_padding
     assert torch.equal(ids[keep], ref_ids[keep]) and torch.equal(weights[keep], ref_weights[keep])
     assert (ids[is_padding] == -1).all() and (weights[is_padding] == 0).all()
