@@ -54,8 +54,6 @@ def patches(monkeypatch):
 
     monkeypatch.delitem(sys.modules, "vllm_gaudi.patches", raising=False)
     mod = importlib.import_module("vllm_gaudi.patches")
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_FAILED", {})
     mod._patch_moe_runner_delegation()
     mod.test_current = current
     mod.test_classes = (MoERunner, ROCmLatentMoERunner)
@@ -72,11 +70,6 @@ def _experts_with_packed_weights():
 def _build(patches, runner_cls_index, architectures):
     patches.test_current["config"] = _Config(architectures)
     return patches.test_classes[runner_cls_index](_experts_with_packed_weights())
-
-
-def test_delegation_patch_is_recorded_as_installed(patches):
-    assert patches._KIMI_PATCHES_INSTALLED == ["moe_runner_delegation"]
-    assert not patches._KIMI_PATCHES_FAILED
 
 
 def test_upstream_runner_classes_get_no_getattr(patches):
@@ -151,6 +144,19 @@ def test_k3_runner_is_not_swapped_twice(patches):
     assert type(runner) is k3_cls
     assert k3_cls.__mro__.count(k3_cls) == 1
     assert not any(c.__dict__.get("_hpu_kimi_k3_runner") for c in k3_cls.__mro__[1:])
+
+
+def test_k3_runner_does_not_expose_the_quant_method_of_its_routed_experts(patches):
+    runner = _build(patches, 0, ["KimiK3ForConditionalGeneration"])
+    runner.routed_experts.quant_method = object()
+    model = torch.nn.Module()
+    model.experts = runner
+
+    # the weight loaders run process_weights_after_loading on every module that has a quant_method
+    owners = [name for name, module in model.named_modules() if getattr(module, "quant_method", None) is not None]
+
+    assert owners == ["experts.routed_experts"]
+    assert runner.w13_weight_packed is runner.routed_experts.w13_weight_packed
 
 
 def test_patching_twice_wraps_init_once(patches):
@@ -289,8 +295,6 @@ def config_patches(monkeypatch):
 
     monkeypatch.delitem(sys.modules, "vllm_gaudi.patches", raising=False)
     mod = importlib.import_module("vllm_gaudi.patches")
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(mod, "_KIMI_PATCHES_FAILED", {})
     mod._patch_kimi_k3_hybrid_config()
     mod._patch_mla_prefill_selector()
     mod.test_model_config = ModelConfig
@@ -298,11 +302,6 @@ def config_patches(monkeypatch):
     mod.test_dummy = dummy_backend
     yield mod
     sys.modules.pop("vllm_gaudi.patches", None)
-
-
-def test_config_patches_install(config_patches):
-    assert not config_patches._KIMI_PATCHES_FAILED
-    assert "mla_prefill_selector" in config_patches._KIMI_PATCHES_INSTALLED
 
 
 @pytest.mark.parametrize(
@@ -331,6 +330,17 @@ def test_k3_mla_model_gets_the_dummy_prefill_backend(config_patches):
     vllm_config = _Config(["KimiK3ForConditionalGeneration"])
 
     assert config_patches.test_selector.get_mla_prefill_backend(vllm_config) is config_patches.test_dummy
+
+
+@pytest.mark.parametrize("architectures,expected", [(["KimiK3ForConditionalGeneration"], 1),
+                                                    (["Kimi_K25ForConditionalGeneration"], 0),
+                                                    (["Llama4ForConditionalGeneration"], 0)])
+def test_settings_are_logged_only_for_k3_configs(config_patches, monkeypatch, architectures, expected):
+    calls = []
+    monkeypatch.setattr(config_patches, "_log_kimi_k3_settings", lambda: calls.append(1))
+    config_patches.test_model_config(architectures)
+
+    assert len(calls) == expected
 
 
 def test_hybrid_config_patch_does_not_wrap_post_init_twice(config_patches):
@@ -384,6 +394,8 @@ def kda_modules(config_patches, monkeypatch):
         mod = types.ModuleType(full)
         for attr in attrs:
             setattr(mod, attr, fused_check)
+        if name == "kda":
+            mod.KimiK3DeltaAttention = type("KimiK3DeltaAttention", (), {"forward": lambda self: None})
         monkeypatch.setitem(sys.modules, full, mod)
         mods[name] = mod
     config_patches.test_kda_modules = mods
@@ -403,7 +415,8 @@ def test_k3_kda_patch_makes_both_fused_checks_return_false_everywhere(kda_module
 
 
 def test_k3_arch_patch_does_not_replace_the_rocm_module(kda_modules):
-    kda_modules._patch_kimi_k3_arch()
+    with pytest.raises(ImportError):  # the amd.linear module is not stubbed here
+        kda_modules._patch_kimi_k3_arch()
 
     assert sys.modules["vllm.platforms.rocm"] is kda_modules.test_rocm
     assert not hasattr(kda_modules.test_rocm, "on_gfx9")
@@ -464,38 +477,99 @@ def test_apply_twice_wraps_load_general_plugins_once(kda_modules, monkeypatch):
     assert deferred_calls == [1]  # and the deferred patches ran once per call
 
 
-def test_kda_patch_import_failure_of_one_module_does_not_skip_the_others(kda_modules, monkeypatch):
-    # the chunk ops module cannot be imported; the rest must still be patched
+def test_kda_patch_leaves_the_shared_gdn_layer_alone(kda_modules):
     gdn_cls, gdn_original = kda_modules.test_gdn_cls, kda_modules.test_gdn_original
-    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.ops.kda_chunk", None)
-    monkeypatch.setattr(kda_modules, "_KIMI_PATCHES_INSTALLED", [])
-    monkeypatch.setattr(kda_modules, "_KIMI_PATCHES_FAILED", {})
 
     kda_modules._patch_kimi_kda()
 
     mods = kda_modules.test_kda_modules
+    assert mods["ops.kda_chunk"].is_fused_kda_chunk_supported() is False
     assert mods["ops.kda_decode"].is_fused_kda_decode_supported() is False
     assert mods["kda"].is_fused_kda_chunk_supported() is False
     assert mods["kda"].is_fused_kda_decode_supported() is False
-    assert "kda_forward" in kda_modules._KIMI_PATCHES_INSTALLED
-    assert "kda_fused_checks" not in kda_modules._KIMI_PATCHES_INSTALLED
-    assert "kimi_gdn_forward" not in kda_modules._KIMI_PATCHES_INSTALLED
-    assert list(kda_modules._KIMI_PATCHES_FAILED) == ["kda_fused_checks[ops.kda_chunk]"]
     # the shared Kimi-Linear GDN layer keeps its own forward (its low-rank gate layout is not the K3 one)
     assert gdn_cls.forward is gdn_original
 
 
-def test_kda_patch_failure_is_logged_through_the_vllm_logger_tree(kda_modules, monkeypatch, caplog):
-    import logging
-    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.kda", None)
-    monkeypatch.setattr(kda_modules, "_KIMI_PATCHES_FAILED", {})
+def test_kda_patch_import_failure_raises(kda_modules, monkeypatch):
+    monkeypatch.setitem(sys.modules, "vllm.models.kimi_k3.amd.ops.kda_chunk", None)
 
-    with caplog.at_level(logging.DEBUG, logger="vllm"):
+    with pytest.raises(ImportError):
         kda_modules._patch_kimi_kda()
 
-    records = [r for r in caplog.records if "'kda_forward' failed" in r.getMessage()]
-    assert records and records[0].name.startswith("vllm.")
-    assert "kda_forward" in kda_modules._KIMI_PATCHES_FAILED
+
+def test_install_skips_a_failing_patch_unless_strict(kda_modules, monkeypatch):
+    calls = []
+
+    def boom():
+        raise ImportError("partially initialised")
+
+    for name in ("_patch_kimi_kda", "_patch_kimi_attn_res", "_patch_kimi_linear_weights", "_patch_mla_prefill_selector",
+                 "_patch_mla_bind_kv_cache", "_patch_moe_runner_delegation", "_patch_latent_moe_runner_forward",
+                 "_patch_kimi_k3_hybrid_config", "_patch_kimi_k3_arch", "_patch_kimi_k3_video",
+                 "_patch_compressed_tensors_mxfp4"):
+        monkeypatch.setattr(kda_modules, name, lambda name=name: calls.append(name))
+    monkeypatch.setattr(kda_modules, "_patch_kimi_kda", boom)
+
+    kda_modules._install_kimi_k3_patches()
+    assert len(calls) == 10  # the others still ran
+    with pytest.raises(ImportError):
+        kda_modules._install_kimi_k3_patches(strict=True)
+
+
+def test_strict_install_warns_for_a_failing_video_patch_and_raises_for_kda(kda_modules, monkeypatch, caplog):
+    names = ("_patch_kimi_kda", "_patch_kimi_attn_res", "_patch_kimi_linear_weights", "_patch_mla_prefill_selector",
+             "_patch_mla_bind_kv_cache", "_patch_moe_runner_delegation", "_patch_latent_moe_runner_forward",
+             "_patch_kimi_k3_hybrid_config", "_patch_kimi_k3_arch", "_patch_kimi_k3_video",
+             "_patch_compressed_tensors_mxfp4")
+
+    def make(name, fail=False):
+
+        def patch():
+            if fail:
+                raise ImportError("not available")
+
+        patch.__name__ = name
+        monkeypatch.setattr(kda_modules, name, patch)
+
+    for name in names:
+        make(name)
+    make("_patch_kimi_k3_video", fail=True)
+
+    with caplog.at_level("WARNING"):
+        installed = kda_modules._install_kimi_k3_patches(strict=True)
+    assert len(installed) == 10 and "kimi_k3_video" not in installed
+    assert "Kimi-K3 patch kimi_k3_video is not active" in caplog.text
+
+    make("_patch_kimi_k3_video")
+    make("_patch_kimi_kda", fail=True)
+    with pytest.raises(ImportError):
+        kda_modules._install_kimi_k3_patches(strict=True)
+
+
+def test_ensure_raises_when_kda_forward_is_not_active(kda_modules, monkeypatch):
+    monkeypatch.setattr(kda_modules, "_install_kimi_k3_patches", lambda strict=False: [])
+    cfg = types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+
+    kda_modules.ensure_kimi_k3_patches(types.SimpleNamespace(architectures=["LlamaForCausalLM"]))  # not K3: untouched
+    with pytest.raises(RuntimeError, match="kda_forward"):
+        kda_modules.ensure_kimi_k3_patches(cfg)
+
+    kda_modules._patch_kimi_kda()
+    kda_modules.ensure_kimi_k3_patches(cfg)
+
+
+def test_warns_when_k3_config_patch_is_not_active(config_patches, caplog):
+    k3 = types.SimpleNamespace(model_config=types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]))
+    other = types.SimpleNamespace(model_config=types.SimpleNamespace(architectures=["LlamaForCausalLM"]))
+
+    with caplog.at_level("WARNING"):
+        config_patches.warn_if_kimi_k3_config_patches_inactive(k3)  # patch installed by the fixture
+        config_patches.test_model_config.__post_init__ = lambda self: None
+        config_patches.warn_if_kimi_k3_config_patches_inactive(other)
+        assert not caplog.records
+        config_patches.warn_if_kimi_k3_config_patches_inactive(k3)
+    assert "hybrid_config) patch is not active" in caplog.text
 
 
 # The "only the gpt-oss alias is installed upstream" check is behavioural and lives in test_kimi_mxfp4_routing.py
@@ -559,9 +633,8 @@ def arch_modules(kda_modules, monkeypatch):
 
 
 def _forward_wrapper(arch_modules):
-    """Runs _patch_kimi_k3_arch; its patches that need real vllm are skipped by their own try blocks."""
+    """Runs _patch_kimi_k3_arch."""
     arch_modules._patch_kimi_k3_arch()
-    assert "linear_model_tokens_1d" in arch_modules._KIMI_PATCHES_INSTALLED
     return arch_modules.test_linear.KimiLinearModel
 
 
@@ -646,6 +719,41 @@ def test_apply_attn_res_replacement_accepts_quant_key_none_and_rejects_a_quant_k
     assert apply_attn_res(*args, quant_key=None).shape == baseline.shape
     with pytest.raises(NotImplementedError, match="quant_key"):
         apply_attn_res(*args, quant_key="fp8_dynamic_token_sym")
+
+
+def test_apply_attn_res_replacement_reads_the_bank_of_a_cached_norm_tuple(arch_modules):
+    arch_modules._patch_kimi_attn_res()
+    apply_attn_res = arch_modules.test_linear._apply_attn_res
+    dim = 8
+    prefix, blocks = torch.randn(3, dim), torch.randn(3, 2, dim)
+    proj = types.SimpleNamespace(weight=torch.randn(1, dim))
+    norm = types.SimpleNamespace(weight=torch.ones(dim), variance_epsilon=1e-6)
+
+    expected = apply_attn_res(prefix.clone(), blocks, proj, norm, 2)
+    got = apply_attn_res(prefix.clone(), (blocks, blocks.pow(2).mean(dim=-1)), proj, norm, 2)
+    torch.testing.assert_close(got, expected)
+
+
+def test_linear_model_forward_wrapper_sends_the_plain_bank_to_the_next_pipeline_stage(arch_modules):
+    bank = torch.randn(4, 2, 8)
+
+    class Intermediate:
+
+        def __init__(self, tensors):
+            self.tensors = tensors
+
+        def __setitem__(self, key, value):
+            self.tensors[key] = value
+
+    def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
+        return Intermediate({"hidden_states": torch.zeros(4, 8), "residual": (bank, torch.zeros(4, 2))})
+
+    arch_modules.test_linear.KimiLinearModel.forward = forward
+    model_cls = _forward_wrapper(arch_modules)
+    model = model_cls()
+    model._hpu_kimi_k3 = True
+
+    assert model.forward(torch.arange(4), torch.arange(4)).tensors["residual"] is bank
 
 
 class _KimiK3MergedQKVGateLinear(torch.nn.Module):

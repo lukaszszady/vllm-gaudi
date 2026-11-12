@@ -94,9 +94,8 @@ def mxfp4(monkeypatch):
            dispatch_hidden_states=None,
            dispatch_tensor=None,
            get_hpu_dp_metadata=None)
-    module("vllm_gaudi.patches",
-           _current_config_is_kimi_k3=lambda: state["kimi"],
-           _hpu_mxfp4_routed_apply=lambda *args: state["apply_calls"].append(args) or "out")
+    module("vllm_gaudi.kimi_k3_gate", current_config_is_kimi_k3=lambda: state["kimi"])
+    module("vllm_gaudi.patches", _hpu_mxfp4_routed_apply=lambda *args: state["apply_calls"].append(args) or "out")
 
     spec = importlib.util.spec_from_file_location("hpu_mxfp4_under_test", _SOURCE)
     mod = importlib.util.module_from_spec(spec)
@@ -287,6 +286,31 @@ def test_kimi_method_process_weights_in_graph_call_only_for_kimi_configs(mxfp4):
     assert created[0].kwargs["in_graph_call"] is False
 
 
+def test_kimi_method_process_weights_runs_once_per_layer(mxfp4):
+    created = []
+    mxfp4.VllmMixtureOfExpertsOpMXFP4 = _fake_op_class(created)
+    mxfp4.state["kimi"] = True
+    method = mxfp4.HPUKimiK3Mxfp4MoEMethod(types.SimpleNamespace(max_capture_size=8))
+    layer = _layer()
+
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
+
+    assert len(created) == 1
+
+
+def test_kimi_method_process_weights_skips_a_module_without_the_expert_weights(mxfp4):
+    import torch
+    created = []
+    mxfp4.VllmMixtureOfExpertsOpMXFP4 = _fake_op_class(created)
+    mxfp4.state["kimi"] = True
+    method = mxfp4.HPUKimiK3Mxfp4MoEMethod(types.SimpleNamespace(max_capture_size=8))
+
+    method.process_weights_after_loading(torch.nn.Module())
+
+    assert not created
+
+
 def test_moe_layers_under_the_nested_submodel_config_get_the_hpu_method(mxfp4, monkeypatch):
     """K3 builds its language model under a Kimi-Linear submodel config; only the K3 build context tells them apart."""
     gate_source = _SOURCE.parents[1] / "kimi_k3_gate.py"
@@ -299,8 +323,9 @@ def test_moe_layers_under_the_nested_submodel_config_get_the_hpu_method(mxfp4, m
     config_mod.get_current_vllm_config_or_none = lambda: nested
     monkeypatch.setitem(sys.modules, "vllm.config", config_mod)
 
-    # the routing wrapper reads the predicate through the stubbed vllm_gaudi.patches: use the real one
-    monkeypatch.setattr(sys.modules["vllm_gaudi.patches"], "_current_config_is_kimi_k3", gate.current_config_is_kimi_k3)
+    # the routing wrapper reads the predicate through the stubbed vllm_gaudi.kimi_k3_gate: use the real one
+    monkeypatch.setattr(sys.modules["vllm_gaudi.kimi_k3_gate"], "current_config_is_kimi_k3",
+                        gate.current_config_is_kimi_k3)
     monkeypatch.setattr(mxfp4.upstream.Mxfp4Config, "_make_moe_method", _original_make(mxfp4), raising=True)
     mxfp4.upstream.Mxfp4Config._hpu_kimi_k3_routed = False
     mxfp4._route_kimi_k3_moe_method()

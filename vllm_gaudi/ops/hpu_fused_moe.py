@@ -752,7 +752,8 @@ def _hpu_apply_moe_dp1(
     # Apply the gate if the runner holds it (mirrors _forward_impl).
     if self.gate is not None:
         if self._fse_fuse_gate:
-            self._maybe_fuse_gate_weights()
+            if self._combined_gate_weight is None:
+                self.process_weights_after_loading()
             router_logits = torch.nn.functional.linear(hidden_states, self._combined_gate_weight)
         else:
             router_logits, _ = self.gate(hidden_states)
@@ -879,16 +880,6 @@ def patched_latent_moe_fused_forward(
     return self._maybe_add_zero_expert_output(result)
 
 
-def _make_inline_forward_entry(runner):
-    """Build a ``_forward_entry`` replacement that runs the MoE inline instead of the opaque custom op."""
-
-    def _inline_forward_entry(hidden_states, router_logits, shared_experts_input, input_ids, *_args, **_kwargs):
-        # layer_name and hidden_dim_unpadded (and any future extra arguments) are not needed by the inline path.
-        return _hpu_apply_moe_dp1(runner, hidden_states, router_logits, shared_experts_input, input_ids)
-
-    return _inline_forward_entry
-
-
 def install_inline_moe_forward_entry(model: torch.nn.Module) -> int:
     """Replace ``_forward_entry`` (``torch.ops.vllm.moe_forward[_shared]``) of every MoE runner of ``model``.
 
@@ -907,7 +898,10 @@ def install_inline_moe_forward_entry(model: torch.nn.Module) -> int:
         moe_config = module.moe_config
         if moe_config.dp_size != 1 or getattr(moe_config, "pcp_size", 1) > 1:
             continue
-        module._forward_entry = _make_inline_forward_entry(module)
+        # layer_name, hidden_dim_unpadded and any future extra arguments are not needed by the inline path.
+        module._forward_entry = (
+            lambda hidden_states, router_logits, shared_experts_input, input_ids, *_args, runner=module, **_kwargs:
+            _hpu_apply_moe_dp1(runner, hidden_states, router_logits, shared_experts_input, input_ids))
         class_names.add(type(module).__name__)
         replaced += 1
     if replaced:
@@ -929,20 +923,16 @@ def prime_moe_runners_for_compile(model: torch.nn.Module) -> int:
     Call after the weights are processed. Returns the number of runners primed.
     """
     primed = 0
-    logged_tail = False
     for module in model.modules():
         if not isinstance(module, MoERunnerBase):
             continue
         routed_experts = getattr(module, "routed_experts", None)
         if routed_experts is not None and hasattr(routed_experts, "_ensure_moe_quant_config_init"):
             routed_experts._ensure_moe_quant_config_init()
+        # the upstream latent-MoE runner logs its sharded tail once; the compile pre-run must not trigger it
         if getattr(module, "_logged_sharded_tail", True) is False:
             module._logged_sharded_tail = True
-            logged_tail = True
         primed += 1
-    if logged_tail:
-        logger.debug("Kimi-K3 latent-MoE tail: up-projecting only this rank's hidden shard into the shared output.")
-    logger.debug("Primed %d MoE runners for torch.compile, pid %d", primed, os.getpid())
     return primed
 
 

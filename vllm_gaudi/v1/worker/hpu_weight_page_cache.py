@@ -300,9 +300,9 @@ def drop_weight_page_cache_during_load(model_config=None):
     after the loader's post-processing released its mappings and CPU tensors."""
     mode = drop_mode()
     if mode == "auto":
-        from vllm_gaudi.patches import _is_kimi_k3_config
+        from vllm_gaudi.kimi_k3_gate import is_kimi_k3_model_config
 
-        if not _is_kimi_k3_config(model_config):
+        if not is_kimi_k3_model_config(model_config):
             logger.info("Weight page cache: disabled (auto mode is limited to Kimi-K3; set %s=1 to force)", _ENV_DROP)
             mode = "off"
     if mode == "off":

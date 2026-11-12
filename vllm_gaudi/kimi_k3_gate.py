@@ -10,6 +10,7 @@ import contextlib
 import os
 import threading
 
+# Internal cross-process marker, deliberately undocumented.
 SEEN_ENV = "HPU_KIMI_K3_SEEN"
 
 # KimiLinearForCausalLM is deliberately absent: a standalone Kimi-Linear model also uses that architecture name

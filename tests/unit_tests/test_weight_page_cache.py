@@ -65,16 +65,8 @@ def _config(*architectures):
     return types.SimpleNamespace(architectures=list(architectures))
 
 
-def _patch_kimi_detector(monkeypatch):
-    """vllm_gaudi.patches needs vLLM; the module is replaced by a stand-in with the same detection helper."""
-    patches = types.ModuleType("vllm_gaudi.patches")
-    patches._is_kimi_k3_config = lambda config: "KimiK3ForConditionalGeneration" in (config.architectures or ())
-    monkeypatch.setitem(sys.modules, "vllm_gaudi.patches", patches)
-
-
 def test_auto_mode_leaves_non_kimi_models_on_the_upstream_loader(monkeypatch):
     from vllm.model_executor.model_loader import default_loader
-    _patch_kimi_detector(monkeypatch)
     monkeypatch.delenv("VLLM_HPU_DROP_WEIGHT_PAGE_CACHE", raising=False)
     original = default_loader.safetensors_weights_iterator
     messages = []
@@ -86,7 +78,6 @@ def test_auto_mode_leaves_non_kimi_models_on_the_upstream_loader(monkeypatch):
 
 def test_auto_mode_wraps_the_loader_for_kimi_k3_and_env_forces_it_for_others(monkeypatch):
     from vllm.model_executor.model_loader import default_loader
-    _patch_kimi_detector(monkeypatch)
     original = default_loader.safetensors_weights_iterator
     monkeypatch.delenv("VLLM_HPU_DROP_WEIGHT_PAGE_CACHE", raising=False)
     with wpc.drop_weight_page_cache_during_load(_config("KimiK3ForConditionalGeneration")):
