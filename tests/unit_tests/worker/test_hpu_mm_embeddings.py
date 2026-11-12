@@ -10,6 +10,7 @@ Also covers _execute_mm_encoder with prefix-cached (stripped) mm items.
 import sys
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 
 # Stub habana_frameworks so the test can run on CPU (no HPU required).
@@ -413,4 +414,18 @@ class TestKimiEncoderItems:
         runner.model = MagicMock()
         HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"r": 100}), ["r"])
         assert runner.model.embed_multimodal.call_count == 0
+        assert not runner.encoder_cache
+
+
+class TestKimiEncoderCacheRowCount:
+    """The Kimi-K3 index scatter rejects an encoder output that does not match is_embed, like the mask path."""
+
+    def test_row_count_mismatch_raises(self):
+        requests = {"r": _make_request_state("r", 6, [_masked_feature("h")])}
+        runner = _make_mock_runner(requests, {}, is_kimi_k3=True)
+        runner.pin_memory = False
+        runner.model = MagicMock()
+        runner.model.embed_multimodal.side_effect = lambda **kw: [torch.zeros(2, HIDDEN_SIZE)]
+        with pytest.raises(ValueError, match="selects 3 positions"):
+            HPUModelRunner._execute_mm_encoder(runner, _make_scheduler_output({"r": 6}), ["r"])
         assert not runner.encoder_cache

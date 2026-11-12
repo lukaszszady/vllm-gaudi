@@ -2250,7 +2250,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             is_embed = pos_info.is_embed
             if is_embed is not None and self.is_kimi_k3:
                 # Device bool-mask indexing has a data-dependent shape the graph compiler cannot build.
-                positions = torch.nonzero(is_embed.cpu(), as_tuple=True)[0].to(output.device)
+                positions = torch.nonzero(is_embed.cpu(), as_tuple=True)[0]
+                if output.shape[0] != positions.numel():
+                    raise ValueError(f"Encoder output has {output.shape[0]} rows but is_embed selects "
+                                     f"{positions.numel()} positions (mm_hash={mm_hash}).")
+                positions = positions.to(output.device)
                 placeholders = output.new_full((is_embed.shape[0], output.shape[-1]), fill_value=torch.nan)
                 self.encoder_cache[mm_hash] = placeholders.index_copy_(0, positions, output)
                 continue

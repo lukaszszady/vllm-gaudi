@@ -891,13 +891,8 @@ def patched_latent_moe_fused_forward(
     input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
 ) -> torch.Tensor:
-    """HPU ``_fused_forward`` of the Kimi-K3 latent-MoE runner without the opaque custom op.
-
-    Upstream ``ROCmLatentMoERunner._fused_forward`` calls ``self._forward_entry``
-    (``torch.ops.vllm.moe_forward_shared``). The HPU compile backend cannot trace that op, so it falls
-    back to eager for every MoE layer. For dp_size==1 this runs the same sequence as the patched
-    ``MoERunnerBase.forward`` (``_kimi_k3_apply_moe_dp1``) and keeps the runner's sharded up-projection tail.
-    """
+    """Kimi-K3 latent-MoE ``_fused_forward`` without the opaque ``moe_forward_shared`` custom op, which the HPU
+    compile backend cannot trace."""
     if shared_experts_input is None:
         hidden_states, shared_experts_input = self.apply_routed_input_transform(hidden_states)
 
@@ -951,14 +946,8 @@ def install_inline_moe_forward_entry(model: torch.nn.Module) -> int:
 
 
 def prime_moe_runners_for_compile(model: torch.nn.Module) -> int:
-    """Run the one-time first-forward work of the MoE runners of ``model`` before it is compiled.
-
-    The first traced call of a decoder layer must see the steady state. Otherwise Dynamo breaks the graph at the
-    one-time branch (the lazy ``moe_quant_config`` init of ``_kimi_k3_apply_moe_dp1``, the ``info_once`` of the Kimi-K3
-    latent runner's ``_shard_up_proj_tail``) and keeps the layer split into nested frames at that call stack
-    even after the branch is no longer taken: one extra cache lookup and graph launch per frame and layer.
-    Call after the weights are processed. Returns the number of runners primed.
-    """
+    """Run the one-time first-forward work of the MoE runners before compile, so the first traced call sees the
+    steady state. Call after the weights are processed; returns the number of runners primed."""
     primed = 0
     for module in model.modules():
         if not isinstance(module, MoERunnerBase):
