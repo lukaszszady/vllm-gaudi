@@ -2248,6 +2248,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 encoder_outputs,
         ):
             is_embed = pos_info.is_embed
+            if is_embed is not None and self.is_kimi_k3:
+                # Device bool-mask indexing has a data-dependent shape the graph compiler cannot build.
+                positions = torch.nonzero(is_embed.cpu(), as_tuple=True)[0].to(output.device)
+                placeholders = output.new_full((is_embed.shape[0], output.shape[-1]), fill_value=torch.nan)
+                self.encoder_cache[mm_hash] = placeholders.index_copy_(0, positions, output)
+                continue
             if is_embed is not None:
                 is_embed = is_embed.to(device=output.device)
 
@@ -2322,7 +2328,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     mm_embeds_item = encoder_output[start_idx:end_idx]
 
                 sliced_output = encoder_output[start_idx:end_idx]
-                mm_embeds_item = sliced_output if is_embed is None else sliced_output[is_embed]
+                if is_embed is not None and self.is_kimi_k3:
+                    positions = torch.nonzero(is_embed.cpu(), as_tuple=True)[0].to(sliced_output.device)
+                    mm_embeds_item = sliced_output.index_select(0, positions)
+                else:
+                    mm_embeds_item = sliced_output if is_embed is None else sliced_output[is_embed]
 
                 # For 2D padded batches, compute position in the
                 # flattened [batch_size * padded_seq_len] layout.
