@@ -51,12 +51,14 @@ def ops(monkeypatch):
     spec.loader.exec_module(module)
 
     def cpu_fused_fwd(hidden_states, expert_routing_table, router_weights, w12_list, w3_list, d_scale_w12, d_scale_w3,
-                      block_size, activation, experts_min, experts_max, chunk_size, total_experts):
+                      block_size, permuted_weights, activation, experts_min, experts_max, is_fp4, chunk_size,
+                      total_experts):
         # touches every weight / scale tensor so that they become graph inputs as with the real op
         acc = sum(w.float().sum() for w in w12_list + w3_list + d_scale_w12 + d_scale_w3)
         return hidden_states * router_weights.sum(-1, keepdim=True) + acc
 
-    monkeypatch.setattr(module, "_mxfp4_fused_fwd", cpu_fused_fwd)
+    fake_hpu = types.SimpleNamespace(mixture_of_experts=types.SimpleNamespace(mxfp4_fused_weights=cpu_fused_fwd))
+    monkeypatch.setattr(torch.ops, "hpu", fake_hpu, raising=False)
     dynamo.reset()
     dynamo.utils.counters.clear()
     yield module
@@ -129,7 +131,7 @@ def test_eager_call_still_compiles_the_op_once(ops, monkeypatch):
     op(hidden_states, routing, weights)
 
     assert len(calls) == 1
-    assert calls[0][0] is ops._mxfp4_fused_fwd
+    assert calls[0][0].__name__ == "_mxfp4_fused_fwd"
     assert calls[0][1] == {"backend": "hpu_backend"}
     expected = hidden_states * weights.sum(-1, keepdim=True)
     assert first.shape == expected.shape
@@ -143,9 +145,9 @@ def test_in_graph_call_is_off_by_default(ops, monkeypatch):
 
     assert op.in_graph_call is False
     # upstream path even inside a compiled region: the nested torch.compile wrapper, cached on the op
-    assert op._get_compiled_forward() is ops._mxfp4_fused_fwd
-    assert calls == [ops._mxfp4_fused_fwd]
-    assert op._compiled_forward is ops._mxfp4_fused_fwd
+    assert op._get_compiled_forward() is calls[0]
+    assert [fn.__name__ for fn in calls] == ["_mxfp4_fused_fwd"]
+    assert op._compiled_forward is calls[0]
 
 
 def test_in_graph_call_skips_the_nested_wrapper_only_while_compiling(ops, monkeypatch):
@@ -154,12 +156,12 @@ def test_in_graph_call_skips_the_nested_wrapper_only_while_compiling(ops, monkey
     op = _make_moe_op(ops, in_graph_call=True)
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    assert op._get_compiled_forward() is ops._mxfp4_fused_fwd
+    assert op._get_compiled_forward().__name__ == "_mxfp4_fused_fwd"
     assert not calls and op._compiled_forward is None
 
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
     op._get_compiled_forward()
-    assert calls == [ops._mxfp4_fused_fwd]
+    assert [fn.__name__ for fn in calls] == ["_mxfp4_fused_fwd"]
 
 
 def test_first_moe_op_per_process_logs_in_graph_call_once(ops, caplog):

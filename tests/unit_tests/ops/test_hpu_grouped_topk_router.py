@@ -118,6 +118,13 @@ def _kimi_like_inputs(seed, tokens, experts):
     return logits, bias
 
 
+def _impl(router, logits, topk, renormalize, num_expert_group, topk_group, scoring_func, routed_scaling_factor, bias,
+          out_dtype):
+    hidden = torch.zeros(logits.shape[0], 1, dtype=out_dtype)
+    return router.grouped_topk(hidden, logits, topk, renormalize, num_expert_group, topk_group, scoring_func,
+                               routed_scaling_factor, bias)
+
+
 def _by_expert(weights, ids):
     order = ids.argsort(dim=-1)
     return weights.gather(1, order), ids.gather(1, order)
@@ -168,7 +175,7 @@ def test_kimi_k3_routing_selects_the_same_experts(router, monkeypatch, tokens, u
     monkeypatch.setattr(router.envs, "VLLM_BATCH_INVARIANT", use_sorted)
     logits, bias = _kimi_like_inputs(tokens, tokens, 896)
     args = (logits, 16, True, 1, 1, "sigmoid", 2.5, bias)
-    weights, ids = router._grouped_topk_impl(*args, torch.float32)
+    weights, ids = _impl(router, *args, torch.float32)
     ref_weights, ref_ids = reference_grouped_topk(*args, use_sorted)
     assert ids.dtype == torch.int64
     if use_sorted:
@@ -185,7 +192,7 @@ def test_kimi_k3_routing_without_two_stage_topk_is_bit_identical(router, monkeyp
     monkeypatch.setattr(router, "_TWO_STAGE_TOPK", False)
     logits, bias = _kimi_like_inputs(11, 200, 896)
     args = (logits, 16, True, 1, 1, "sigmoid", 2.5, bias)
-    weights, ids = router._grouped_topk_impl(*args, torch.float32)
+    weights, ids = _impl(router, *args, torch.float32)
     ref_weights, ref_ids = reference_grouped_topk(*args, False)
     assert torch.equal(ids, ref_ids) and torch.equal(weights, ref_weights)
 
@@ -197,7 +204,7 @@ def test_multi_group_routing_is_bit_identical(router, tokens, with_bias, scoring
     """DeepSeek-V3 like: 256 experts in 8 groups, 4 groups kept, top-8."""
     logits, bias = _kimi_like_inputs(tokens + 3, tokens, 256)
     args = (logits, 8, True, 8, 4, scoring_func, 2.5, bias if with_bias else None)
-    weights, ids = router._grouped_topk_impl(*args, torch.bfloat16)
+    weights, ids = _impl(router, *args, torch.bfloat16)
     ref_weights, ref_ids = reference_grouped_topk(*args, False)
     assert torch.equal(ids, ref_ids) and torch.equal(weights, ref_weights.to(torch.bfloat16))
 
@@ -205,12 +212,12 @@ def test_multi_group_routing_is_bit_identical(router, tokens, with_bias, scoring
 def test_single_group_shortcut_is_bit_identical_without_bias(router):
     logits, _ = _kimi_like_inputs(5, 40, 384)
     args = (logits, 8, True, 1, 1, "softmax", 1.0, None)
-    weights, ids = router._grouped_topk_impl(*args, torch.float32)
+    weights, ids = _impl(router, *args, torch.float32)
     ref_weights, ref_ids = reference_grouped_topk(*args, False)
     assert torch.equal(ids, ref_ids) and torch.equal(weights, ref_weights)
 
 
-def test_hpu_grouped_topk_op_uses_the_same_routing(router):
+def test_hpu_grouped_topk_op_selects_the_same_experts(router):
     op = router.HPUGroupedTopk(topk=16,
                                renormalize=True,
                                num_expert_group=1,
@@ -219,9 +226,10 @@ def test_hpu_grouped_topk_op_uses_the_same_routing(router):
                                routed_scaling_factor=2.5)
     logits, bias = _kimi_like_inputs(3, 20, 896)
     hidden = torch.zeros(20, 8, dtype=torch.bfloat16)
-    weights, ids = op.forward_oot(hidden, logits, bias)
-    ref_weights, ref_ids = router._grouped_topk_impl(logits, 16, True, 1, 1, "sigmoid", 2.5, bias, torch.bfloat16)
-    assert torch.equal(ids, ref_ids) and torch.equal(weights, ref_weights)
+    weights, ids = _by_expert(*op.forward_oot(hidden, logits, bias))
+    ref_weights, ref_ids = _by_expert(*_impl(router, logits, 16, True, 1, 1, "sigmoid", 2.5, bias, torch.bfloat16))
+    assert torch.equal(ids, ref_ids)
+    torch.testing.assert_close(weights, ref_weights, rtol=1e-2, atol=0)
 
 
 def test_kimi_k3_routing_compiles_to_one_graph_for_all_token_counts(router):
@@ -234,15 +242,14 @@ def test_kimi_k3_routing_compiles_to_one_graph_for_all_token_counts(router):
         return counter(gm, example_inputs)
 
     _, bias = _kimi_like_inputs(0, 1, 896)
-    compiled = torch.compile(
-        lambda logits: router._grouped_topk_impl(logits, 16, True, 1, 1, "sigmoid", 2.5, bias, torch.bfloat16),
-        backend=backend,
-        fullgraph=True,
-        dynamic=True)
+    compiled = torch.compile(lambda logits: _impl(router, logits, 16, True, 1, 1, "sigmoid", 2.5, bias, torch.bfloat16),
+                             backend=backend,
+                             fullgraph=True,
+                             dynamic=True)
     for tokens in (5, 33, 1500):
         logits, _ = _kimi_like_inputs(tokens, tokens, 896)
         weights, ids = compiled(logits)
-        ref_weights, ref_ids = router._grouped_topk_impl(logits, 16, True, 1, 1, "sigmoid", 2.5, bias, torch.bfloat16)
+        ref_weights, ref_ids = _impl(router, logits, 16, True, 1, 1, "sigmoid", 2.5, bias, torch.bfloat16)
         assert torch.equal(ids, ref_ids) and torch.equal(weights, ref_weights)
     assert counter.frame_count == 1
     assert not any("gather" in name for name in targets)

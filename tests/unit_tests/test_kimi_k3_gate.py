@@ -202,11 +202,6 @@ def test_mla_bind_kv_cache_gated_by_data_type(patches, monkeypatch):
     assert calls == ["tensor"]
 
 
-def test_pad_ids_without_virtual_split_equal_scheduler_blocks():
-    kv = _load("kv_block_layout_under_test", "v1/worker/kv_block_layout.py")
-    assert kv.attn_pad_ids(10, None, 128) == (10, 10, 1280)
-
-
 def _nested_k3_text_config():
     """Language-model config of K3: deep-copied submodel config of a standalone Kimi-Linear model."""
     return types.SimpleNamespace(

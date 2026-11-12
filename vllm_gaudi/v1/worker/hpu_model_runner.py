@@ -31,7 +31,6 @@ import vllm_gaudi.envs as gaudi_envs
 import vllm_gaudi.extension.environment as environment
 from vllm_gaudi.kimi_k3_gate import is_kimi_k3_model_config
 from vllm_gaudi.patches import ensure_kimi_k3_patches
-from vllm_gaudi.mm_warmup_inputs import build_dummy_processor_inputs, build_raw_image_processor_inputs
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.ops.hpu_kda_pytorch import attn_res_layer_variants, tag_kda_cache_groups
 from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
@@ -39,11 +38,9 @@ from vllm_gaudi.extension.profiler import (HabanaHighLevelProfiler, HabanaMemory
                                            format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import clear_config, finalize_config, get_config
 from vllm_gaudi.extension.utils import align_and_pad, pad_list, with_default
-from vllm_gaudi.v1.worker.mm_embed_utils import collect_step_encoder_items, scatter_embed_rows, select_embed_rows
 from vllm_gaudi.extension.debug import init_debug_logger
 from vllm_gaudi.v1.worker.hpu_dp_utils import set_hpu_dp_metadata
 from vllm_gaudi.v1.worker.hpu_weight_page_cache import drop_weight_page_cache_during_load
-from vllm_gaudi.v1.worker.kv_block_layout import attn_pad_ids, contiguous_dummy_decode_layout, pad_slot_cycle
 
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.model_executor.layers.attention import Attention
@@ -2158,11 +2155,33 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # List of tuple (mm_hash, pos_info)
         mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
         if self.is_kimi_k3:
-            # encode only items needed by this step; payload may come from another request with the same hash
-            for mm_hash, mm_feature in collect_step_encoder_items(req_ids, self.requests,
-                                                                  scheduler_output.scheduled_encoder_inputs,
-                                                                  scheduler_output.num_scheduled_tokens,
-                                                                  self.encoder_cache):
+            # The scheduler dedups identical mm_hash values within a step, so the payload of an item may be
+            # held by another request of the step. Encode only items overlapping the tokens scheduled here.
+            payloads = {}
+            for req_id, input_ids in scheduler_output.scheduled_encoder_inputs.items():
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    continue
+                for input_id in input_ids:
+                    feature = req_state.mm_features[input_id]
+                    if feature.data is not None:
+                        payloads.setdefault(feature.identifier, feature)
+            step_items = {}
+            for req_id in req_ids:
+                req_state = self.requests[req_id]
+                computed = req_state.num_computed_tokens
+                end = computed + scheduler_output.num_scheduled_tokens[req_id]
+                for mm_feature in req_state.mm_features:
+                    mm_hash = mm_feature.identifier
+                    if mm_hash in self.encoder_cache or mm_hash in step_items:
+                        continue
+                    pos_info = mm_feature.mm_position
+                    if pos_info.offset >= end or pos_info.offset + pos_info.length <= computed:
+                        continue
+                    source = mm_feature if mm_feature.data is not None else payloads.get(mm_hash)
+                    if source is not None:
+                        step_items[mm_hash] = source
+            for mm_hash, mm_feature in step_items.items():
                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
                 mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
         else:
@@ -2224,22 +2243,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # _gather_mm_embeddings, so reordering is not necessary.
 
         # Cache the encoder outputs.
-        for (modality, _), (mm_hash, pos_info), output in zip(
-                mm_kwargs,
+        for (mm_hash, pos_info), output in zip(
                 mm_hashes_pos,
                 encoder_outputs,
         ):
             is_embed = pos_info.is_embed
+            if is_embed is not None:
+                is_embed = is_embed.to(device=output.device)
 
             if is_embed is None:
                 scattered_output = output
             else:
-                num_embed = int(is_embed.sum())
-                if output.shape[0] != num_embed:
-                    raise ValueError(f"Encoder output of the {modality} item {mm_hash} has {output.shape[0]} rows, "
-                                     f"but its prompt placeholder has {num_embed} embedding positions "
-                                     f"(placeholder length {is_embed.shape[0]})")
-                scattered_output = scatter_embed_rows(output, is_embed, fill_value=torch.nan)
+                placeholders = output.new_full(
+                    (is_embed.shape[0], output.shape[-1]),
+                    fill_value=torch.nan,
+                )
+                placeholders[is_embed] = output
+                scattered_output = placeholders
 
             self.encoder_cache[mm_hash] = scattered_output
 
@@ -2297,9 +2317,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
+                    mm_embeds_item = encoder_output[curr_embeds_start:curr_embeds_end]
+                else:
+                    mm_embeds_item = encoder_output[start_idx:end_idx]
 
                 sliced_output = encoder_output[start_idx:end_idx]
-                mm_embeds_item = sliced_output if is_embed is None else select_embed_rows(sliced_output, is_embed)
+                mm_embeds_item = sliced_output if is_embed is None else sliced_output[is_embed]
 
                 # For 2D padded batches, compute position in the
                 # flattened [batch_size * padded_seq_len] layout.
@@ -3406,9 +3429,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # set an out of range value for the padding tokens so that they
         # are ignored when inserting into the KV cache.
         slot_mapping = slot_mapping[:padded_batch_size]
-        # decode_block_size is attn_block_size, so the pad row (kernel-block units, see attn_pad_ids) is exactly
-        # decode_block_size slots starting at _PAD_SLOT_ID: cycling over it keeps padding tokens in the pad row.
-        dummy_slots = pad_slot_cycle(self._PAD_SLOT_ID, decode_block_size)
+        pad_slot_base = self._PAD_BLOCK_ID * decode_block_size
+        dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
         slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
 
         #####################################
@@ -4239,16 +4261,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return lora_mask, lora_logits_mask
 
-    def _prepare_sampling_ahead(self, batch_changed, request_ids, pad_to, logits_requests) -> SamplingMetadata:
-        """Sampling metadata with its host-to-device copies, built before the forward it samples.
-
-        The copies come from pageable memory and block the host until the stream drains, so issued after a
-        forward they stall the launch of the next one.
-        """
-        # Async scheduling: repair -1 placeholders before penalties read them.
-        self.input_batch.update_async_output_token_ids()
-        return self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
-
     def _run_sampling(self,
                       batch_changed: bool,
                       logits_device: torch.Tensor,
@@ -4258,7 +4270,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       sampling_metadata: Optional[SamplingMetadata] = None) -> tuple[torch.Tensor, SamplingMetadata]:
         htorch.core.mark_step()
         if sampling_metadata is None:
-            sampling_metadata = self._prepare_sampling_ahead(batch_changed, request_ids, pad_to, logits_requests)
+            # Async scheduling: repair -1 placeholders before penalties read them.
+            self.input_batch.update_async_output_token_ids()
+            sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
         htorch.core.mark_step()
         return sampler_output, sampling_metadata
@@ -4677,9 +4691,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for req_id, logits_indices, logits_requests in zip(prefill_data.request_ids, prefill_data.logits_indices,
                                                                prefill_data.logits_requests):
                 metadata = None
-                if logits_indices.numel() > 0 and not self.use_structured_output:
-                    metadata = self._prepare_sampling_ahead(batch_changed, req_id, logits_indices.shape[0],
-                                                            logits_requests)
+                # Kimi-K3: build the sampling metadata (host-to-device copies) before the forward, not after it
+                if self.is_kimi_k3 and logits_indices.numel() > 0 and not self.use_structured_output:
+                    self.input_batch.update_async_output_token_ids()
+                    metadata = self._prepare_sampling(batch_changed, req_id, logits_indices.shape[0], logits_requests)
                 prefill_sampling_metadata.append(metadata)
             htorch.core.mark_step()
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
@@ -4785,9 +4800,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             lora_mask, lora_logits_mask = self._configure_lora(decode_data.token_ids, self.requests,
                                                                pd_info.decode_req_ids, False)
             decode_sampling_metadata = None
-            if not self.use_structured_output and decode_data.spec_decode_metadata is None:
-                decode_sampling_metadata = self._prepare_sampling_ahead(batch_changed, pd_info.decode_req_ids,
-                                                                        decode_data.logits_indices.shape[0], None)
+            if self.is_kimi_k3 and not self.use_structured_output and decode_data.spec_decode_metadata is None:
+                self.input_batch.update_async_output_token_ids()
+                decode_sampling_metadata = self._prepare_sampling(batch_changed, pd_info.decode_req_ids,
+                                                                  decode_data.logits_indices.shape[0], None)
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
             htorch.core.mark_step()
@@ -5932,10 +5948,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # place the dummy blocks to make that id bucket - 1, capped at
                 # the physical pool. Under virtual block splitting scheduler
                 # block s holds kernel blocks s * ratio .. s * ratio + ratio - 1.
-                block_id, min_tokens_per_seq = contiguous_dummy_decode_layout(decode_num_blocks, self._num_attn_blocks,
-                                                                              self.kv_cache_config.num_blocks,
-                                                                              decode_block_size, min_tokens_per_seq,
-                                                                              self.interleaved_sliding_window)
+                if self.is_kimi_k3:
+                    # Kernel block ids of the attention caches: scheduler block s holds kernel blocks
+                    # s * ratio .. s * ratio + ratio - 1 (before initialize_kv_cache the pool is the scheduler one).
+                    num_sched_blocks = self.kv_cache_config.num_blocks
+                    pool = self._num_attn_blocks or num_sched_blocks
+                    ratio = max(1, pool // max(1, num_sched_blocks))
+                    block_id, last_kernel_block = divmod(min(decode_num_blocks, pool) - 1, ratio)
+                    if ratio > 1 and not self.interleaved_sliding_window:
+                        min_tokens_per_seq = (last_kernel_block + 1) * decode_block_size - 1
+                else:
+                    # Cap block_id at physical pool — contiguous PA uses
+                    # block_id as the allocation base which must be valid.
+                    block_id = min(decode_num_blocks - 1, self.kv_cache_config.num_blocks - 1)
                 decode_seq_lengths = [min_tokens_per_seq] * decode_bs
                 if decode_longest_blocks:
                     decode_seq_lengths[0] = min(decode_longest_blocks * decode_block_size, self.max_model_len) - 1
@@ -6110,9 +6135,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # resize (smart_resize / navit_resize / ...) pick the exact
                 # same grid as real traffic, guaranteeing a warmup cache hit.
                 processor_inputs = self._build_raw_image_processor_inputs(processor, modality, count, width, height)
+            elif self.is_kimi_k3:
+                # Kimi-K3 dummy builders have no get_dummy_processor_inputs
+                processor_inputs = processor.get_dummy_inputs(
+                    seq_len=self.model_config_copy.max_model_len,
+                    mm_counts={modality: count},
+                    mm_options=mm_options,
+                )
             else:
-                processor_inputs = build_dummy_processor_inputs(
-                    processor,
+                processor_inputs = processor.dummy_inputs.get_dummy_processor_inputs(
                     seq_len=self.model_config_copy.max_model_len,
                     mm_counts={modality: count},
                     mm_options=mm_options,
@@ -6127,8 +6158,53 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return dummy_mm_inputs
 
     def _build_raw_image_processor_inputs(self, processor, modality, count, width, height):
-        """See `build_raw_image_processor_inputs`."""
-        return build_raw_image_processor_inputs(processor, modality, count, width, height)
+        """Build ProcessorInputs from raw WxH images, bypassing the upstream
+        per-dimension clamp in DummyInputsBuilder._get_dummy_images.
+
+        Mirrors get_dummy_processor_inputs (dummy_text + parse_mm_data +
+        ProcessorInputs) but supplies our own solid image at the requested raw
+        WxH. The upstream builder clamps width and height *independently*
+        against the model's max-feature size, distorting the aspect ratio so
+        the warmed grid stops matching real traffic. Feeding the raw image
+        straight through processor.apply lets the model's own resize
+        (smart_resize / navit_resize / ...) pick exactly the same grid it
+        would for a real image of that resolution -- including scaling an
+        oversized image down -- so warmup and serving grids are identical by
+        construction.
+        """
+        from PIL import Image
+        from vllm.multimodal.processing.inputs import ProcessorInputs
+
+        images = [Image.new("RGB", (width, height), color=255)] * count
+
+        # vision_chunk (Kimi-K2.5/K2.6) does not accept bare PIL images: its
+        # parser expects VisionChunkImage dicts ({"type": "image", "image":
+        # PIL}). 'image' takes the raw PIL directly. Wrap accordingly so the
+        # raw WxH still flows through the model's own resize (navit_resize) and
+        # the warmed grid matches real serving traffic.
+        mm_items = ([{"type": "image", "image": img} for img in images] if modality == 'vision_chunk' else images)
+
+        dummy_builder = processor.dummy_inputs
+        dummy_text = dummy_builder.get_dummy_text({modality: count})
+        mm_data_items = processor.info.parse_mm_data({modality: mm_items}, validate=False)
+
+        # Upstream vllm#53093 removed the text components (str prompt +
+        # tokenization_kwargs) from ProcessorInputs; the prompt is now a
+        # pre-tokenized list[int] and tokenization happens in the caller.
+        # Mirror get_dummy_processor_inputs' tokenization exactly.
+        tokenizer = processor.info.ctx.tokenizer
+        if tokenizer is None:
+            dummy_prompt: list[int] = []
+        else:
+            dummy_prompt = tokenizer.encode(
+                dummy_text,
+                **processor.info.default_tok_params.get_encode_kwargs(),
+            )
+
+        return ProcessorInputs(
+            prompt=dummy_prompt,
+            mm_data_items=mm_data_items,
+        )
 
     def _get_mm_warmup_processor(self):
         if self._mm_warmup_processor is None:
@@ -7140,13 +7216,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # id num_blocks is a real kernel block (the first one of scheduler block
         # num_blocks / blocks_per_kv_block), so padding tokens must target the
         # trailing pad row instead, or they overwrite a live request's KV.
-        num_attn_blocks, self._PAD_BLOCK_ID, self._PAD_SLOT_ID = attn_pad_ids(
-            num_blocks, num_attn_kernel_blocks if self.is_kimi_k3 else None, self.attn_block_size)
+        num_attn_blocks = num_blocks
+        if self.is_kimi_k3 and num_attn_kernel_blocks is not None:
+            num_attn_blocks = num_attn_kernel_blocks
         self._num_attn_blocks = num_attn_blocks
         if self.enable_bucketing:
             # Contiguous PA buckets by the highest kernel block id + 1.
             self.bucketing_manager.num_hpu_blocks = num_attn_blocks if self.use_contiguous_pa else num_blocks
 
+        self._PAD_BLOCK_ID = num_attn_blocks
+        self._PAD_SLOT_ID = num_attn_blocks * self.attn_block_size
         self._MAMBA_PAD_BLOCK_ID = num_blocks
         self._dummy_num_blocks = num_blocks
 

@@ -679,17 +679,12 @@ def test_mixed_group_is_rejected(video):
 
 @pytest.fixture
 def warmup(video, monkeypatch):
-    """The warmup helpers of the runner plus a processor wired like the vLLM one (builder + parse_mm_data)."""
-    mod = _load("vllm_gaudi.mm_warmup_inputs", ROOT / "mm_warmup_inputs.py")
+    """A processor wired like the vLLM one (builder + parse_mm_data)."""
 
     class ProcessorInputs:
 
         def __init__(self, prompt, mm_data_items):
             self.prompt, self.mm_data_items = prompt, mm_data_items
-
-    inputs_mod: Any = types.ModuleType("vllm.multimodal.processing.inputs")
-    inputs_mod.ProcessorInputs = ProcessorInputs
-    monkeypatch.setitem(sys.modules, "vllm.multimodal.processing.inputs", inputs_mod)
 
     video.mod.install_kimi_k3_video()
     _, processor_cls, info_cls, builder_cls = video.registrations[0]
@@ -718,7 +713,7 @@ def warmup(video, monkeypatch):
             prompt = self.info.ctx.tokenizer.encode(builder.get_dummy_text(mm_counts))
             return ProcessorInputs(prompt, self.info.parse_mm_data(data))
 
-    return types.SimpleNamespace(mod=mod, Processor=Processor, ProcessorInputs=ProcessorInputs)
+    return types.SimpleNamespace(Processor=Processor, ProcessorInputs=ProcessorInputs)
 
 
 def test_builder_has_no_get_dummy_processor_inputs(video):
@@ -730,7 +725,7 @@ def test_builder_has_no_get_dummy_processor_inputs(video):
 def test_video_warmup_goes_through_the_processor(warmup):
     proc = warmup.Processor()
     options = {"video": types.SimpleNamespace(count=2, width=864, height=480, num_frames=20)}
-    inputs = warmup.mod.build_dummy_processor_inputs(proc, seq_len=4096, mm_counts={"video": 2}, mm_options=options)
+    inputs = proc.get_dummy_inputs(seq_len=4096, mm_counts={"video": 2}, mm_options=options)
     assert proc.calls == [(4096, {"video": 2}, options)]
     assert inputs.prompt == ["<|kimi_video_placeholder"] * 2
     frames, metadata = inputs.mm_data_items["video"][0]
@@ -741,49 +736,18 @@ def test_video_warmup_goes_through_the_processor(warmup):
 def test_video_warmup_follows_the_requested_size(warmup):
     proc = warmup.Processor()
     options = {"video": types.SimpleNamespace(count=1, width=64, height=32, num_frames=8)}
-    inputs = warmup.mod.build_dummy_processor_inputs(proc, 4096, {"video": 1}, options)
+    inputs = proc.get_dummy_inputs(4096, {"video": 1}, options)
     assert inputs.mm_data_items["video"][0][0].shape == (8, 32, 64, 3)
-
-
-def test_warmup_falls_back_to_the_builder_of_older_vllm(warmup):
-
-    class OldProcessor:
-        dummy_inputs = types.SimpleNamespace(get_dummy_processor_inputs=lambda **kw: ("old", kw))
-
-    assert warmup.mod.build_dummy_processor_inputs(OldProcessor(), 8, {"video": 1}, None) == ("old", {
-        "seq_len": 8,
-        "mm_counts": {
-            "video": 1
-        },
-        "mm_options": None
-    })
 
 
 def test_video_dummy_goes_through_processor_apply(warmup, video, utils):
     """get_dummy_inputs output feeds the K3 video processor: IBM shape -> 5 grids of 558 tokens."""
     proc = warmup.Processor()
     options = {"video": types.SimpleNamespace(count=1, width=IBM_WIDTH, height=IBM_HEIGHT, num_frames=IBM_FRAMES)}
-    inputs = warmup.mod.build_dummy_processor_inputs(proc, 4096, {"video": 1}, options)
+    inputs = proc.get_dummy_inputs(4096, {"video": 1}, options)
     frames, metadata = inputs.mm_data_items["video"][0]
     out = proc._call_hf_processor({"videos": [(frames, metadata)]}, {})
     assert out[video.mod.VIDEO_GRID_THWS].tolist() == [[4, 36, 62]] * 5
-
-
-@pytest.mark.parametrize("modality,wrapped", [("image", False), ("vision_chunk", True)])
-def test_raw_image_warmup_keeps_the_requested_size(warmup, modality, wrapped):
-    proc = warmup.Processor()
-    proc.dummy_inputs.get_dummy_text = lambda counts: "<|a|><|b|>"
-    inputs = warmup.mod.build_raw_image_processor_inputs(proc, modality, 2, 1770, 1180)
-    items = inputs.mm_data_items[modality]
-    assert inputs.prompt == ["<|a", "<|b"] and len(items) == 2
-    image = items[0]["image"] if wrapped else items[0]
-    assert image.size == (1770, 1180)
-
-
-def test_raw_image_warmup_without_a_tokenizer_has_an_empty_prompt(warmup):
-    proc = warmup.Processor()
-    proc.info.ctx.tokenizer = None
-    assert warmup.mod.build_raw_image_processor_inputs(proc, "image", 1, 64, 64).prompt == []
 
 
 # ------------------------------------------------------- dtype of the video pixels
