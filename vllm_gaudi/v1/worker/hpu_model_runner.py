@@ -2423,10 +2423,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return inputs_embeds, model_mm_kwargs
 
     def get_model(self) -> torch.nn.Module:
-        if isinstance(self.model, HpuModelAdapter):
-            return self.model.model
-        assert self.model is not None
-        return self.model
+        # The whole-model non-regional path stores self.model as the
+        # torch.compile wrapper, which would not pass task/model probes.
+        model = self.model
+        original = getattr(model, "_orig_mod", None)
+        while original is not None and original is not model:
+            model = original
+            original = getattr(model, "_orig_mod", None)
+        if isinstance(model, HpuModelAdapter):
+            return model.model
+        assert model is not None
+        return model
 
     def is_decoder_only(self, req_id) -> bool:
         return bool(req_id in self.input_batch.req_type and \
