@@ -2628,20 +2628,30 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 slice-based fetch.
         """
         block_size = self.attn_block_size if block_size is None else block_size
-        last_block_usage = [slot[0] % block_size + 1 for slot in slot_mapping]
-        block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
-        block_usage = [[block_size] * (len(bt) - 1) + [lbu] for bt, lbu in zip(block_tables, last_block_usage) if bt]
-        block_list = flatten(block_tables)
-        block_groups = flatten(block_groups)
-        block_usage = flatten(block_usage)
-        assert len(block_list) == len(block_groups)
-        assert len(block_list) == len(block_usage)
+        lengths = np.fromiter((len(bt) for bt in block_tables), dtype=np.int64)
+        n_pairs = min(len(block_tables), len(slot_mapping))
+        if len(lengths) > n_pairs:
+            # slot_mapping shorter than block_tables: the old zip/pre-flatten
+            # assert caught it; keep the same failure.
+            assert lengths[n_pairs:].sum() == 0
+        # Last-block usage pairs with block_tables by position (old zip
+        # semantics); empty seqs are dropped, as before.
+        lbu = np.fromiter((slot[0] % block_size + 1 for slot in itertools.islice(slot_mapping, n_pairs)),
+                          dtype=np.int64)
+        block_list_np = (np.concatenate([np.asarray(bt, dtype=np.int64)
+                                         for bt in block_tables]) if len(lengths) else np.empty(0, dtype=np.int64))
+        block_groups_np = np.repeat(np.arange(len(lengths), dtype=np.int64), lengths)
+        block_usage_np = np.full(len(block_list_np), block_size, dtype=np.int64)
+        non_empty = lengths[:n_pairs] > 0
+        block_usage_np[np.cumsum(lengths)[np.nonzero(non_empty)[0]] - 1] = lbu[non_empty]
+        assert len(block_list_np) == len(block_groups_np)
+        assert len(block_list_np) == len(block_usage_np)
 
         padding_fn = None
         block_bucket_size: int
         use_contiguous = self.use_contiguous_pa and not force_non_contiguous
         if use_contiguous:
-            actual_blocks_needed = max(block_list) + 1 if block_list else 0
+            actual_blocks_needed = int(block_list_np.max()) + 1 if block_list_np.size else 0
 
             block_bucket_size = \
                 self.bucketing_manager.find_decode_bucket(batch_size,
@@ -2671,29 +2681,36 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     self._block_bucket_cap_warned = True
                 block_bucket_size = kv_total_blocks
 
-            indices: list[Any]
-            indices = [None] * block_bucket_size
-            for i, bid in enumerate(block_list):
-                indices[bid] = i
+            # Scatter by block id with duplicates keeping the last position.
+            rev = block_list_np[::-1]
+            unique_bids, first_in_rev = np.unique(rev, return_index=True)
+            last_pos = len(rev) - 1 - first_in_rev
 
-            def padding_fn(tensor, pad_value):
-                return gather_list(tensor, indices, pad_value)
+            def padding_fn(values: np.ndarray, pad_value):
+                out = np.full(block_bucket_size, pad_value, dtype=values.dtype)
+                out[unique_bids] = values[last_pos]
+                return out
         else:
             block_bucket_size = \
                 self.bucketing_manager.find_decode_bucket(batch_size,
-                                                          len(block_list))[2]
+                                                          len(block_list_np))[2]
             block_bucket_size += self.get_dp_padding(block_bucket_size)
 
-            def padding_fn(tensor, pad_value):
-                return pad_list(tensor, block_bucket_size, itertools.repeat(pad_value))
+            def padding_fn(tensor: np.ndarray, pad_value):
+                # Same as pad_list: keep the values, append padding to target.
+                if block_bucket_size > len(tensor):
+                    out = np.full(block_bucket_size, pad_value, dtype=tensor.dtype)
+                    out[:len(tensor)] = tensor
+                    return out
+                return tensor
 
-        block_list = padding_fn(block_list, self._PAD_BLOCK_ID)
-        block_groups = padding_fn(block_groups, -1)
-        block_usage = padding_fn(block_usage, 1)
+        block_list_np = padding_fn(block_list_np, self._PAD_BLOCK_ID)
+        block_groups_np = padding_fn(block_groups_np, -1)
+        block_usage_np = padding_fn(block_usage_np, 1)
 
-        block_list = torch.tensor(block_list, dtype=torch.long, device='cpu')
-        block_groups = torch.tensor(block_groups, dtype=torch.long, device='cpu')
-        block_usage = torch.tensor(block_usage, dtype=self.model_config.dtype, device='cpu')
+        block_list = torch.from_numpy(block_list_np).long()
+        block_groups = torch.from_numpy(block_groups_np).long()
+        block_usage = torch.from_numpy(block_usage_np).to(self.model_config.dtype)
         return block_list, block_groups, block_usage
 
     def _align_and_pad_mrope_positions(self, req_ids: list[str], context_lens: list[int], query_lens: list[int],
