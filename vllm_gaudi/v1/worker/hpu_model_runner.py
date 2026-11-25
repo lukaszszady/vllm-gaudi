@@ -4947,6 +4947,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         # Since prompt logprobs are a rare feature, prioritize simple,
         # maintainable loop over optimal performance.
+        lora_mask_backup = LoraMask.getLoraMask()
         completed_prefill_reqs = []
         for req_id, num_prompt_logprobs in num_prompt_logprobs_dict.items():
             if req_id not in prefill_hidden_states:
@@ -5000,6 +5001,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if hs.dim() == 3:
                 hs = hs.squeeze(0)  # [seq_len, hidden_dim]
             prompt_hidden_states = hs[:num_logits]
+            if self.lora_config:
+                # Rows belong to this request only, so the active mask must
+                # carry exactly their LoRA one-hot (the sampling mask is
+                # per-request, not per-row).
+                lora_mask = torch.zeros(num_logits,
+                                        self.lora_config.max_loras * self.lora_config.max_lora_rank,
+                                        dtype=self.lora_config.lora_dtype)
+                if request.lora_request is not None:
+                    lora_index = self.lora_manager._adapter_manager.lora_index_to_id.\
+                        index(request.lora_request.lora_int_id)
+                    start_col = lora_index * self.lora_config.max_lora_rank
+                    lora_mask[:, start_col:start_col + self.lora_config.max_lora_rank] = 1
+                LoraMask.setLoraMask(lora_mask.to(self.device))
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
@@ -5016,6 +5030,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             logprobs_tensors.logprob_token_ids[chunk_slice].copy_(gathered.logprob_token_ids, non_blocking=True)
             logprobs_tensors.logprobs[chunk_slice].copy_(gathered.logprobs, non_blocking=True)
             logprobs_tensors.selected_token_ranks[chunk_slice].copy_(gathered.selected_token_ranks, non_blocking=True)
+
+        LoraMask.setLoraMask(lora_mask_backup)
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
