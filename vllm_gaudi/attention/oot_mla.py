@@ -148,6 +148,11 @@ class HPUMLAAttention(MLAAttention):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is None:
+            # Profiling run (mirrors upstream MLAAttention.forward_impl).
+            if output is not None:
+                return output.fill_(0)
+            return torch.zeros((q.shape[0], self.num_heads * self.v_head_dim), dtype=q.dtype, device=q.device)
         is_prefill = attn_metadata.is_prompt
 
         if not is_prefill:
@@ -171,17 +176,18 @@ class HPUMLAAttention(MLAAttention):
             self.impl.latent_cache_k(latent_vec_k, kv_cache[0], slot_mapping)
 
         if is_prefill:
-            output = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)
-            return output
+            attn_out = self.impl.forward_mha(q, latent_vec_k, kv_cache, attn_metadata)
         elif self.use_sparse and getattr(self.impl, 'topk_indices_buffer', None) is not None:
             query = torch.cat((decode_ql_nope, q_pe), dim=-1)
-            output = self.impl.forward_mqa_sparse(query, kv_cache, attn_metadata, self.impl.topk_indices_buffer)
-            output = self._v_up_proj(output)
-            return output
+            attn_out = self.impl.forward_mqa_sparse(query, kv_cache, attn_metadata, self.impl.topk_indices_buffer)
+            attn_out = self._v_up_proj(attn_out)
         else:
-            output = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata)
-            output = self._v_up_proj(output)
-            return output
+            attn_out = self.impl.forward_mqa(decode_ql_nope, q_pe, kv_cache, attn_metadata)
+            attn_out = self._v_up_proj(attn_out)
+        if output is None:
+            return attn_out
+        output.copy_(attn_out.reshape(output.shape))
+        return output
 
     def process_weights_after_loading(self) -> None:
         act_dtype = self.act_dtype
