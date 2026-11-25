@@ -29,6 +29,7 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.lora.request import LoRARequest
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
@@ -405,6 +406,18 @@ class HPUWorker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()  # type: ignore[union-attr]
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_runner.add_lora(lora_request)  # type: ignore[union-attr]
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.model_runner.remove_lora(lora_id)  # type: ignore[union-attr]
+
+    def pin_lora(self, lora_id: int) -> bool:
+        return self.model_runner.pin_lora(lora_id)  # type: ignore[union-attr]
+
+    def list_loras(self) -> set[int]:
+        return self.model_runner.list_loras()  # type: ignore[union-attr]
 
     def unload_model(self) -> dict[str, float | None]:
         """Stash the current HPUModelRunner (weights already on CPU from sleep)

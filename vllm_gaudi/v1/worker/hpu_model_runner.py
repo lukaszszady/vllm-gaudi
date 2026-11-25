@@ -1382,6 +1382,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
+        self.lora_manager: LRUCacheWorkerLoRAManager | None = None
         self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
         self.scheduler_config = vllm_config.scheduler_config
@@ -1854,6 +1855,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if not self.lora_manager:
             raise RuntimeError("LoRA is not enabled.")
         self.lora_manager.remove_all_adapters()
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        if self.lora_manager is None:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.add_adapter(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        if self.lora_manager is None:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.remove_adapter(lora_id)
+
+    def pin_lora(self, lora_id: int) -> bool:
+        if self.lora_manager is None:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.pin_adapter(lora_id)
+
+    def list_loras(self) -> set[int]:
+        if self.lora_manager is None:
+            raise RuntimeError("LoRA is not enabled.")
+        return self.lora_manager.list_adapters()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
