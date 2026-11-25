@@ -577,8 +577,11 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         """
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for HPUAttentionImpl")
+        if attn_metadata is None:
+            # Profiling run.
+            return output.fill_(0) if output is not None else torch.zeros_like(query)
         if self.attn_type == AttentionType.ENCODER_DECODER:
-            return self.forward_encoder_decoder(
+            attn_out = self.forward_encoder_decoder(
                 query=query,
                 key=key,
                 value=value,
@@ -587,6 +590,10 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 k_scale=layer._k_scale_float,
                 v_scale=layer._k_scale_float,
             )
+            if output is not None:
+                output.copy_(attn_out.reshape(output.shape))
+                return output
+            return attn_out
         # Set return shape
         output_shape = query.shape
         if query.dim() == 2:
@@ -721,7 +728,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                                        valid_seq_lengths=attn_metadata.seq_lens_tensor,
                                        **common_args)
 
-            output = out.reshape(batch_size, seq_len, hidden_size)
+            attn_out = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
             # GAUDISW-248985: decode block_list is the contiguous-identity layout, so
@@ -766,18 +773,21 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                     )
 
             if key_cache is None:
-                return torch.zeros(*output_shape, dtype=query.dtype, device=query.device)
-
-            output = HPUPagedAttention.forward_decode(query=query,
-                                                      block_mapping=block_mapping,
-                                                      block_bias=attn_bias,
-                                                      block_groups=block_groups,
-                                                      position_bias=self.position_bias,
-                                                      **self.common_attention_args(block_list, key_cache, value_cache,
-                                                                                   attn_metadata.block_size, k_scales,
-                                                                                   v_scales))
-
-        return output.view(*output_shape)
+                # No KV cache yet: memory-profiling run.
+                attn_out = torch.zeros(*output_shape, dtype=query.dtype, device=query.device)
+            else:
+                attn_out = HPUPagedAttention.forward_decode(query=query,
+                                                            block_mapping=block_mapping,
+                                                            block_bias=attn_bias,
+                                                            block_groups=block_groups,
+                                                            position_bias=self.position_bias,
+                                                            **self.common_attention_args(
+                                                                block_list, key_cache, value_cache,
+                                                                attn_metadata.block_size, k_scales, v_scales))
+        if output is None:
+            return attn_out.view(*output_shape)
+        output.copy_(attn_out.reshape(output.shape))
+        return output
 
     def common_attention_args(self,
                               block_list=None,
