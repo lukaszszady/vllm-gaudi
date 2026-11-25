@@ -608,8 +608,9 @@ class HPUWorker(WorkerBase):
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
 
             elif isinstance(layer_spec, MambaSpec):
-                dtype0 = layer_spec.dtypes[0]
-                dtype1 = layer_spec.dtypes[1]
+                dtypes = layer_spec.dtypes
+                dtype0 = dtypes[0]
+                dtype1 = dtypes[1] if len(dtypes) > 1 else dtypes[0]
 
                 # Use an empty tensor instead of `None`` to force Dynamo to pass
                 # it by reference, rather by specializing on the value ``None``.
