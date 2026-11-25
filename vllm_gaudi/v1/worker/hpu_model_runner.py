@@ -765,6 +765,39 @@ def bool_helper(value):
     return value in ("y", "yes", "t", "true", "on", "1")
 
 
+# Diagnostic (VLLM_HPU_DIAG_DEVTIME): per-step device timing; no effect when disabled.
+_diag_devtime_counts: dict[str, int] = {}
+_diag_devtime_ms: dict[str, list[float]] = {}
+_diag_devtime_ar_ms: list[float] = []
+_diag_devtime_log_every: int = 200
+
+
+def _diag_devtime_pctl(values, pct):
+    idx = min(len(values) - 1, int(round(pct * (len(values) - 1) / 100)))
+    return values[idx]
+
+
+def _diag_devtime_record(bucket: str, t0: float, t1: float):
+    counts = _diag_devtime_counts
+    counts[bucket] = counts.get(bucket, 0) + 1
+    _diag_devtime_ms.setdefault(bucket, []).append((t1 - t0) * 1e3)
+    from vllm_gaudi.distributed.device_communicators import hpu_communicator as _hpc
+    _hpc._diag_ar_reset_append(_diag_devtime_ar_ms)
+    if sum(counts.values()) % _diag_devtime_log_every == 0:
+        if get_tensor_model_parallel_rank() == 0:
+            for name in sorted(counts):
+                ms = _diag_devtime_ms[name]
+                ms.sort()
+                ar = _diag_devtime_ar_ms
+                ar.sort()
+                ar_ms = _diag_devtime_pctl(ar, 50) if ar else 0.0
+                logger.info('DIAG_DEVTIME bucket=%s n=%d med_ms=%.3f p90_ms=%.3f ar_calls=%d ar_med_ms=%.3f', name,
+                            counts[name], _diag_devtime_pctl(ms, 50), _diag_devtime_pctl(ms, 90), len(ar), ar_ms)
+        _diag_devtime_counts.clear()
+        _diag_devtime_ms.clear()
+        _diag_devtime_ar_ms.clear()
+
+
 Mergeable: TypeAlias = Union[BatchContents, PrefillInputData]
 
 
@@ -1408,6 +1441,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
+        self._diag_devtime_bucket = None
+        self._diag_t0 = 0.0
         if cache_config.cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         else:
@@ -3897,6 +3932,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 f"graphs{'T' if use_graphs else 'F'}")
         else:
             model_event_name = 'model_executable'
+        if not warmup_mode and seq_len == 1 and os.getenv('VLLM_HPU_DIAG_DEVTIME', '0') == '1':
+            self._diag_devtime_bucket = (batch_size, seq_len, num_blocks)
+            torch.hpu.synchronize()
+            self._diag_t0 = time.perf_counter()
+            from vllm_gaudi.distributed.device_communicators import hpu_communicator as _hpc
+            _hpc._diag_ar_set(True)
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
@@ -4768,8 +4809,21 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 lora_mask,
                 warmup_mode=warmup_mode)
             htorch.core.mark_step()
+            _diag_on = os.getenv('VLLM_HPU_DIAG_DEVTIME', '0') == '1' \
+                and not warmup_mode and self._diag_devtime_bucket is not None
+            if _diag_on:
+                from vllm_gaudi.distributed.device_communicators import hpu_communicator as _hpc
+                _hpc._diag_ar_set(False)
+
+            def _diag_record_step():
+                bs, sl, nb = self._diag_devtime_bucket
+                _diag_devtime_record(f'd_bs{bs}_seq{sl}_ctx{nb}', self._diag_t0, time.perf_counter())
+                self._diag_devtime_bucket = None
 
             if self.use_structured_output:
+                if _diag_on:
+                    torch.hpu.synchronize()
+                    _diag_record_step()
                 logits_decode.append(logits_device[:num_decodes])
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
             else:
@@ -4811,6 +4865,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             sampled_token_ids.to("hpu", non_blocking=True)
                     decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
                     ##### Sampling End #####
+                if _diag_on:
+                    torch.hpu.synchronize()
+                    _diag_record_step()
 
             if self.is_driver_worker and self.profiler.enabled:
                 # Stop recording 'execute_model' event

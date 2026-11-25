@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import time
 from typing import Optional
 import torch
 import torch.distributed as dist
@@ -54,6 +56,10 @@ class HpuCommunicator(DeviceCommunicatorBase):
                                   if self.device_group is not None and not _compile_on_one_rank() else None)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        _ap = _allreduce_profile()
+        if _ap is not None:
+            torch.hpu.synchronize()
+            t0 = time.perf_counter()
         # FIXME(kzawora): this is a workaround for a bug in Habana PT bridge
         # occurring when PT_HPU_ENABLE_LAZY_COLLECTIVES=true env var is used
         # (which is required for tensor parallel HPUGraph inference)
@@ -65,9 +71,44 @@ class HpuCommunicator(DeviceCommunicatorBase):
             # guard into every cache entry holding an all_reduce.
             reduced = torch.ops._c10d_functional.all_reduce(input_, "sum", self.device_group_name)
             input_.copy_(torch.ops._c10d_functional.wait_tensor(reduced))
-            return input_
+            return input_ if _ap is None else _allreduce_done(_ap, t0, input_)
         dist.all_reduce(input_, group=self.device_group)
-        return input_
+        return input_ if _ap is None else _allreduce_done(_ap, t0, input_)
+
+
+_diag_ar_enabled = os.getenv('VLLM_HPU_DIAG_DEVTIME', '0') == '1' \
+    and os.getenv('VLLM_HPU_DIAG_DEVTIME_AR', '0') == '1'
+# Window: only decode steps measured by the HPU model runner collect timings.
+_diag_ar_window = False
+
+
+def _diag_ar_set(on: bool) -> None:
+    global _diag_ar_window
+    _diag_ar_window = on
+
+
+def _allreduce_profile() -> Optional[dict]:
+    if torch.compiler.is_compiling() or not _diag_ar_enabled or _diag_ar_window is not True \
+            or dist.get_rank() != 0:
+        return None
+    return {'acc': _diag_ar_ms}
+
+
+def _allreduce_done(ap: dict, t0: float, input_: torch.Tensor) -> torch.Tensor:
+    torch.hpu.synchronize()
+    ap['acc'].append((time.perf_counter() - t0) * 1e3)
+    return input_
+
+
+# Diagnostic (VLLM_HPU_DIAG_DEVTIME): per-step device timing; no effect when disabled.
+_diag_ar_ms: list[float] = []
+
+
+def _diag_ar_reset_append(target: list[float]) -> None:
+    if _diag_ar_ms:
+        ms = _diag_ar_ms
+        target.extend(ms)
+        ms.clear()
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
