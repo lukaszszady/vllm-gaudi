@@ -2024,9 +2024,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
+                mrope_model = self.model if self.is_pooling_model else self.model.model
                 self.requests[req_id].mrope_positions, \
                     self.requests[req_id].mrope_position_delta = \
-                    self.model.model.get_mrope_input_positions(
+                    mrope_model.get_mrope_input_positions(
                         self.requests[req_id].prompt_token_ids,
                         self.requests[req_id].mm_features
                 )
@@ -4412,7 +4413,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         **model_kwargs,
                     )
                 htorch.core.mark_step()
-                flattened = hidden_states.view(-1, hidden_states.shape[-1])
+                # Input was padded to a prompt bucket; pool only the tokens of
+                # this request so lengths match the pooling metadata.
+                flattened = hidden_states.view(-1, hidden_states.shape[-1])[:num_scheduled_tokens]
 
                 pooling_metadata = PoolingMetadata(prompt_lens=torch.tensor([num_scheduled_tokens]),
                                                    prompt_token_ids=input_ids,
