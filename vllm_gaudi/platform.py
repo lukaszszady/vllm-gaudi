@@ -230,10 +230,18 @@ class HpuPlatform(Platform):
                                "VLLM_WORKER_MULTIPROC_METHOD=fork explicitly.")
                 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-        if (vllm_config.model_config is not None and vllm_config.model_config.dtype in (torch.float16, torch.float32)):
+        model_config = vllm_config.model_config
+        if model_config is not None and model_config.dtype in (torch.float16, torch.float32):
             logger.warning("The HPU backend currently does not support %s. "
-                           "Using bfloat16 instead.", vllm_config.model_config.dtype)
-            vllm_config.model_config.dtype = torch.bfloat16
+                           "Using bfloat16 instead.", model_config.dtype)
+            model_config.dtype = torch.bfloat16
+            # LoRA weights must share the model dtype, but upstream resolved
+            # lora_dtype from the original dtype earlier.
+            if vllm_config.lora_config is not None and vllm_config.lora_config.lora_dtype != torch.bfloat16:
+                logger.warning(
+                    "The HPU LoRA backend requires bfloat16 LoRA weights. "
+                    "Forcing lora_dtype from %s to bfloat16.", vllm_config.lora_config.lora_dtype)
+                vllm_config.lora_config.lora_dtype = torch.bfloat16
 
         from vllm.config import CompilationMode, CUDAGraphMode
         compilation_config = vllm_config.compilation_config
