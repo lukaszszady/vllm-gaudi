@@ -3402,7 +3402,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         block_number[:num_decodes] = torch.gather(input=block_table_cpu_tensor,
                                                   dim=1,
                                                   index=(index // decode_block_size))
-        block_number.apply_(self._resolve_block)
+        defragmenter = getattr(self, 'defragmenter', None)
+        if defragmenter is not None and defragmenter.enabled:
+            block_number.apply_(self._resolve_block)
 
         block_offsets = padded_index % decode_block_size
         slot_mapping = block_number * decode_block_size + block_offsets
@@ -3410,8 +3412,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # are ignored when inserting into the KV cache.
         slot_mapping = slot_mapping[:padded_batch_size]
         pad_slot_base = self._PAD_BLOCK_ID * decode_block_size
-        dummy_slots = itertools.cycle(range(pad_slot_base, pad_slot_base + decode_block_size))
-        slot_mapping[num_decodes:].apply_(lambda _, ds=dummy_slots: next(ds))
+        pad_slots = slot_mapping[num_decodes:]
+        pad_slots.copy_((pad_slot_base +
+                         torch.arange(pad_slots.numel(), dtype=pad_slots.dtype) % decode_block_size).view_as(pad_slots))
 
         #####################################
         # NOTE(Chendi): Since we can't actually do num_tokens = 2,
