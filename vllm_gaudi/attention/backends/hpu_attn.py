@@ -555,6 +555,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: HPUAttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
+        output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with PagedAttention.
 
@@ -566,9 +568,15 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 KV-shared layers that project Q only
             kv_cache = [2, num_blocks, block_size * num_kv_heads * head_size]
             attn_metadata: Metadata for attention.
+            output: tensor the attention result is written into.
+            output_scale: scale for fused output quantization; not supported.
+            output_block_scale: block scale for fused output quantization;
+                not supported.
         Returns:
             shape = [num_tokens, num_heads * head_size]
         """
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError("fused output quantization is not yet supported for HPUAttentionImpl")
         if self.attn_type == AttentionType.ENCODER_DECODER:
             return self.forward_encoder_decoder(
                 query=query,
