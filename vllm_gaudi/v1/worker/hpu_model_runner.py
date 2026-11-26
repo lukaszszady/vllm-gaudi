@@ -822,18 +822,21 @@ def _diag_devtime_flush_stepmix():
 
 
 def _diag_devtime_shutdown():
-    _diag_devtime_flush_decode()
-    _diag_devtime_flush_prefill()
-    _diag_devtime_flush_stepmix()
-
-
-atexit.register(_diag_devtime_shutdown)
+    if _diag_stepmix_wall is None:
+        return
+    try:
+        _diag_devtime_flush_decode()
+        _diag_devtime_flush_prefill()
+        _diag_devtime_flush_stepmix()
+    except Exception:
+        pass
 
 
 def _diag_devtime_record(bucket: str, t0: float, t1: float, is_prefill: bool, tokens: int = 0):
     global _diag_stepmix_wall
     if _diag_stepmix_wall is None:
         _diag_stepmix_wall = t0
+        atexit.register(_diag_devtime_shutdown)
     ms = (t1 - t0) * 1e3
     if is_prefill:
         counts = _diag_prefill_counts
@@ -4900,7 +4903,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
             def _diag_record_step():
                 bs, sl, nb = self._diag_devtime_bucket
-                _diag_devtime_record(f'd_bs{bs}_seq{sl}_ctx{nb}', self._diag_t0, time.perf_counter())
+                _diag_devtime_record(f'd_bs{bs}_seq{sl}_ctx{nb}', self._diag_t0, time.perf_counter(), is_prefill=False)
                 self._diag_devtime_bucket = None
 
             if self.use_structured_output:
