@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm_gaudi.v1._vendored._compat import swap_dict_values
+from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
@@ -110,7 +111,7 @@ class HPUMultiGroupBlockTable(MultiGroupBlockTable):
 class CachedRequestState:
 
     req_id: str
-    prompt_token_ids: list[int]
+    prompt_token_ids: Optional[list[int]]
     mm_features: list[MultiModalFeatureSpec]
     sampling_params: Optional[SamplingParams]
     generator: Optional[torch.Generator]
@@ -124,12 +125,16 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
 
+    prompt_embeds: Optional[torch.Tensor] = None
+    # Per-position mask for mixed token/embedding prompts; None unless both are set.
+    prompt_is_token_ids: Optional[list[bool]] = None
+
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
 
     def __post_init__(self):
-        self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(self.prompt_token_ids, self.prompt_embeds)
         if self.pooling_params is not None:
             self.pooling_states = PoolingStates()
 
@@ -139,6 +144,9 @@ class CachedRequestState:
 
     def get_token_id(self, idx: int) -> int:
         if idx < self.num_prompt_tokens:
+            if self.prompt_token_ids is None:
+                raise ValueError(f"Tried to access token index {idx}, but that token was "
+                                 "provided via prompt_embeds, and its ID is unknown.")
             return self.prompt_token_ids[idx]
         else:
             return self.output_token_ids[idx - self.num_prompt_tokens]
@@ -184,6 +192,9 @@ class InputBatch:
             pin_memory=False,
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        # req_index -> (prompt embeds [num_prompt_tokens, hidden], is_token_ids mask or None).
+        # Held per request to avoid a max_model_len x hidden_size buffer.
+        self.req_prompt_embeds: dict[int, tuple[torch.Tensor, Optional[np.ndarray]]] = {}
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
@@ -359,9 +370,20 @@ class InputBatch:
         self.req_id_to_index[req_id] = req_index
 
         # Copy the prompt token ids and output token ids.
-        num_prompt_tokens = len(request.prompt_token_ids)
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(request.prompt_token_ids, request.prompt_embeds)
         self.num_prompt_tokens[req_index] = num_prompt_tokens
-        self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
+        if request.prompt_token_ids is None:
+            self.token_ids_cpu[req_index, :num_prompt_tokens] = 0
+        else:
+            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
+        if request.prompt_embeds is not None:
+            is_token_ids = None
+            if request.prompt_is_token_ids is not None:
+                is_token_ids = np.asarray(request.prompt_is_token_ids, dtype=bool)
+                self.token_ids_cpu[req_index, :num_prompt_tokens][~is_token_ids] = 0
+            self.req_prompt_embeds[req_index] = (request.prompt_embeds, is_token_ids)
+        else:
+            self.req_prompt_embeds.pop(req_index, None)
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
@@ -479,6 +501,7 @@ class InputBatch:
             return None
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
+        self.req_prompt_embeds.pop(req_index, None)
 
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
@@ -533,6 +556,12 @@ class InputBatch:
             self.num_tokens_no_spec[i2], self.num_tokens_no_spec[i1]
         self.num_prompt_tokens[i1], self.num_prompt_tokens[i2] =\
             self.num_prompt_tokens[i2], self.num_prompt_tokens[i1]
+        embeds_i1 = self.req_prompt_embeds.pop(i1, None)
+        embeds_i2 = self.req_prompt_embeds.pop(i2, None)
+        if embeds_i1 is not None:
+            self.req_prompt_embeds[i2] = embeds_i1
+        if embeds_i2 is not None:
+            self.req_prompt_embeds[i1] = embeds_i2
         self.num_computed_tokens_cpu[i1], self.num_computed_tokens_cpu[i2] =\
             self.num_computed_tokens_cpu[i2], self.num_computed_tokens_cpu[i1]
         self.temperature_cpu[i1], self.temperature_cpu[i2] =\
@@ -614,6 +643,8 @@ class InputBatch:
             self.num_tokens[empty_index] = num_tokens
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[last_req_index]
             self.num_prompt_tokens[empty_index] = self.num_prompt_tokens[last_req_index]
+            if last_req_index in self.req_prompt_embeds:
+                self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(last_req_index)
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[last_req_index]
             self.block_table.move_row(last_req_index, empty_index)
             self.temperature_cpu[empty_index] = self.temperature_cpu[last_req_index]

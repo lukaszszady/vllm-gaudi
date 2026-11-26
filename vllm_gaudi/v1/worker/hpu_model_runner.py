@@ -2728,6 +2728,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # Non-empty only for a request resumed after preemption.
                 output_token_ids=list(new_req_data.prefill_token_ids[new_req_data.prompt_len:]),
                 lora_request=new_req_data.lora_request,
+                prompt_embeds=new_req_data.prompt_embeds,
+                prompt_is_token_ids=new_req_data.prompt_is_token_ids,
             )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -3316,6 +3318,49 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             model_mm_kwargs = self._extract_mm_kwargs(scheduler_output)
 
         return inputs_embeds, model_mm_kwargs
+
+    def _apply_prompt_embeds(
+        self,
+        token_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        scheduler_output: "SchedulerOutput",
+        req_ids: list[str],
+    ) -> torch.Tensor | None:
+        """Overlay the scheduled prompt-embedding rows onto the prefill batch's input embeddings."""
+        if not self.input_batch.req_prompt_embeds:
+            return inputs_embeds
+        batch_rows = token_ids.shape[0] if token_ids.ndim == 2 else 1
+        seq_len = token_ids.shape[-1]
+        placements = []
+        offset = 0
+        for i, req_id in enumerate(req_ids):
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            num_scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            entry = self.input_batch.req_prompt_embeds.get(req_idx)
+            if entry is not None:
+                embeds, is_token_ids = entry
+                start = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                end = min(start + num_scheduled, embeds.shape[0])
+                if end > start:
+                    placements.append((0 if self.use_merged_prefill else i, offset, embeds[start:end],
+                                       None if is_token_ids is None else is_token_ids[start:end]))
+            if self.use_merged_prefill:
+                offset += num_scheduled
+        if not placements:
+            return inputs_embeds
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_input_ids(token_ids.clamp(min=0))
+        hidden_size = inputs_embeds.shape[-1]
+        src = torch.zeros((batch_rows, seq_len, hidden_size), dtype=inputs_embeds.dtype)
+        use_embeds = torch.zeros((batch_rows, seq_len), dtype=torch.bool)
+        for row, col, embeds, is_token_ids in placements:
+            n = embeds.shape[0]
+            src[row, col:col + n] = embeds.to(dtype=src.dtype, device='cpu')
+            use_embeds[row, col:col + n] = True if is_token_ids is None else torch.from_numpy(~is_token_ids)
+        src = src.to(self.device, non_blocking=True)
+        use_embeds = use_embeds.to(self.device, non_blocking=True)
+        merged = torch.where(use_embeds.unsqueeze(-1), src, inputs_embeds.reshape(batch_rows, seq_len, hidden_size))
+        return merged.reshape(-1, hidden_size) if get_config().flatten_input else merged
 
     def get_model(self) -> torch.nn.Module:
         if isinstance(self.model, HpuModelAdapter):
@@ -5786,6 +5831,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     scheduler_output,
                     req_id,
                 )
+                inputs_embeds = self._apply_prompt_embeds(token_ids, inputs_embeds, scheduler_output, req_id)
 
                 self.event_start = self.profiler.get_timestamp_us()
                 self.profiler.start("internal", "prefill")
