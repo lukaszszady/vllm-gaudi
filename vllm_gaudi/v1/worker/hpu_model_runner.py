@@ -4236,12 +4236,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                       request_ids: Optional[list[str]] = None,
                       pad_to: Optional[int] = None,
                       logits_requests=None) -> tuple[torch.Tensor, SamplingMetadata]:
-        htorch.core.mark_step()
+        # mark_step is a step separator for lazy-collectives (graphs); redundant when compiled.
+        if htorch.utils.internal.is_lazy():
+            htorch.core.mark_step()
         # Async scheduling: repair -1 placeholders before penalties read them.
         self.input_batch.update_async_output_token_ids()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
         sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
-        htorch.core.mark_step()
+        if htorch.utils.internal.is_lazy():
+            htorch.core.mark_step()
         return sampler_output, sampling_metadata
 
     def _pool(
