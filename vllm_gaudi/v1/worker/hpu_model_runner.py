@@ -98,7 +98,8 @@ from vllm_gaudi.v1._vendored.sample.metadata import SamplingMetadata
 from vllm.v1.worker.utils import bind_kv_cache, add_kv_sharing_layers_to_kv_cache_groups
 from vllm.v1.utils import CpuGpuBuffer
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch, CachedRequestState, splice_placeholders
-from vllm.distributed.parallel_state import get_pp_group, get_dp_group
+from vllm.distributed.parallel_state import get_pp_group, get_dp_group, get_tp_group
+from vllm.sequence import IntermediateTensors
 from vllm.model_executor.models.interfaces import (supports_eagle3, supports_transcription)
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -1334,6 +1335,15 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
 
     def compute_logits(self, *args, **kwargs):
         return self.model.compute_logits(*args, **kwargs)
+
+    def make_dummy_intermediate_tensors(self, input_ids):
+        # Same layout the previous PP stage hands over for these input_ids.
+        tensors = self.model.make_empty_intermediate_tensors(batch_size=input_ids.numel(),
+                                                             dtype=self.dtype,
+                                                             device=input_ids.device)
+        if self.flatten_input or self.is_transformers_backend:
+            return tensors
+        return IntermediateTensors({k: v.view(*input_ids.shape, -1) for k, v in tensors.tensors.items()})
 
     # def sample(self, *args, **kwargs):
     #    return self.sampler(*args, **kwargs)
@@ -5086,6 +5096,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             use_graphs = False
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
+        pp_group = get_pp_group()
+        if not pp_group.is_first_rank:
+            # Warmup ranks run independently, so they use dummy inputs instead of recv.
+            additional_kwargs['intermediate_tensors'] = (
+                self.model.make_dummy_intermediate_tensors(token_ids) if warmup_mode else IntermediateTensors(
+                    pp_group.recv_tensor_dict(all_gather_group=get_tp_group())))
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
@@ -5104,6 +5120,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                model_mm_kwargs=model_mm_kwargs,
                                                lora_mask=lora_mask,
                                                **additional_kwargs)
+        if isinstance(hidden_states, IntermediateTensors):
+            # Non-last PP stage: hand over to the next stage, no logits here.
+            if not warmup_mode:
+                htorch.core.mark_step()
+                pp_group.send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
+            return None, None, None, None
         # NOTE(kzawora): returning hidden_states is required in prompt logprobs
         # scenarios, as they will do logit processing on their own
         if self.use_aux_hidden_state_outputs:
@@ -5884,6 +5906,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             structured_decode_req_ids: list[str] = []
             self.use_structured_output = True
 
+        is_last_pp_rank = get_pp_group().is_last_rank
         ######################### PREFILLS #########################
         if num_prefills > 0:
             htorch.core.mark_step()
@@ -5919,6 +5942,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         model_mm_kwargs=model_mm_kwargs,
                         warmup_mode=warmup_mode)
                 htorch.core.mark_step()
+                if not is_last_pp_rank:
+                    continue
                 non_flattened_hidden_states_prefills.append(non_flattened_hidden_states)
                 # Collect prefill hidden states for prompt logprobs.
                 # req_id is a list of request IDs in this prefill batch.
@@ -6015,7 +6040,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 warmup_mode=warmup_mode)
             htorch.core.mark_step()
 
-            if self.use_structured_output and decode_data.spec_decode_metadata is None:
+            if not is_last_pp_rank:
+                pass
+            elif self.use_structured_output and decode_data.spec_decode_metadata is None:
                 logits_decode.append(logits_device[:num_decodes])
                 decode_sampled_requests.extend(self.input_batch.req_ids[:num_decodes])
                 structured_decode_req_ids = list(self.input_batch.req_ids[:num_decodes])
@@ -6112,6 +6139,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                        None,
                                                                        warmup_mode=warmup_mode)
             htorch.core.mark_step()
+
+        if not is_last_pp_rank:
+            return None  # type: ignore[return-value]
 
         if self.use_structured_output and (logits_decode or logits_prompt):
             # Scheduler places cached before prompt: the decode rows (without
@@ -7994,7 +8024,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         ("HabanaWorker.determine_num_available_blocks needs "
                          "to be called before warming up the model.")
 
-                    self.warmup_sampler()
+                    if get_pp_group().is_last_rank:
+                        self.warmup_sampler()
                     self.defragmenter.warmup()
                     prompt_buckets = self.bucketing_manager.prompt_buckets
 
