@@ -121,6 +121,12 @@ class HpuPlatform(Platform):
                     raise ValueError(f"Unknown vLLM environment variable detected: {env}")
                 logger.warning("Unknown vLLM environment variable detected: %s", env)
 
+    @property
+    def supported_dtypes(self) -> list[torch.dtype]:
+        # float16 models are run in bfloat16 (see check_and_update_config); resolving "auto" to bfloat16 up front
+        # keeps quantization dtype checks consistent with the dtype actually used.
+        return [torch.bfloat16, torch.float32]
+
     @classmethod
     def is_hpu(cls) -> bool:
         return True
