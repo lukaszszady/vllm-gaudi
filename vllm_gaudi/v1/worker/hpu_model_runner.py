@@ -6,6 +6,7 @@ import contextlib
 from copy import deepcopy
 import functools
 from functools import partial, wraps
+import atexit
 import itertools
 import math
 import os
@@ -769,7 +770,14 @@ def bool_helper(value):
 _diag_devtime_counts: dict[str, int] = {}
 _diag_devtime_ms: dict[str, list[float]] = {}
 _diag_devtime_ar_ms: list[float] = []
+_diag_prefill_counts: dict[str, int] = {}
+_diag_prefill_ms: dict[str, list[float]] = {}
+_diag_prefill_tokens: dict[str, int] = {}
 _diag_devtime_log_every: int = 200
+_diag_prefill_log_every: int = 20
+_diag_stepmix: list[int] = [0, 0]
+_diag_stepmix_ms: list[float] = [0.0, 0.0]
+_diag_stepmix_wall: Optional[float] = None
 
 
 def _diag_devtime_pctl(values, pct):
@@ -777,25 +785,83 @@ def _diag_devtime_pctl(values, pct):
     return values[idx]
 
 
-def _diag_devtime_record(bucket: str, t0: float, t1: float):
-    counts = _diag_devtime_counts
-    counts[bucket] = counts.get(bucket, 0) + 1
-    _diag_devtime_ms.setdefault(bucket, []).append((t1 - t0) * 1e3)
-    from vllm_gaudi.distributed.device_communicators import hpu_communicator as _hpc
-    _hpc._diag_ar_reset_append(_diag_devtime_ar_ms)
-    if sum(counts.values()) % _diag_devtime_log_every == 0:
-        if get_tensor_model_parallel_rank() == 0:
-            for name in sorted(counts):
-                ms = _diag_devtime_ms[name]
-                ms.sort()
-                ar = _diag_devtime_ar_ms
-                ar.sort()
-                ar_ms = _diag_devtime_pctl(ar, 50) if ar else 0.0
-                logger.info('DIAG_DEVTIME bucket=%s n=%d med_ms=%.3f p90_ms=%.3f ar_calls=%d ar_med_ms=%.3f', name,
-                            counts[name], _diag_devtime_pctl(ms, 50), _diag_devtime_pctl(ms, 90), len(ar), ar_ms)
-        _diag_devtime_counts.clear()
-        _diag_devtime_ms.clear()
-        _diag_devtime_ar_ms.clear()
+def _diag_devtime_flush_decode():
+    for name in sorted(_diag_devtime_counts):
+        ms = _diag_devtime_ms[name]
+        ms.sort()
+        ar = _diag_devtime_ar_ms
+        ar.sort()
+        ar_ms = _diag_devtime_pctl(ar, 50) if ar else 0.0
+        logger.info('rank=%d DIAG_DEVTIME bucket=%s n=%d med_ms=%.3f p90_ms=%.3f ar_calls=%d ar_med_ms=%.3f',
+                    get_tensor_model_parallel_rank(), name, _diag_devtime_counts[name], _diag_devtime_pctl(ms, 50),
+                    _diag_devtime_pctl(ms, 90), len(ar), ar_ms)
+    _diag_devtime_counts.clear()
+    _diag_devtime_ms.clear()
+    _diag_devtime_ar_ms.clear()
+
+
+def _diag_devtime_flush_prefill():
+    for name in sorted(_diag_prefill_counts):
+        ms = _diag_prefill_ms[name]
+        ms.sort()
+        logger.info('rank=%d DIAG_DEVTIME_PREFILL bucket=%s n=%d med_ms=%.3f p90_ms=%.3f tokens=%d',
+                    get_tensor_model_parallel_rank(), name, _diag_prefill_counts[name], _diag_devtime_pctl(ms, 50),
+                    _diag_devtime_pctl(ms, 90), _diag_prefill_tokens.get(name, 0))
+    _diag_prefill_counts.clear()
+    _diag_prefill_ms.clear()
+    _diag_prefill_tokens.clear()
+
+
+def _diag_devtime_flush_stepmix():
+    if _diag_stepmix_wall is None:
+        return
+    logger.info(
+        'rank=%d DIAG_STEPMIX decode_steps=%d prefill_steps=%d decode_ms_sum=%.1f prefill_ms_sum=%.1f wall_s=%.1f',
+        get_tensor_model_parallel_rank(), _diag_stepmix[0], _diag_stepmix[1], _diag_stepmix_ms[0], _diag_stepmix_ms[1],
+        time.perf_counter() - _diag_stepmix_wall)
+
+
+def _diag_devtime_shutdown():
+    _diag_devtime_flush_decode()
+    _diag_devtime_flush_prefill()
+    _diag_devtime_flush_stepmix()
+
+
+atexit.register(_diag_devtime_shutdown)
+
+
+def _diag_devtime_record(bucket: str, t0: float, t1: float, is_prefill: bool, tokens: int = 0):
+    global _diag_stepmix_wall
+    if _diag_stepmix_wall is None:
+        _diag_stepmix_wall = t0
+    ms = (t1 - t0) * 1e3
+    if is_prefill:
+        counts = _diag_prefill_counts
+        counts[bucket] = counts.get(bucket, 0) + 1
+        _diag_prefill_ms.setdefault(bucket, []).append(ms)
+        _diag_prefill_tokens[bucket] = _diag_prefill_tokens.get(bucket, 0) + max(tokens, 1)
+        _diag_stepmix[1] += 1
+        _diag_stepmix_ms[1] += ms
+        if counts[bucket] % _diag_prefill_log_every == 0:
+            samples = _diag_prefill_ms[bucket]
+            samples.sort()
+            logger.info('rank=%d DIAG_DEVTIME_PREFILL bucket=%s n=%d med_ms=%.3f p90_ms=%.3f tokens=%d',
+                        get_tensor_model_parallel_rank(), bucket, counts[bucket], _diag_devtime_pctl(samples, 50),
+                        _diag_devtime_pctl(samples, 90), _diag_prefill_tokens[bucket])
+            del counts[bucket], _diag_prefill_ms[bucket], _diag_prefill_tokens[bucket]
+    else:
+        from vllm_gaudi.distributed.device_communicators import hpu_communicator as _hpc
+        _hpc._diag_ar_reset_append(_diag_devtime_ar_ms)
+        counts = _diag_devtime_counts
+        counts[bucket] = counts.get(bucket, 0) + 1
+        _diag_devtime_ms.setdefault(bucket, []).append(ms)
+        _diag_stepmix[0] += 1
+        _diag_stepmix_ms[0] += ms
+        if sum(_diag_devtime_counts.values()) % _diag_devtime_log_every == 0:
+            _diag_devtime_flush_decode()
+    total = _diag_stepmix[0] + _diag_stepmix[1]
+    if total % _diag_devtime_log_every == 0:
+        _diag_devtime_flush_stepmix()
 
 
 Mergeable: TypeAlias = Union[BatchContents, PrefillInputData]
@@ -1443,6 +1509,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.dtype = self.model_config.dtype
         self._diag_devtime_bucket = None
         self._diag_t0 = 0.0
+        self._diag_prefill_armed = False
         if cache_config.cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         else:
@@ -3932,12 +3999,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                 f"graphs{'T' if use_graphs else 'F'}")
         else:
             model_event_name = 'model_executable'
-        if not warmup_mode and seq_len == 1 and os.getenv('VLLM_HPU_DIAG_DEVTIME', '0') == '1':
-            self._diag_devtime_bucket = (batch_size, seq_len, num_blocks)
-            torch.hpu.synchronize()
-            self._diag_t0 = time.perf_counter()
-            from vllm_gaudi.distributed.device_communicators import hpu_communicator as _hpc
-            _hpc._diag_ar_set(True)
+        if not warmup_mode and os.getenv('VLLM_HPU_DIAG_DEVTIME', '0') == '1' and self._diag_devtime_bucket is None:
+            if seq_len == 1:
+                self._diag_devtime_bucket = (batch_size, seq_len, num_blocks)
+                torch.hpu.synchronize()
+                self._diag_t0 = time.perf_counter()
+                from vllm_gaudi.distributed.device_communicators import hpu_communicator as _hpc
+                _hpc._diag_ar_set(True)
+            else:
+                self._diag_prefill_armed = True
+                self._diag_devtime_bucket = (batch_size, seq_len, num_blocks)
+                torch.hpu.synchronize()
+                self._diag_t0 = time.perf_counter()
         with self.profiler.record_event('internal', model_event_name):
             hidden_states = self.model.forward(input_ids=token_ids,
                                                positions=position_ids,
@@ -4768,6 +4841,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                              prompt_batch_idx=idx,
                                                                              is_prompt=True)
                     self.profiler.record_counter(self.event_start, counters)
+                if getattr(self, '_diag_prefill_armed', False) and self._diag_devtime_bucket is not None:
+                    torch.hpu.synchronize()
+                    bs, sl, nb = self._diag_devtime_bucket
+                    _diag_devtime_record(f'p_bs{bs}_seq{sl}_ctx{nb}',
+                                         self._diag_t0,
+                                         time.perf_counter(),
+                                         is_prefill=True,
+                                         tokens=token_ids.numel())
+                    self._diag_devtime_bucket = None
+                    self._diag_prefill_armed = False
 
             if self.is_driver_worker and self.profiler.enabled:
                 self.profiler_counter_helper.reset_prompt_seq_stats()
