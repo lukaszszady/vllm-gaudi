@@ -11,6 +11,9 @@ Covers:
   for granitemoehybrid models across cold-start, deserialization, and
   reconfigure paths.
 """
+import functools
+import weakref
+import gc
 import os
 import re
 from types import SimpleNamespace
@@ -703,3 +706,71 @@ def test_beam_search_step_with_allowlist_is_refused(allowed_token_ids, refused):
         return
     with pytest.raises(VLLMValidationError, match="logprob_token_ids is not supported on HPU"):
         HpuPlatform.validate_request(None, params)
+
+
+def test_make_synced_weight_loader_preserves_self():
+    """Verify that bound and plain loaders are wrapped correctly and retain self."""
+
+    class _Layer:
+
+        def __init__(self):
+            self.called = False
+
+        def load(self, param, w, shard_id=None):
+            self.called = True
+            return (param, w, shard_id)
+
+    layer = _Layer()
+    original = layer.load
+    wrapped = HpuPlatform.make_synced_weight_loader(original)
+
+    # Bound method case
+    assert hasattr(wrapped, "__self__"), "Wrapped loader should be a bound method"
+    assert wrapped.__self__ is layer
+    res = wrapped("P", "W", shard_id=3)
+    assert res == ("P", "W", 3)
+    assert layer.called is True
+
+    # Plain function case
+    def fn(param, loaded_weight, shard_id=None):
+        return (param, loaded_weight, shard_id)
+
+    wrapped_plain = HpuPlatform.make_synced_weight_loader(fn)
+    assert not hasattr(wrapped_plain, "__self__")
+    assert wrapped_plain("P", "W", shard_id=3) == ("P", "W", 3)
+
+    # Partial case
+    def fn2(a, param, w):
+        return (a, param, w)
+
+    wrapped_partial = HpuPlatform.make_synced_weight_loader(functools.partial(fn2, 7))
+    assert wrapped_partial("P", "W") == (7, "P", "W")
+
+
+def test_make_synced_weight_loader_release_layer():
+    """Verify that wrapped loader allows layer release via sanitize_layer_refs."""
+    from vllm.model_executor.model_loader.reload.sanitize import sanitize_layer_refs, restore_layer_refs
+
+    class _Layer(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+
+        def load(self, param, w):
+            return self
+
+    layer = _Layer()
+    t = torch.empty(1)
+    t.weight_loader = HpuPlatform.make_synced_weight_loader(layer.load)
+
+    ref = weakref.ref(layer)
+    sanitize_layer_refs(t, layer)
+
+    del layer
+    gc.collect()
+    assert ref() is None, "Layer should have been released after sanitation"
+
+    # Test restoration
+    new_layer = _Layer()
+    restore_layer_refs(t, new_layer)
+    assert t.weight_loader.__self__ is new_layer, "Restored loader should be bound to new layer"
