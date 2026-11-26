@@ -196,6 +196,11 @@ class HpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        # Register OOT ops on paths that build configs/models without the
+        # engine (EngineArgs loads general plugins; tests do not). Idempotent.
+        from vllm.plugins import load_general_plugins
+
+        load_general_plugins()
         # Apply torch.compile/eager-only env defaults here (engine construction
         # time) instead of at plugin registration time, so they cannot leak into
         # a lazy-mode subprocess (GAUDISW-248809) and always respect values the
