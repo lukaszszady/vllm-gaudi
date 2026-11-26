@@ -76,6 +76,7 @@ from vllm.utils.import_utils import LazyLoader
 from vllm_gaudi.utils import (HPUCompileConfig, is_fake_hpu, async_h2d_copy, getattr_nested, setattr_nested)
 from vllm_gaudi.v1.attention.backends.hpu_attn import HPUAttentionMetadataV1
 from vllm_gaudi.v1.sample import hpu_rejection_sampler
+from vllm_gaudi.v1.sample.hpu_watermark_sampler import HPUWatermarkSampler
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.core.kv_cache_utils import is_mamba_group
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
@@ -89,6 +90,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.worker.gpu.kv_connector import KVConnector, NO_OP_KV_CONNECTOR, get_kv_connector
+from vllm.v1.watermarking import create_watermarker
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists, LogprobsTensors, DraftTokenIds,
                              ModelRunnerOutput, AsyncModelRunnerOutput, KVConnectorOutput)
 from vllm.v1.pool.metadata import PoolingMetadata
@@ -1532,7 +1534,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         self.supports_mm_inputs = False
 
-        self.sampler = Sampler()
+        self.watermark_sampler: Optional[HPUWatermarkSampler] = None
+        if (wm_config := self.vllm_config.watermark_config) is None:
+            self.sampler = Sampler()
+        else:
+            self.sampler = self.watermark_sampler = HPUWatermarkSampler(
+                create_watermarker(wm_config),
+                deduplicate_contexts=wm_config.deduplicate_contexts,
+                deduplicate_contexts_max_history=wm_config.deduplicate_contexts_max_history)
 
         # NOTE(kzawora) update_env is a hack to work around VLLMKVCache in
         # hpu-extension which selects fetch_from_cache implementation based
@@ -3543,6 +3552,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                        pad_to, logits_reqs)
         sampling_metadata = self.input_batch.make_selective_sampling_metadata(req_id_output_token_ids_lst,
                                                                               skip_copy=not batch_changed)
+        if self.watermark_sampler is not None and self.input_batch.watermarking_reqs:
+            sampling_metadata.watermark = self.watermark_sampler.make_inputs(
+                [self.requests[req_id] for req_id, _ in req_id_output_token_ids_lst], self.device)
         return sampling_metadata
 
     def get_habana_paged_attn_buffers(self,

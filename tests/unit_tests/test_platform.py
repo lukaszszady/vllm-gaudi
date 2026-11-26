@@ -586,7 +586,7 @@ def test_validate_request_accepts_prompt_logprobs_start_zero_and_thinking_budget
     HpuPlatform.validate_request(None, params)
 
 
-def _engine_config(*, async_scheduling=False, pipeline_parallel_size=1, speculative_config=None):
+def _engine_config(*, async_scheduling=False, pipeline_parallel_size=1, speculative_config=None, watermark_config=None):
     """A minimal non-hybrid config that check_and_update_config accepts."""
     return SimpleNamespace(
         model_config=SimpleNamespace(
@@ -605,6 +605,7 @@ def _engine_config(*, async_scheduling=False, pipeline_parallel_size=1, speculat
         load_config=SimpleNamespace(device=None),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling, scheduler_cls=None),
         speculative_config=speculative_config,
+        watermark_config=watermark_config,
     )
 
 
@@ -644,7 +645,8 @@ def _dflash_spec(architectures, layer_types=None):
 _UNSUPPORTED_ENGINE_FEATURES = [
     ("return_sampling_mask", lambda c: setattr(c.model_config, "return_sampling_mask", True)),
     ("enable_trace_replay", lambda c: setattr(c.model_config, "enable_trace_replay", True)),
-    ("watermarking", lambda c: setattr(c, "watermark_config", object())),
+    ("watermarking with speculative decoding", lambda c:
+     (setattr(c, "watermark_config", object()), setattr(c, "speculative_config", _spec_config()))),
     ("prefill context parallel", lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2)),
     ("custom speculative method 'mine'",
      lambda c: setattr(c, "speculative_config", _spec_config(custom_method="mine"))),
@@ -672,6 +674,10 @@ def test_unsupported_engine_features_fail_at_startup(feature, enable):
     enable(vllm_config)
     with pytest.raises(ValueError, match=f"HPU does not support: {re.escape(feature)}\\."):
         _run_check_and_update_config(vllm_config)
+
+
+def test_watermarking_without_speculative_decoding_passes_startup():
+    _run_check_and_update_config(_engine_config(watermark_config=object()))
 
 
 def test_hisparse_is_rejected_by_upstream_platform_check():

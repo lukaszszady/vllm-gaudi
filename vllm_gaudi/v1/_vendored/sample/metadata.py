@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Vendored from https://github.com/vllm-project/vllm/blob/b46907cce0/vllm/v1/sample/metadata.py
-# (removed upstream in aac1b2a4f3, vllm-project/vllm#63373). Local changes: imports retargeted.
+# (removed upstream in aac1b2a4f3, vllm-project/vllm#63373). Local changes: imports retargeted, ``watermark`` field.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,6 +10,14 @@ import torch
 
 from vllm_gaudi.v1._vendored.sample.logits_processor import LogitsProcessors
 from vllm_gaudi.v1._vendored.sample.thinking_budget_state import ThinkingBudgetStateHolder
+
+
+@dataclass
+class WatermarkInputs:
+    # int64 (rows, context_width): the last output tokens of each row's request, -1 where there are fewer.
+    contexts: torch.Tensor
+    # bool (rows,): rows sampled with the watermark.
+    active: torch.Tensor
 
 
 @dataclass
@@ -54,3 +62,5 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+    # Set only by a watermark-aware sampler's input builder, and only for a batch with a watermarked request.
+    watermark: WatermarkInputs | None = None

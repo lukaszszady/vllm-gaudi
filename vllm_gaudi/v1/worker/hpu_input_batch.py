@@ -227,6 +227,7 @@ class InputBatch:
         self.temperature_cpu = self.temperature_cpu_tensor.numpy()
         self.greedy_reqs: set[str] = set()
         self.random_reqs: set[str] = set()
+        self.watermarking_reqs: set[str] = set()
 
         self.top_p = torch.empty((max_num_reqs, ), dtype=torch.float32, device=device)
         self.top_p_cpu_tensor = torch.empty((max_num_reqs, ), dtype=torch.float32, device="cpu", pin_memory=pin_memory)
@@ -392,6 +393,8 @@ class InputBatch:
             else:
                 self.temperature_cpu[req_index] = sampling_params.temperature
                 self.random_reqs.add(req_id)
+                if sampling_params.watermarking:
+                    self.watermarking_reqs.add(req_id)
 
             self.top_p_cpu[req_index] = sampling_params.top_p
             if sampling_params.top_p < 1:
@@ -482,6 +485,7 @@ class InputBatch:
 
         self.greedy_reqs.discard(req_id)
         self.random_reqs.discard(req_id)
+        self.watermarking_reqs.discard(req_id)
         self.top_p_reqs.discard(req_id)
         self.top_k_reqs.discard(req_id)
         self.min_p_reqs.discard(req_id)
@@ -1020,14 +1024,14 @@ class InputBatch:
     def needs_output_token_ids(self) -> bool:
         """Whether any sampler consumer reads output_token_ids this batch.
 
-        Both penalties and bad_words read it, so the -1 placeholders must be
-        repaired before sampling if either is active for any request.
+        Penalties, bad_words and watermarking read it, so the -1 placeholders must be
+        repaired before sampling if any is active for any request.
 
         Upstream also ORs in a custom-logitsprocs flag; unreachable here because
         batch_update_builder is never populated on HPU (see the PR#16728 TODO in
         _make_sampling_metadata). Add it back when batch_update is enabled.
         """
-        return not self.no_penalties or bool(self.bad_words_token_ids)
+        return not self.no_penalties or bool(self.bad_words_token_ids) or bool(self.watermarking_reqs)
 
     @property
     def max_num_logprobs(self) -> Optional[int]:
