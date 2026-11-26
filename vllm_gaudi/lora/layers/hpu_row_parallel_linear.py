@@ -55,15 +55,20 @@ class HPURowParallelLinearWithShardedLoRA(RowParallelLinearWithShardedLoRA):
 
 
 def register_hpu_lora_layers():
-    """Register HPU LoRA layers in the global lora_utils._all_lora_classes set.
-    
-    This must be called before LoRA model creation to ensure HPU layers
-    are checked before upstream layers.
+    """Register HPU LoRA layers in the global lora_utils._all_lora_classes so that
+    from_layer() instantiates the HPU-aware wrappers instead of the upstream ones.
     """
-    # Remove the upstream classes first (they use strict type check)
-    lora_utils._all_lora_classes.discard(RowParallelLinearWithLoRA)
-    lora_utils._all_lora_classes.discard(RowParallelLinearWithShardedLoRA)
-
-    # Add HPU-aware classes
-    lora_utils._all_lora_classes.add(HPURowParallelLinearWithLoRA)
-    lora_utils._all_lora_classes.add(HPURowParallelLinearWithShardedLoRA)
+    replacements = {
+        RowParallelLinearWithLoRA: HPURowParallelLinearWithLoRA,
+        RowParallelLinearWithShardedLoRA: HPURowParallelLinearWithShardedLoRA,
+    }
+    lora_classes = lora_utils._all_lora_classes
+    if isinstance(lora_classes, (list, tuple)):
+        # VLLM 0.33.0 declares _all_lora_classes as a tuple: rebuild it
+        # in place, preserving order (from_layer iterates positionally).
+        lora_utils._all_lora_classes = tuple(replacements.get(cls, cls) for cls in lora_classes)
+    else:
+        lora_utils._all_lora_classes.discard(RowParallelLinearWithLoRA)
+        lora_utils._all_lora_classes.discard(RowParallelLinearWithShardedLoRA)
+        lora_utils._all_lora_classes.add(HPURowParallelLinearWithLoRA)
+        lora_utils._all_lora_classes.add(HPURowParallelLinearWithShardedLoRA)
