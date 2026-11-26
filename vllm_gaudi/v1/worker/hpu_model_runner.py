@@ -5927,6 +5927,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             structured_decode_req_ids: list[str] = []
             self.use_structured_output = True
 
+        is_first_pp_rank = get_pp_group().is_first_rank
         is_last_pp_rank = get_pp_group().is_last_rank
         ######################### PREFILLS #########################
         if num_prefills > 0:
@@ -5939,14 +5940,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     # embed_input_ids below runs outside the model adapter.
                     LoraMask.setLoraMask(lora_mask)
 
-                # Prepare multimodal inputs if any
-                inputs_embeds, model_mm_kwargs = self._get_model_mm_inputs(
-                    token_ids,
-                    token_ids.shape[-1],
-                    scheduler_output,
-                    req_id,
-                )
-                inputs_embeds = self._apply_prompt_embeds(token_ids, inputs_embeds, scheduler_output, req_id)
+                # Prepare multimodal inputs if any; only the first PP rank has embeddings.
+                inputs_embeds, model_mm_kwargs = None, None
+                if is_first_pp_rank:
+                    inputs_embeds, model_mm_kwargs = self._get_model_mm_inputs(
+                        token_ids,
+                        token_ids.shape[-1],
+                        scheduler_output,
+                        req_id,
+                    )
+                    inputs_embeds = self._apply_prompt_embeds(token_ids, inputs_embeds, scheduler_output, req_id)
 
                 self.event_start = self.profiler.get_timestamp_us()
                 self.profiler.start("internal", "prefill")
