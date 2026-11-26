@@ -468,6 +468,7 @@ def _prepare_apply(kda_modules, monkeypatch):
     plugins.load_general_plugins = lambda: None
     monkeypatch.setitem(sys.modules, "vllm.plugins", plugins)
     monkeypatch.setattr(torch.accelerator, "empty_cache", torch.accelerator.empty_cache)
+    monkeypatch.setattr(torch.accelerator, "current_stream", torch.accelerator.current_stream)
     if hasattr(torch.accelerator, "empty_host_cache"):
         monkeypatch.setattr(torch.accelerator, "empty_host_cache", torch.accelerator.empty_host_cache)
     monkeypatch.setattr(torch._C,
