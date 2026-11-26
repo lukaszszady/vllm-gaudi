@@ -434,19 +434,21 @@ class HPUWorker(WorkerBase):
         pattern: str | None = None,
         max_size: int | None = None,
     ) -> None:
-        ShardedStateLoader.save_model(
-            self.model_runner.get_model(),  # type: ignore[union-attr]
-            path,
-            pattern=pattern,
-            max_size=max_size,
-        )
+        with self.model_runner.uncompiled_model() as model:  # type: ignore[union-attr]
+            ShardedStateLoader.save_model(
+                model,
+                path,
+                pattern=pattern,
+                max_size=max_size,
+            )
 
     def save_tensorized_model(self, tensorizer_config: "TensorizerConfig") -> None:
-        TensorizerLoader.save_model(
-            self.get_model(),
-            tensorizer_config=tensorizer_config,
-            model_config=self.model_config,
-        )
+        with self.model_runner.uncompiled_model() as model:  # type: ignore[union-attr]
+            TensorizerLoader.save_model(
+                model,
+                tensorizer_config=tensorizer_config,
+                model_config=self.model_config,
+            )
 
     def unload_model(self) -> dict[str, float | None]:
         """Stash the current HPUModelRunner (weights already on CPU from sleep)

@@ -3272,6 +3272,43 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         assert self.model is not None
         return self.model
 
+    @contextlib.contextmanager
+    def uncompiled_model(self):
+        """Yield the model without torch.compile wrappers: compiled regions
+        are swapped back to their _orig_mod for the duration (restored on
+        exit) so a saved state_dict matches the raw model's keys."""
+        model = self.model
+        while isinstance(model, (torch._dynamo.eval_frame.OptimizedModule, HpuModelAdapter)):
+            model = model._orig_mod if isinstance(model, torch._dynamo.eval_frame.OptimizedModule) else model.model
+        assert model is not None
+        compiled = [(name, module) for name, module in model.named_modules()
+                    if name and isinstance(module, torch._dynamo.eval_frame.OptimizedModule)]
+
+        def swap(name, module):
+            parent = model
+            for part in name.split(".")[:-1]:
+                if isinstance(parent, torch.nn.ModuleList):
+                    parent = parent[int(part)]
+                elif isinstance(parent, torch.nn.ModuleDict):
+                    parent = parent[part]
+                else:
+                    parent = getattr(parent, part)
+            last = name.split(".")[-1]
+            if isinstance(parent, torch.nn.ModuleList):
+                parent[int(last)] = module
+            elif isinstance(parent, torch.nn.ModuleDict):
+                parent[last] = module
+            else:
+                setattr(parent, last, module)
+
+        for name, module in compiled:
+            swap(name, module._orig_mod)
+        try:
+            yield model
+        finally:
+            for name, module in compiled:
+                swap(name, module)
+
     def is_decoder_only(self, req_id) -> bool:
         return bool(req_id in self.input_batch.req_type and \
             self.input_batch.req_type[req_id] == "decode")
