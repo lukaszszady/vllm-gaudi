@@ -6191,6 +6191,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             ", moving along the block table with prefix caching" if self.use_prefix_caching else "")
         return True
 
+    def _move_model_to_hpu(self):
+        """Move model weights to HPU, respecting CPU offloading."""
+        offloader = get_offloader()
+        if offloader is None or offloader.__class__.__name__ == "NoopOffloader":
+            self._move_model_to_hpu()
+            return
+
+        for p in self.model.parameters():
+            if p.device.type != "cpu":
+                p.data = p.data.to("hpu")
+
     @with_thread_limits()
     def load_model(self) -> None:
         set_offloader(create_offloader(self.vllm_config.offload_config))
@@ -6254,7 +6265,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # Leaving dense models on host until the post-INC move restores the
                 # pre-#1590 behavior that convert() shrinks them first.
                 if not is_fake_hpu() and _model_has_moe_experts(self.model):
-                    self.model = self.model.to("hpu")
+                    self._move_model_to_hpu()
                     _rebind_moe_expert_weights(self.model)
                     htorch.core.mark_step()
                 if config.measure:
@@ -6275,7 +6286,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                      "please validate quantization config file")
                 self._sync_shared_moe_gates()
                 if not is_fake_hpu():
-                    self.model = self.model.to("hpu")
+                    self._move_model_to_hpu()
                     _rebind_moe_expert_weights(self.model)
                     _move_remaining_tensors_to_device(self.model, "hpu")
                     _dedup_moe_op_weights(self.model)
@@ -6286,7 +6297,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.model_memory_usage = m_inc.consumed_device_memory
             logger.info("Preparing model with INC took %.4f GB", self.model_memory_usage / float(2**30))
         elif not is_fake_hpu():
-            self.model = self.model.to("hpu")
+            self._move_model_to_hpu()
             # A CPU-first load leaves WNA16 per-expert views on the host; without
             # this they would stay there (no stray-tensor sweep on this path).
             _rebind_wna16_moe_expert_weights(self.model)

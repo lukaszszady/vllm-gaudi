@@ -293,8 +293,9 @@ class HpuPlatform(Platform):
                                "VLLM_WORKER_MULTIPROC_METHOD=fork explicitly.")
                 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-        model_config = vllm_config.model_config
-        if model_config is not None and model_config.dtype in (torch.float16, torch.float32):
+        if vllm_config.offload_config.uva.cpu_offload_gb > 0:
+            logger.warning("[HPU] CPU weight offloading is enabled; forcing eager mode.")
+            model_config.enforce_eager = True
             logger.warning("The HPU backend currently does not support %s. "
                            "Using bfloat16 instead.", model_config.dtype)
             model_config.dtype = torch.bfloat16
@@ -332,12 +333,9 @@ class HpuPlatform(Platform):
                 "enable_prefix_caching=%s", cache_config.block_size, getattr(cache_config, "mamba_block_size", None),
                 getattr(cache_config, "mamba_cache_mode", None), cache_config.enable_prefix_caching)
 
-        if compilation_config.mode != CompilationMode.NONE or vllm_config.offload_config.uva.cpu_offload_gb > 0:
             if compilation_config.mode != CompilationMode.NONE:
                 logger.info("[HPU] Forcing CompilationMode.NONE compilation mode")
-            elif vllm_config.offload_config.uva.cpu_offload_gb > 0:
-                logger.info("[HPU] Forcing CompilationMode.NONE due to CPU weight offloading")
-            compilation_config.mode = CompilationMode.NONE
+                compilation_config.mode = CompilationMode.NONE
 
         # Force CPU loading for INC quantization to prevent OOM during weight loading.
         # INC FP8 quantization requires weights to be loaded to CPU first, then
