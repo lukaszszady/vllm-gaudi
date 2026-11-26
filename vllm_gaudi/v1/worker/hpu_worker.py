@@ -36,6 +36,8 @@ from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, se
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig, KVCacheLayerConfig, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
+from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+from vllm.v1.core.kv_cache_planning import get_kv_cache_groups_from_builder, _pool_bytes_per_block_from_builder
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.host_headroom import host_identity, host_memory_headroom_bytes
@@ -766,22 +768,29 @@ class HPUWorker(WorkerBase):
                 available = adjusted
 
         if has_attn and has_standard_mamba:
-            # Standard Mamba2 + ATN hybrids (e.g. Granite): the
-            # naive_mamba_cache_sharing path allocates independent
-            # tensors per layer type, so the real per-block cost is
-            # attn_page + mamba_state (not max(attn, mamba)).
-            attn_page_size = next(s.page_size_bytes for s in kv_cache_spec.values() if isinstance(s, AttentionSpec))
-            mamba_state_per_block = next(
-                sum(math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(s.shapes, s.dtypes))
-                for s in kv_cache_spec.values() if isinstance(s, MambaSpec) and s.mamba_type not in _GDN_MAMBA_TYPES)
-            if attn_page_size > 0:
-                ratio = attn_page_size / (attn_page_size + mamba_state_per_block)
-                adjusted = int(available * ratio)
+            # Standard Mamba + ATN hybrids (e.g. Granite, Jamba): the
+            # naive_mamba_cache_sharing path allocates an independent tensor
+            # per layer, while the engine sizes blocks assuming the layers of
+            # different groups share tensors. Scale the budget by the ratio of
+            # the engine's bytes per block to the bytes this worker allocates.
+            builder = get_kv_cache_config_builder(self.vllm_config)
+            layer_configs = self.model_runner.get_kv_cache_layer_configs()  # type: ignore[union-attr]
+            kv_cache_groups = get_kv_cache_groups_from_builder(builder, self.vllm_config, layer_configs)
+            engine_bytes_per_block = _pool_bytes_per_block_from_builder(builder, self.vllm_config, kv_cache_groups)
+            hpu_bytes_per_block = 0
+            for layer_spec in kv_cache_spec.values():
+                if isinstance(layer_spec, AttentionSpec):
+                    hpu_bytes_per_block += layer_spec.real_page_size_bytes
+                else:
+                    hpu_bytes_per_block += sum(
+                        math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(layer_spec.shapes, layer_spec.dtypes))
+            if hpu_bytes_per_block > engine_bytes_per_block:
+                adjusted = int(available * engine_bytes_per_block / hpu_bytes_per_block)
                 logger.info(
-                    "Hybrid model (standard Mamba2 + ATN): adjusted "
-                    "usable KV cache from %s to %s (attn_page=%d, "
-                    "mamba_state=%d, ratio=%.3f)", format_bytes(available), format_bytes(adjusted), attn_page_size,
-                    mamba_state_per_block, ratio)
+                    "Hybrid model (standard Mamba + ATN): adjusted "
+                    "usable KV cache from %s to %s (engine_bytes_per_block=%d, "
+                    "hpu_bytes_per_block=%d)", format_bytes(available), format_bytes(adjusted), engine_bytes_per_block,
+                    hpu_bytes_per_block)
                 available = adjusted
 
         # Core vLLM's determine_available_memory contract returns an int
