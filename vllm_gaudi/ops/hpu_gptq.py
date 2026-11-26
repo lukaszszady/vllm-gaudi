@@ -105,7 +105,9 @@ class GPTQHPUConfig(QuantizationConfig):
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None) -> Optional[str]:
 
-        is_valid_user_quant = user_quant == "gptq_hpu"
+        is_gptq_checkpoint = hf_quant_cfg.get("quant_method", "").lower() == "gptq"
+        is_valid_user_quant = user_quant == "gptq_hpu" or (is_gptq_checkpoint
+                                                           and user_quant in (None, "gptq", "auto_gptq"))
 
         if is_valid_user_quant:
             instance = cls(weight_bits=4, group_size=128, desc_act=True, lm_head_quantized=False)
