@@ -1322,6 +1322,9 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         return hidden_states
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None, is_multimodal=False):
+        if multimodal_embeddings is None:
+            # Text-only models do not accept the multimodal kwargs.
+            return self.model.embed_input_ids(input_ids)
         return self.model.embed_input_ids(input_ids=input_ids,
                                           multimodal_embeddings=multimodal_embeddings,
                                           is_multimodal=is_multimodal)
