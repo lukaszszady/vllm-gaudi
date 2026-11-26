@@ -309,7 +309,7 @@ class HpuPlatform(Platform):
         from vllm.config import CompilationMode, CUDAGraphMode
         compilation_config = vllm_config.compilation_config
         # Activate custom ops for v1.
-        compilation_config.custom_ops = ["all"]
+        compilation_config.custom_ops = ["all", *(op for op in compilation_config.custom_ops if op.startswith("-"))]
         compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compilation_config.cudagraph_capture_sizes = []
 

@@ -670,10 +670,9 @@ def test_unsupported_engine_features_fail_at_startup(feature, enable):
     with pytest.raises(ValueError, match=f"HPU does not support: {re.escape(feature)}\\."):
         _run_check_and_update_config(vllm_config)
 
-
-
     def test_hisparse_is_rejected_by_upstream_platform_check():
         assert HpuPlatform.get_hisparse_backend_cls() is None
+
 
 @pytest.mark.parametrize(
     "speculative_config",
