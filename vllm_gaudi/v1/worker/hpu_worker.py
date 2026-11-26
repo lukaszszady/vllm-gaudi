@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A GPU worker class."""
+from collections.abc import Iterable
 import contextlib
 import gc
 import itertools
@@ -391,6 +392,19 @@ class HPUWorker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner = HPUModelRunner(vllm_config=self.vllm_config, is_driver_worker=self.is_driver_worker)
         self.init_profiler()
+
+    def reload_weights(
+        self,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+        weights_path: str | None = None,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        with set_current_vllm_config(self.vllm_config):
+            self.model_runner.reload_weights(
+                weights_iterator=weights_iterator,
+                weights_path=weights_path,
+                is_checkpoint_format=is_checkpoint_format,
+            )
 
     def shutdown(self):
         self._model_runner_stash.clear()

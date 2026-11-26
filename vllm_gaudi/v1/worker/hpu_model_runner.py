@@ -13,6 +13,7 @@ import time
 from contextlib import suppress
 from tqdm import tqdm
 from dataclasses import dataclass, field, fields, replace
+from collections.abc import Iterable
 from typing import (TYPE_CHECKING, Any, Callable, NamedTuple, Optional, TypeAlias, Union, cast)
 if os.getenv("QUANT_CONFIG", None) is not None:
     from neural_compressor.torch.quantization import finalize_calibration
@@ -58,7 +59,7 @@ from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.vocab_parallel_embedding import (VocabParallelEmbedding)
-from vllm.model_executor.model_loader import get_model, get_model_loader
+from vllm.model_executor.model_loader import get_model
 from vllm.platforms import current_platform
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (BatchedTensorInputs, MultiModalKwargsItem)
@@ -8609,13 +8610,18 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
-    def reload_weights(self) -> None:
-        assert getattr(self, "model", None) is not None, \
-            "Cannot reload weights before model is loaded."
-        model_loader = get_model_loader(self.load_config)
-        logger.info("Reloading weights inplace...")
-        model_loader.load_weights(self.model, model_config=self.model_config)
+    def reload_weights(
+        self,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+        weights_path: str | None = None,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        assert getattr(self, "model", None) is not None, "Cannot reload weights before model is loaded."
+        from vllm.model_executor.model_loader.reload.inplace import reload_weights
+        with self.uncompiled_model() as model:
+            reload_weights(self.vllm_config, model, weights_iterator, weights_path, is_checkpoint_format)
         torch.hpu.synchronize()
+        self.reset_encoder_cache()
 
     def _record_draft_token_ids(self, draft_token_ids: Optional[Union[list[list[int]], torch.Tensor]]) -> None:
         """Keep a step's drafts for take_draft_token_ids and, with async scheduling, for the next step's inputs.
