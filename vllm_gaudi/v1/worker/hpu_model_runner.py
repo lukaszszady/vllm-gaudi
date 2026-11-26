@@ -92,6 +92,7 @@ from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsLists, LogprobsT
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm_gaudi.v1._vendored.sample.metadata import SamplingMetadata
 from vllm.v1.worker.utils import bind_kv_cache, add_kv_sharing_layers_to_kv_cache_groups
+from vllm.model_executor.offloader.base import create_offloader, set_offloader, get_offloader
 from vllm.v1.utils import CpuGpuBuffer
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch, CachedRequestState, splice_placeholders
 from vllm.distributed.parallel_state import get_pp_group, get_dp_group
@@ -6192,6 +6193,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     @with_thread_limits()
     def load_model(self) -> None:
+        set_offloader(create_offloader(self.vllm_config.offload_config))
         import habana_frameworks.torch.core as htcore
         if self._is_quant_with_inc() or self.model_config.quantization == 'fp8':
             htcore.hpu_inference_set_env()
@@ -6222,6 +6224,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_device_memory
         logger.info("Loading model weights took %.4f GB", self.model_memory_usage / float(2**30))
+        get_offloader().post_init()
         self._mamba_spec_decode = self._uses_mamba2_spec_decode()
 
         if self._is_quant_with_inc():
@@ -8509,10 +8512,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                if self._mamba_spec_decode and is_mamba_group(g))
 
         if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [self.cache_config.block_size]:
-            assert self.vllm_config.offload_config.uva.cpu_offload_gb == 0, (
-                "Cannot re-initialize the input batch when CPU weight "
-                "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
-                "for more details.")
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,

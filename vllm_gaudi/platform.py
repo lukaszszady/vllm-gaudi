@@ -332,9 +332,11 @@ class HpuPlatform(Platform):
                 "enable_prefix_caching=%s", cache_config.block_size, getattr(cache_config, "mamba_block_size", None),
                 getattr(cache_config, "mamba_cache_mode", None), cache_config.enable_prefix_caching)
 
-        if compilation_config.mode != CompilationMode.NONE:
-            logger.info("[HPU] Forcing CompilationMode.NONE "
-                        "compilation mode")
+        if compilation_config.mode != CompilationMode.NONE or vllm_config.offload_config.uva.cpu_offload_gb > 0:
+            if compilation_config.mode != CompilationMode.NONE:
+                logger.info("[HPU] Forcing CompilationMode.NONE compilation mode")
+            elif vllm_config.offload_config.uva.cpu_offload_gb > 0:
+                logger.info("[HPU] Forcing CompilationMode.NONE due to CPU weight offloading")
             compilation_config.mode = CompilationMode.NONE
 
         # Force CPU loading for INC quantization to prevent OOM during weight loading.
