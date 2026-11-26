@@ -246,13 +246,25 @@ class HPUMLAAttention(MLAAttention):
                 set_default_quant_scales(self, register_buffer=False)
         else:
             # Non-FP8 kv_b_proj: use upstream logic as before.
+            # On reload, upstream rebinds W_UV/W_UK_T to strided views of a
+            # temporary; keep the storage of the existing contiguous weights.
+            prev_storage = {}
+            for name in ("W_UV", "W_UK_T"):
+                param = getattr(self, name, None)
+                if isinstance(param, torch.nn.Parameter) and not param.is_meta and param.is_contiguous():
+                    prev_storage[name] = param.data
             MLAAttention.process_weights_after_loading(self)
             # Since vllm#48251 base registers W_UV/W_UK_T as nn.Parameter (via
             # replace_parameter), so a plain tensor reassignment raises
             # TypeError. Route the contiguous() update through replace_parameter
             # to preserve the registration.
-            replace_parameter(self, "W_UV", self.W_UV.contiguous())
-            replace_parameter(self, "W_UK_T", self.W_UK_T.contiguous())
+            for name in ("W_UV", "W_UK_T"):
+                weight = getattr(self, name).contiguous()
+                prev = prev_storage.get(name)
+                if (prev is not None and prev.shape == weight.shape and prev.dtype == weight.dtype
+                        and prev.device == weight.device):
+                    weight = prev.copy_(weight)
+                replace_parameter(self, name, weight)
 
     # NOTE(Chendi): PR25184 using output buffer as default, which can't be used in HPU Graph,
     # so we override and always return a new tensor
