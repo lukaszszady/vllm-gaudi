@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from collections.abc import Iterable
 import collections
 from collections.abc import Mapping
 import copy
@@ -58,7 +59,7 @@ from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.vocab_parallel_embedding import (VocabParallelEmbedding)
-from vllm.model_executor.model_loader import get_model, get_model_loader
+from vllm.model_executor.model_loader import get_model
 from vllm.platforms import current_platform
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (BatchedTensorInputs, MultiModalKwargsItem)
@@ -8572,13 +8573,26 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
-    def reload_weights(self) -> None:
-        assert getattr(self, "model", None) is not None, \
-            "Cannot reload weights before model is loaded."
-        model_loader = get_model_loader(self.load_config)
-        logger.info("Reloading weights inplace...")
-        model_loader.load_weights(self.model, model_config=self.model_config)
+    def reload_weights(
+        self,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+        weights_path: str | None = None,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        """Reload weights in place."""
+        from vllm.model_executor.model_loader.reload.inplace import reload_weights
+        reload_weights(self.vllm_config, self.get_model(), weights_iterator, weights_path, is_checkpoint_format)
         torch.hpu.synchronize()
+        # Replicate cache resets if implemented on HPU
+        if hasattr(self, "reset_encoder_cache"):
+            self.reset_encoder_cache()
+        if hasattr(self, "reset_mm_cache"):
+            self.reset_mm_cache()
+        if hasattr(self, "on_target_weights_replaced"):
+            self.on_target_weights_replaced()
+        # Keep existing no-arg callers working: the signature above allows it.
+        # Note: The above supports weights_iterator=None, weights_path=None etc.
+        # To strictly support no-arg call, the defaults are provided.
 
     def _record_draft_token_ids(self, draft_token_ids: Optional[Union[list[list[int]], torch.Tensor]]) -> None:
         """Keep a step's drafts for take_draft_token_ids and, with async scheduling, for the next step's inputs.
