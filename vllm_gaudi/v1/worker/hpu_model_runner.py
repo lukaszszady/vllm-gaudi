@@ -8663,6 +8663,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         from vllm.model_executor.model_loader.reload.inplace import reload_weights
         with self.uncompiled_model() as model:
             reload_weights(self.vllm_config, model, weights_iterator, weights_path, is_checkpoint_format)
+            # Reload copies processed weights back into the original Parameters, but
+            # process_weights_after_loading rebuilt moe_op with views of temporaries.
+            _rebind_moe_expert_weights(model)
         torch.hpu.synchronize()
         self.reset_encoder_cache()
 
