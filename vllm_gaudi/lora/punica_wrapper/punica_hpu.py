@@ -19,6 +19,8 @@ class PunicaWrapperHPU(PunicaWrapperBase):
         PunicaWrapperBase.__init__(self, 3 * max_num_batched_tokens, max_batches, device)
         # Mask for multimodal tower/connector wrappers; None uses the global text mask.
         self.lora_mask: Optional[torch.Tensor] = None
+        # Run with no adapter active, masking whatever rows the layer sees.
+        self.zero_lora_mask = False
 
     def _get_mask(self) -> torch.Tensor:
         return LoraMask.getLoraMask() if self.lora_mask is None else self.lora_mask
@@ -47,6 +49,10 @@ class PunicaWrapperHPU(PunicaWrapperBase):
         offset_left = 0
 
         for slice_idx in range(len(output_slices)):
+            mask = self.lora_mask
+            if self.zero_lora_mask:
+                a = lora_a_stacked[slice_idx]
+                mask = x.new_zeros(x.shape[0], a.shape[0] * a.shape[2])
             dispatch_bgmv_linear(
                 y[:, offset_left:offset_left + output_slices[slice_idx]],
                 x,
@@ -54,7 +60,7 @@ class PunicaWrapperHPU(PunicaWrapperBase):
                 lora_b_stacked[slice_idx],
                 0,
                 scale,
-                self.lora_mask,
+                mask,
             )
             offset_left += output_slices[slice_idx]
 

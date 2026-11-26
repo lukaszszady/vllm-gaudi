@@ -381,6 +381,7 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
         vision_buckets,
+        lora_hook=None,
     ) -> torch.Tensor:
         seq_len, _ = pixel_values.size()
         offset = 0
@@ -435,6 +436,8 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
                 padding_attn_mask_window = create_block_diagonal_attention_mask(cu_window_seqlens)
 
             # static part
+            if lora_hook is not None:
+                lora_hook(img_idx, "tower", max(int(bucket_size), int(curr_img_size)))
             htcore.mark_step()
             hidden_states = self.forward(hidden_states,
                                          rotary_pos_emb_cos=rot_pos_emb_cos,
@@ -448,6 +451,8 @@ class Qwen2_5_VisionTransformerStaticShape(Qwen2_5_VisionTransformer):
             hidden_states = hidden_states[:curr_img_size, :, :]
 
             # after attention
+            if lora_hook is not None:
+                lora_hook(img_idx, "connector", int(curr_img_size) // self.spatial_merge_unit)
             image_embeds = self.post_attn(hidden_states, window_index)
             results += [image_embeds]
         results_cat = torch.concat(results)
@@ -497,6 +502,8 @@ class HPUQwen2_5_VLMultiModalProcessor(Qwen2_5_VLMultiModalProcessor):
     dummy_inputs=Qwen2_5_VLDummyInputsBuilder,
 )
 class HpuQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
+    # Set by the runner while tower/connector LoRA is active; sizes masks per padded image.
+    mm_lora_item_hook = None
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -584,6 +591,7 @@ class HpuQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 pixel_values,
                 grid_thw=grid_thw,
                 vision_buckets=self.vision_bucket_manager,
+                lora_hook=self.mm_lora_item_hook,
             )
 
         # Split concatenated embeddings for each image item.
@@ -605,6 +613,7 @@ class HpuQwen2_5_VLForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 pixel_values_videos,
                 grid_thw=grid_thw,
                 vision_buckets=self.vision_bucket_manager,
+                lora_hook=self.mm_lora_item_hook,
             )
 
         # Split concatenated embeddings for each video item.

@@ -3038,12 +3038,20 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.encoder_timing_registry.clear()
             return stats
 
-    def _set_mm_encoder_lora_masks(self, tower_mask, connector_mask) -> None:
+    def _set_mm_encoder_lora_masks(self, tower_mask, connector_mask, zero: bool = False) -> None:
         adapter_manager = self.lora_manager._adapter_manager
         mm_mapping = adapter_manager.mm_mapping
         for prefixes, mask in ((mm_mapping.tower_model, tower_mask), (mm_mapping.connector, connector_mask)):
             for prefix in prefixes:
-                adapter_manager.punica_wrapper_mapping[prefix].lora_mask = mask
+                wrapper = adapter_manager.punica_wrapper_mapping.get(prefix)
+                if wrapper is not None:
+                    wrapper.lora_mask = mask
+                    wrapper.zero_lora_mask = zero
+
+    def _clear_mm_encoder_lora(self) -> None:
+        self._set_mm_encoder_lora_masks(None, None)
+        if hasattr(self.get_model(), "mm_lora_item_hook"):
+            self.get_model().mm_lora_item_hook = None
 
     def _set_mm_encoder_lora(self, items: list[tuple[Optional[LoRARequest], Any]]) -> None:
         """Activate LoRAs and build per-token masks for one tower/connector batch."""
@@ -3076,6 +3084,19 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 lora_requests, LoRAMapping(index_mapping, lora_ids, is_prefill=False, type=mapping_type))
 
         activate(tower_counts, LoRAMappingType.TOWER)
+        if hasattr(model, "mm_lora_item_hook"):
+            # The model pads each item itself, so it requests masks per item at the padded row count.
+            connector_counts = [c for _, c in counts]
+            if has_connector:
+                activate(connector_counts, LoRAMappingType.CONNECTOR)
+
+            def item_hook(idx, stage, rows):
+                mask = build([lora_ids[idx]], [rows])
+                self._set_mm_encoder_lora_masks(mask if stage == "tower" else None,
+                                                mask if stage == "connector" else None)
+
+            model.mm_lora_item_hook = item_hook
+            return
         connector_mask = None
         if has_connector:
             connector_counts = [c for _, c in counts]
@@ -3177,7 +3198,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     item_start += num_items
                 curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
                 if use_mm_lora:
-                    self._set_mm_encoder_lora_masks(None, None)
+                    self._clear_mm_encoder_lora()
 
                 sanity_check_mm_encoder_outputs(
                     curr_group_outputs,
@@ -7704,6 +7725,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         vision_bucket_manager = self.get_model().vision_bucket_manager
         is_batch_based = vision_bucket_manager.is_batch_based
         mm_config = self.model_config.get_multimodal_config()
+        use_mm_lora = bool(self.lora_config) and self.lora_manager.supports_tower_connector_lora()
 
         is_image_warmup = (mm_config is not None and mm_config.limit_per_prompt.get("image") is not None
                            and "image" in self.mm_budget.mm_limits and self.mm_budget.mm_limits['image'] != 0)
@@ -7820,9 +7842,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                        width=width,
                                                                        height=height,
                                                                        count_override=count)
+                    if use_mm_lora:
+                        self._set_mm_encoder_lora_masks(None, None, zero=True)
                     dummy_encoder_outputs = \
                         self.model.embed_multimodal(
                         **batched_dummy_mm_inputs)
+                    if use_mm_lora:
+                        self._clear_mm_encoder_lora()
                     if is_batch_based:
                         sanity_check_mm_encoder_outputs(
                             dummy_encoder_outputs,
