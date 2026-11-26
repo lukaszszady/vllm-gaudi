@@ -700,3 +700,26 @@ def test_beam_search_step_with_allowlist_is_refused(allowed_token_ids, refused):
         return
     with pytest.raises(VLLMValidationError, match="logprob_token_ids is not supported on HPU"):
         HpuPlatform.validate_request(None, params)
+
+def test_make_synced_weight_loader_preserves_self():
+    """Verify that a bound method wrapped in make_synced_weight_loader keeps its __self__."""
+    class MockLoader:
+        def __init__(self):
+            self.called = False
+        def load(self, param):
+            self.called = True
+            return 1
+    
+    loader_inst = MockLoader()
+    original = loader_inst.load
+    wrapped = HpuPlatform.make_synced_weight_loader(HpuPlatform, original)
+    
+    # Check bound method property
+    assert hasattr(wrapped, "__self__")
+    assert wrapped.__self__ is loader_inst
+    
+    # Check functionality
+    result = wrapped(None)
+    assert result == 1
+    assert loader_inst.called is True
+
