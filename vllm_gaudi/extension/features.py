@@ -126,7 +126,7 @@ def get_features():
         Value(
             'flatten_input',
             Any(ModelType('qwen3_moe'), ModelType('qwen3_5'), ModelType('qwen3_5_text'), ModelType('granitemoe'),
-                ModelType('glm4_moe'), ModelType('gemma4'), ModelType('nemotron_h'))),
+                ModelType('glm4_moe'), ModelType('gemma4'), ModelType('nemotron_h'), ModelType('internlm2'))),
         Value('high_level_profiler_enabled', False, env_var='VLLM_PROFILER_ENABLED', env_var_type=boolean),
         # Async scheduling together with speculative decoding (one draft token,
         # EAGLE-style drafters). On by default for Nemotron-H, where it is

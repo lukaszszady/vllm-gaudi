@@ -5504,7 +5504,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
                 lora_mask, lora_logits_mask = self._configure_lora(input_ids.view(1, -1), self.requests, [req_id], True)
                 if lora_mask is not None:
-                    model_kwargs["lora_mask"] = lora_mask
+                    LoraMask.setLoraMask(lora_mask)
 
                 htorch.core.mark_step()
                 with set_forward_context(attn_metadata, self.vllm_config):
@@ -5774,6 +5774,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata, logits_indices,
                       logits_requests) in enumerate(zip(*shallow_tuple(prefill_data))):
 
+                lora_mask, lora_logits_mask = self._configure_lora(token_ids, self.requests, req_id, True)
+                if lora_mask is not None:
+                    # embed_input_ids below runs outside the model adapter.
+                    LoraMask.setLoraMask(lora_mask)
+
                 # Prepare multimodal inputs if any
                 inputs_embeds, model_mm_kwargs = self._get_model_mm_inputs(
                     token_ids,
@@ -5781,8 +5786,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     scheduler_output,
                     req_id,
                 )
-
-                lora_mask, lora_logits_mask = self._configure_lora(token_ids, self.requests, req_id, True)
 
                 self.event_start = self.profiler.get_timestamp_us()
                 self.profiler.start("internal", "prefill")
