@@ -401,11 +401,34 @@ class HabanaMemoryProfiler:
 
 
 def setup_profiler(warmup, active):
+    # habana_frameworks replaces torch.profiler.profile with a wrapper that
+    # builds the inner profiler with use_cuda (TypeError on image 1.24.3-256),
+    # so build the original class instead; fall back to the package attribute.
+    profile_cls = getattr(torch.profiler, "profiler", None)
+    profile_cls = getattr(profile_cls, "profile", None) or torch.profiler.profile
+    out_dir = os.environ.get('VLLM_TORCH_PROFILER_DIR_DIAG', '/root/results/hpu_trace')
+    os.makedirs(out_dir, exist_ok=True)
     schedule = torch.profiler.schedule(wait=0, warmup=warmup, active=active, repeat=1)
     activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
-    profiler = torch.profiler.profile(schedule=schedule,
-                                      activities=activities,
-                                      on_trace_ready=torch.profiler.tensorboard_trace_handler('.', use_gzip=True),
-                                      record_shapes=False,
-                                      with_stack=True)
-    return profiler
+
+    def on_trace_ready(prof):
+        # Only the inner profiler takes a single path arg for export; the
+        # Habana wrapper/profiler export_chrome_trace rejects the extra
+        # metadata argument, so export_chrome_trace/tensorboard_trace_handler
+        # are unusable here.
+        file_path = os.path.join(out_dir, f"trace_{os.getpid()}_{int(time.time())}.json")
+        prof.profiler.export_chrome_trace(file_path)
+        try:
+            with open(file_path, "rb") as f_in, gzip.open(file_path + ".gz", "wb") as f_out:
+                f_out.writelines(f_in)
+            os.remove(file_path)
+            file_path = file_path + ".gz"
+        except Exception:
+            logger().warning("Failed to gzip profiler trace, keeping %s", file_path)
+        logger().info("Profiler trace written to %s", file_path)
+
+    return profile_cls(schedule=schedule,
+                       activities=activities,
+                       on_trace_ready=on_trace_ready,
+                       record_shapes=False,
+                       with_stack=False)
