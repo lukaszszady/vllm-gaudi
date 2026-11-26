@@ -701,25 +701,73 @@ def test_beam_search_step_with_allowlist_is_refused(allowed_token_ids, refused):
     with pytest.raises(VLLMValidationError, match="logprob_token_ids is not supported on HPU"):
         HpuPlatform.validate_request(None, params)
 
+
+def test_make_synced_weight_loader_release_layer():
+    """Verify that the wrapped loader can be sanitized to release the layer."""
+    import gc
+    import weakref
+    import types
+
+    class _Layer:
+
+        def load(self, param):
+            return 1
+
+    layer = _Layer()
+
+    # Mock a tensor object that has a __dict__
+    class MockTensor:
+
+        def __init__(self):
+            self.__dict__ = {}
+
+    tensor = MockTensor()
+    wrapped = HpuPlatform.make_synced_weight_loader(layer.load)
+    tensor.weight_loader = wrapped
+
+    # Setup weakref to track the layer
+    wr = weakref.ref(layer)
+
+    # Apply sanitation (mocked version of vllm.model_executor.model_loader.reload.sanitize.sanitize_layer_refs)
+    def sanitize(t, layer):
+        for k, v in t.__dict__.items():
+            if isinstance(v, types.MethodType) and v.__selayerf__ is layer:
+                t.__dict__[k] = v.__func__.__get__(object())
+        return t
+
+    sanitize(tensor, layer)
+    del layer
+    gc.collect()
+
+    assert wr() is None, "Layer should have been released after sanitation"
+
+
 def test_make_synced_weight_loader_preserves_self():
     """Verify that a bound method wrapped in make_synced_weight_loader keeps its __self__."""
-    class MockLoader:
+
+    class _Layer:
+
         def __init__(self):
             self.called = False
+
         def load(self, param):
             self.called = True
             return 1
-    
-    loader_inst = MockLoader()
-    original = loader_inst.load
-    wrapped = HpuPlatform.make_synced_weight_loader(HpuPlatform, original)
-    
-    # Check bound method property
-    assert hasattr(wrapped, "__self__")
-    assert wrapped.__self__ is loader_inst
-    
-    # Check functionality
+
+    layer = _Layer()
+    original = layer.load
+    wrapped = HpuPlatform.make_synced_weight_loader(original)
+
+    assert hasattr(wrapped, "__self__"), "Wrapped loader should have __self__"
+    assert wrapped.__self__ is layer, "Wrapped loader must be bound to the same layer instance"
+
     result = wrapped(None)
     assert result == 1
-    assert loader_inst.called is True
+    assert layer.called is True
 
+    def plain_loader(param):
+        return 2
+
+    wrapped_plain = HpuPlatform.make_synced_weight_loader(plain_loader)
+    assert not hasattr(wrapped_plain, "__self__"), "Plain function wrapper should not have __self__"
+    assert wrapped_plain(None) == 2

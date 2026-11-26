@@ -1,7 +1,7 @@
-import types
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import types
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -793,14 +793,23 @@ class HpuPlatform(Platform):
         """
         Wrap the original weight loader to make it synced.
         """
-        def _synced_weight_loader(self, param, *args, **kwargs):
+        if isinstance(original_weight_loader, types.MethodType):
+            func = original_weight_loader.__func__
+
+            def _synced_method(self, param, *args, **kwargs):
+                out = func(self, param, *args, **kwargs)
+                torch.hpu.synchronize()
+                return out
+
+            return types.MethodType(_synced_method, original_weight_loader.__self__)
+
+        def _synced_weight_loader(param, *args, **kwargs):
             out = original_weight_loader(param, *args, **kwargs)
             torch.hpu.synchronize()
             return out
-        
-        if isinstance(original_weight_loader, types.MethodType):
-            return types.MethodType(_synced_weight_loader, original_weight_loader.__self__)
+
         return _synced_weight_loader
+
     @classmethod
     def insert_blocks_to_device(
         cls,
