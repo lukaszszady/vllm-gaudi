@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.model_loader import ShardedStateLoader, TensorizerLoader
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig, KVCacheLayerConfig, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
@@ -48,6 +49,7 @@ logger = init_logger()
 _QUANT_CONFIG_UNCHANGED = object()
 
 if TYPE_CHECKING:
+    from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
@@ -425,6 +427,26 @@ class HPUWorker(WorkerBase):
 
     def list_loras(self) -> set[int]:
         return self.model_runner.list_loras()  # type: ignore[union-attr]
+
+    def save_sharded_state(
+        self,
+        path: str,
+        pattern: str | None = None,
+        max_size: int | None = None,
+    ) -> None:
+        ShardedStateLoader.save_model(
+            self.model_runner.get_model(),  # type: ignore[union-attr]
+            path,
+            pattern=pattern,
+            max_size=max_size,
+        )
+
+    def save_tensorized_model(self, tensorizer_config: "TensorizerConfig") -> None:
+        TensorizerLoader.save_model(
+            self.get_model(),
+            tensorizer_config=tensorizer_config,
+            model_config=self.model_config,
+        )
 
     def unload_model(self) -> dict[str, float | None]:
         """Stash the current HPUModelRunner (weights already on CPU from sleep)
