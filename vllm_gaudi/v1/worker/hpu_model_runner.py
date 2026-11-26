@@ -4758,7 +4758,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                pd_info.decode_req_ids, False)
             self.event_start = self.profiler.get_timestamp_us()
             self.profiler.start("internal", "decode")
-            htorch.core.mark_step()
+            # mark_step is a step separator for lazy-collectives (graphs); redundant when compiled.
+            if htorch.utils.internal.is_lazy():
+                htorch.core.mark_step()
             non_flattened_hidden_states, aux_hidden_states, \
                 sample_hidden_states, logits_device = \
                     self._execute_model_generic(
@@ -4770,7 +4772,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 lora_logits_mask,
                 lora_mask,
                 warmup_mode=warmup_mode)
-            htorch.core.mark_step()
+            if htorch.utils.internal.is_lazy():
+                htorch.core.mark_step()
 
             if self.use_structured_output:
                 logits_decode.append(logits_device[:num_decodes])
