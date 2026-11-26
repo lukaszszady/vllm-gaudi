@@ -36,8 +36,6 @@ from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, se
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig, KVCacheLayerConfig, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
-from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
-from vllm.v1.core.kv_cache_planning import get_kv_cache_groups_from_builder, _pool_bytes_per_block_from_builder
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.host_headroom import host_identity, host_memory_headroom_bytes
@@ -767,23 +765,31 @@ class HPUWorker(WorkerBase):
                     format_bytes(real_attn), format_bytes(real_mamba))
                 available = adjusted
 
-        if has_attn and has_standard_mamba:
+        if (has_attn and has_standard_mamba
+                and self.model_runner.use_naive_mamba_cache_sharing  # type: ignore[union-attr]
+                and not self.model_runner.use_hybrid_cache):  # type: ignore[union-attr]
             # Standard Mamba + ATN hybrids (e.g. Granite, Jamba): the
             # naive_mamba_cache_sharing path allocates an independent tensor
             # per layer, while the engine sizes blocks assuming the layers of
             # different groups share tensors. Scale the budget by the ratio of
             # the engine's bytes per block to the bytes this worker allocates.
+            from vllm.v1.core.kv_cache_config_builder import get_kv_cache_config_builder
+            from vllm.v1.core.kv_cache_planning import (get_kv_cache_groups_from_builder,
+                                                        _pool_bytes_per_block_from_builder)
             builder = get_kv_cache_config_builder(self.vllm_config)
             layer_configs = self.model_runner.get_kv_cache_layer_configs()  # type: ignore[union-attr]
             kv_cache_groups = get_kv_cache_groups_from_builder(builder, self.vllm_config, layer_configs)
             engine_bytes_per_block = _pool_bytes_per_block_from_builder(builder, self.vllm_config, kv_cache_groups)
             hpu_bytes_per_block = 0
-            for layer_spec in kv_cache_spec.values():
-                if isinstance(layer_spec, AttentionSpec):
-                    hpu_bytes_per_block += layer_spec.real_page_size_bytes
-                else:
-                    hpu_bytes_per_block += sum(
-                        math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(layer_spec.shapes, layer_spec.dtypes))
+            mamba_seen = set()
+            for group in kv_cache_groups:
+                for layer_pos, layer_spec in enumerate(group.kv_cache_specs.values()):
+                    if isinstance(layer_spec, AttentionSpec):
+                        hpu_bytes_per_block += layer_spec.real_page_size_bytes
+                    elif (layer_spec, layer_pos) not in mamba_seen:
+                        mamba_seen.add((layer_spec, layer_pos))
+                        hpu_bytes_per_block += sum(
+                            math.prod(sh) * get_dtype_size(dt) for sh, dt in zip(layer_spec.shapes, layer_spec.dtypes))
             if hpu_bytes_per_block > engine_bytes_per_block:
                 adjusted = int(available * engine_bytes_per_block / hpu_bytes_per_block)
                 logger.info(
