@@ -5,6 +5,7 @@ import copy
 import contextlib
 from copy import deepcopy
 import functools
+import inspect
 from functools import partial, wraps
 import itertools
 import math
@@ -1221,6 +1222,10 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
                         disable_tensor_cache=True)
 
         self.pooling_model = vllm_config.model_config.pooler_config is not None
+        forward_params = inspect.signature(self.model.forward).parameters
+        intermediate_param = forward_params.get('intermediate_tensors')
+        self.requires_intermediate_tensors = (intermediate_param is not None
+                                              and intermediate_param.default is inspect.Parameter.empty)
 
     def _get_rotary_embedding_module(self, model: torch.nn.Module):
         """
@@ -1307,6 +1312,8 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
                                  num_tokens=self.dummy_num_input_tokens,
                                  num_tokens_across_dp=self.dummy_num_tokens_across_dp_cpu), set_hpu_dp_metadata(
                                      self.vllm_config, num_real_tokens):
+            if self.requires_intermediate_tensors:
+                kwargs.setdefault('intermediate_tensors', None)
             hidden_states = self.model(*args, **kwargs)
             if self._rotary_prepare_cos_sin is not None:
                 self._reset_rotary_cos_sin()
@@ -5495,6 +5502,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 if token_type_ids is not None and len(token_type_ids) > 0:
                     model_kwargs["token_type_ids"] = token_type_ids
 
+                lora_mask, lora_logits_mask = self._configure_lora(input_ids.view(1, -1), self.requests, [req_id], True)
+                if lora_mask is not None:
+                    model_kwargs["lora_mask"] = lora_mask
+
                 htorch.core.mark_step()
                 with set_forward_context(attn_metadata, self.vllm_config):
                     hidden_states = self.model.forward(
@@ -5517,6 +5528,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 pooling_metadata.build_pooling_cursor(num_scheduled_tokens_np=num_scheduled_tokens_np,
                                                       seq_lens_cpu=seq_lens_cpu,
                                                       device=hidden_states.device)
+                if lora_logits_mask is not None:
+                    LoraMask.setLoraMask(lora_logits_mask)
                 pooled_output = self.model.pooler(hidden_states=flattened, pooling_metadata=pooling_metadata)
                 req_ids_list.append(req_id)
                 pooler_output_list.append(pooled_output[0])
