@@ -9,6 +9,7 @@ from functools import partial, wraps
 import itertools
 import math
 import os
+import threading
 import time
 from contextlib import suppress
 from tqdm import tqdm
@@ -98,7 +99,8 @@ from vllm.distributed.parallel_state import get_pp_group, get_dp_group
 from vllm.model_executor.models.interfaces import (supports_eagle3, supports_transcription)
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.v1.worker.utils import (AttentionGroup, prepare_kernel_block_sizes, sanity_check_mm_encoder_outputs)
+from vllm.v1.worker.utils import (AttentionGroup, EncoderTimingStats, prepare_kernel_block_sizes,
+                                  sanity_check_mm_encoder_outputs)
 from vllm_gaudi.v1._vendored.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID, RejectionSampler
 from vllm_gaudi.v1._vendored.spec_decode.eagle import EagleProposer
 from vllm_gaudi.v1._vendored.spec_decode.metadata import SpecDecodeMetadata
@@ -1504,6 +1506,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.enable_encoder_timing = bool(self.observability_config
+                                          and self.observability_config.enable_mm_processor_stats)
+        self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
+        self._encoder_timing_lock = threading.Lock()
         self.is_driver_worker = is_driver_worker
         # Replaced by an active connector once the KV caches exist (initialize_kv_cache).
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
@@ -2971,6 +2977,28 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return {}
 
+    @contextlib.contextmanager
+    def _timed_encoder_operation(self, request_ids: list[str]):
+        if not (self.enable_encoder_timing and request_ids):
+            yield
+            return
+        start_time = time.perf_counter()
+        try:
+            yield
+        finally:
+            per_request_time = (time.perf_counter() - start_time) / len(request_ids)
+            with self._encoder_timing_lock:
+                for req_id in request_ids:
+                    stats = self.encoder_timing_registry.setdefault(req_id, EncoderTimingStats())
+                    stats.encoder_forward_secs += per_request_time
+                    stats.num_encoder_calls += 1
+
+    def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:
+        with self._encoder_timing_lock:
+            stats = {req_id: s.to_dict() for req_id, s in self.encoder_timing_registry.items()}
+            self.encoder_timing_registry.clear()
+            return stats
+
     # source: vllm/v1/worker/gpu_model_runner.py at vLLM b46907cce0 (file removed upstream)
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput", req_ids: list[str]):
         # Batch the multi-modal inputs.
@@ -3040,27 +3068,29 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
-        for _, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
-                mm_kwargs,
-                device=self.device,
-                pin_memory=self.pin_memory,
-        ):
-            # Run the encoder.
-            # `curr_group_outputs` is either of the following:
-            # 1. A tensor of shape (num_items, feature_size, hidden_size)
-            # in case feature_size is fixed across all multimodal items.
-            # 2. A list or tuple (length: num_items) of tensors, each of shape
-            # (feature_size, hidden_size) in case the feature size is dynamic
-            # depending on the input multimodal items.
-            curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
+        encoder_req_ids = [r for r in req_ids if r in scheduler_output.scheduled_encoder_inputs]
+        with self._timed_encoder_operation(encoder_req_ids):
+            for _, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
+                    mm_kwargs,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+            ):
+                # Run the encoder.
+                # `curr_group_outputs` is either of the following:
+                # 1. A tensor of shape (num_items, feature_size, hidden_size)
+                # in case feature_size is fixed across all multimodal items.
+                # 2. A list or tuple (length: num_items) of tensors, each of shape
+                # (feature_size, hidden_size) in case the feature size is dynamic
+                # depending on the input multimodal items.
+                curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
 
-            sanity_check_mm_encoder_outputs(
-                curr_group_outputs,
-                expected_num_items=num_items,
-            )
+                sanity_check_mm_encoder_outputs(
+                    curr_group_outputs,
+                    expected_num_items=num_items,
+                )
 
-            for output in curr_group_outputs:
-                encoder_outputs.append(output)
+                for output in curr_group_outputs:
+                    encoder_outputs.append(output)
 
         # NOTE: Encoder outputs are cached by mm_hash and fetched in
         # _gather_mm_embeddings, so reordering is not necessary.

@@ -881,6 +881,9 @@ class HPUWorker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()  # type: ignore[union-attr]
 
+    def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:
+        return self.model_runner.get_encoder_timing_stats()  # type: ignore[union-attr]
+
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()  # type: ignore[union-attr]
 
