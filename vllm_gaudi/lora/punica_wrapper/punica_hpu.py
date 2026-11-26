@@ -17,6 +17,11 @@ class PunicaWrapperHPU(PunicaWrapperBase):
         # tensor size due to padding.
         # TODO: Need to check if this override is still required
         PunicaWrapperBase.__init__(self, 3 * max_num_batched_tokens, max_batches, device)
+        # Mask for multimodal tower/connector wrappers; None uses the global text mask.
+        self.lora_mask: Optional[torch.Tensor] = None
+
+    def _get_mask(self) -> torch.Tensor:
+        return LoraMask.getLoraMask() if self.lora_mask is None else self.lora_mask
 
     def add_lora_embedding(self,
                            y: torch.Tensor,
@@ -49,6 +54,7 @@ class PunicaWrapperHPU(PunicaWrapperBase):
                 lora_b_stacked[slice_idx],
                 0,
                 scale,
+                self.lora_mask,
             )
             offset_left += output_slices[slice_idx]
 
@@ -108,7 +114,7 @@ class PunicaWrapperHPU(PunicaWrapperBase):
         **kwargs,
     ) -> None:
         x = x.view(-1, x.shape[-1])
-        mask = LoraMask.getLoraMask()
+        mask = self._get_mask()
         for slice_idx in range(len(lora_a_stacked)):
             wa = lora_a_stacked[slice_idx][:, 0, :, :]
             num_loras = wa.shape[0]
@@ -131,7 +137,7 @@ class PunicaWrapperHPU(PunicaWrapperBase):
         **kwargs,
     ) -> None:
         y = y.view(-1, y.shape[-1])
-        mask = LoraMask.getLoraMask()
+        mask = self._get_mask()
         offset_left = offset_start
         for slice_idx in range(len(lora_b_stacked)):
             wb = lora_b_stacked[slice_idx][:, 0, :, :]

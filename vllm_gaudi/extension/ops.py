@@ -581,6 +581,7 @@ def dispatch_bgmv_linear(
     wb_t_all: torch.Tensor,
     layer_idx: int,
     scale: float,
+    mask: Optional[torch.Tensor] = None,
 ):
     """
     `wa_t_all` and `wb_t_all` contains all LoRA A and LoRA B weight matrices
@@ -595,7 +596,8 @@ def dispatch_bgmv_linear(
     """
 
     assert layer_idx == 0, f'layer_idx should be 0, but got {layer_idx}'
-    mask = LoraMask.getLoraMask()
+    if mask is None:
+        mask = LoraMask.getLoraMask()
 
     wa = wa_t_all[:, 0, :, :]
     wb = wb_t_all[:, 0, :, :].transpose(1, 2)

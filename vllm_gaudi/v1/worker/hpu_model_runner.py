@@ -114,7 +114,7 @@ from torch.nn.utils.rnn import pad_sequence
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.sampling_params import SamplingParams
 from vllm.pooling_params import PoolingParams
-from vllm.lora.layers import LoRAMapping
+from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor.models import supports_lora, supports_multimodal
@@ -3028,12 +3028,59 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.encoder_timing_registry.clear()
             return stats
 
+    def _set_mm_encoder_lora_masks(self, tower_mask, connector_mask) -> None:
+        adapter_manager = self.lora_manager._adapter_manager
+        mm_mapping = adapter_manager.mm_mapping
+        for prefixes, mask in ((mm_mapping.tower_model, tower_mask), (mm_mapping.connector, connector_mask)):
+            for prefix in prefixes:
+                adapter_manager.punica_wrapper_mapping[prefix].lora_mask = mask
+
+    def _set_mm_encoder_lora(self, items: list[tuple[Optional[LoRARequest], Any]]) -> None:
+        """Activate LoRAs and build per-token masks for one tower/connector batch."""
+        adapter_manager = self.lora_manager._adapter_manager
+        model = self.get_model()
+        lora_ids = [r.lora_int_id if r else 0 for r, _ in items]
+        counts = [
+            model.get_mm_lora_token_counts(modality=f.modality,
+                                           mm_kwargs=f.data,
+                                           num_mm_embeds=f.mm_position.get_num_embeds()) for _, f in items
+        ]
+        tower_counts = [t for t, _ in counts]
+        has_connector = bool(adapter_manager.mm_mapping.connector) and all(c is not None for _, c in counts)
+        lora_requests = {r for r, _ in items if r}
+
+        def build(row_counts):
+            rank = self.lora_config.max_lora_rank
+            mask = torch.zeros(sum(row_counts), self.lora_config.max_loras * rank, dtype=self.lora_config.lora_dtype)
+            row = 0
+            for lora_id, n in zip(lora_ids, row_counts):
+                if lora_id != 0:
+                    col = adapter_manager.lora_index_to_id.index(lora_id) * rank
+                    mask[row:row + n, col:col + rank] = 1
+                row += n
+            return mask.to(self.device)
+
+        def activate(row_counts, mapping_type):
+            index_mapping = [i for i, n in zip(lora_ids, row_counts) for _ in range(n)]
+            self.lora_manager.set_active_adapters(
+                lora_requests, LoRAMapping(index_mapping, lora_ids, is_prefill=False, type=mapping_type))
+
+        activate(tower_counts, LoRAMappingType.TOWER)
+        connector_mask = None
+        if has_connector:
+            connector_counts = [c for _, c in counts]
+            activate(connector_counts, LoRAMappingType.CONNECTOR)
+            connector_mask = build(connector_counts)
+        self._set_mm_encoder_lora_masks(build(tower_counts), connector_mask)
+
     # source: vllm/v1/worker/gpu_model_runner.py at vLLM b46907cce0 (file removed upstream)
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput", req_ids: list[str]):
         # Batch the multi-modal inputs.
         mm_kwargs = list[tuple[str, MultiModalKwargsItem]]()
         # List of tuple (mm_hash, pos_info)
         mm_hashes_pos = list[tuple[str, PlaceholderRange]]()
+        # (lora_request, feature) per item, aligned with mm_kwargs; used for tower/connector LoRA.
+        mm_lora_items = list[tuple[Optional[LoRARequest], Any]]()
         if self.is_kimi_k3:
             # The scheduler dedups identical mm_hash values within a step, so the payload of an item may be
             # held by another request of the step. Encode only items overlapping the tokens scheduled here.
@@ -3080,6 +3127,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         continue
                     mm_kwargs.append((mm_feature.modality, mm_feature.data))
                     mm_hashes_pos.append((mm_hash, mm_feature.mm_position))
+                    mm_lora_items.append((req_state.lora_request, mm_feature))
 
         if not mm_kwargs:
             return
@@ -3097,6 +3145,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
+        use_mm_lora = bool(self.lora_config) and self.lora_manager.supports_tower_connector_lora() \
+            and len(mm_lora_items) == len(mm_kwargs)
+        item_start = 0
         encoder_req_ids = [r for r in req_ids if r in scheduler_output.scheduled_encoder_inputs]
         with self._timed_encoder_operation(encoder_req_ids):
             for _, num_items, mm_kwargs_group in group_and_batch_mm_kwargs(
@@ -3111,7 +3162,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # 2. A list or tuple (length: num_items) of tensors, each of shape
                 # (feature_size, hidden_size) in case the feature size is dynamic
                 # depending on the input multimodal items.
+                if use_mm_lora:
+                    self._set_mm_encoder_lora(mm_lora_items[item_start:item_start + num_items])
+                    item_start += num_items
                 curr_group_outputs = self.model.embed_multimodal(**mm_kwargs_group)
+                if use_mm_lora:
+                    self._set_mm_encoder_lora_masks(None, None)
 
                 sanity_check_mm_encoder_outputs(
                     curr_group_outputs,
