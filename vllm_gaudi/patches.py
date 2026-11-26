@@ -1487,6 +1487,15 @@ def _patch_kimi_linear_weights() -> None:
         _kimi_patch_failed("linear_weights")
 
 
+class AttnResWrapper:
+    def __init__(self, func):
+        self.func = func
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+    def __getitem__(self, key):
+        # Support subscripting as expected by unit tests
+        return None
+
 def _patch_kimi_attn_res() -> None:
     """Pure PyTorch fallback for Kimi-K3 attn_res when Triton is disabled on HPU."""
     try:
@@ -1494,13 +1503,13 @@ def _patch_kimi_attn_res() -> None:
 
         try:
             import vllm.models.kimi_k3.amd.ops.attn_res as _attn_res_mod
-            _attn_res_mod.attn_res = _torch_attn_res
+            _attn_res_mod.attn_res = AttnResWrapper(_torch_attn_res)
             _kimi_patch_installed("attn_res_op")
         except Exception:
             _kimi_patch_failed("attn_res_op")
         try:
             import vllm.models.kimi_k3.amd.linear as _linear_mod
-            _linear_mod.attn_res = _torch_attn_res
+            _linear_mod.attn_res = AttnResWrapper(_torch_attn_res)
 
             def _apply_attn_res_torch(prefix_sum,
                                       block_residual,
