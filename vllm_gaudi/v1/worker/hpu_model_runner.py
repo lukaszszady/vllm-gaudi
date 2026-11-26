@@ -1194,8 +1194,6 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         from vllm.model_executor.models.transformers.base import Base as TransformersBase
         self.is_transformers_backend = isinstance(model, TransformersBase)
         self.flatten_positions = self.is_transformers_backend and not vllm_config.model_config.uses_mrope
-        self.is_transformers_backend = isinstance(model, TransformersBase)
-        self.flatten_positions = self.is_transformers_backend and not vllm_config.model_config.uses_mrope
         self.is_mm_optimized = is_mm_optimized(self.model)
         self.sliding_window = vllm_config.model_config.get_sliding_window()
         self.interleaved_sliding_window = (is_interleaved(vllm_config.model_config.hf_text_config)
@@ -1300,6 +1298,8 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
             hidden_states = kwargs.get('hidden_states')
             if hidden_states is not None and hidden_states.dim() > 2:
                 kwargs['hidden_states'] = hidden_states.reshape(-1, hidden_states.shape[-1])
+        # here num_tokens and num_tokens_across_dp are dummy values which are
+        # used to skip sync in forward_context between DP ranks
         with set_forward_context(attn_meta,
                                  self.vllm_config,
                                  num_tokens=self.dummy_num_input_tokens,
