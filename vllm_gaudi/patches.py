@@ -568,7 +568,9 @@ def _hpu_get_num_layers_by_block_type(self, parallel_config, block_type="attenti
         layer_types_value = getattr(self.hf_text_config, "layer_types", None)
         if layer_types_value is not None:
             if block_type == "attention":
-                return sum(t == "full_attention" for t in layer_types_value[start:end])
+                from vllm.config import model as model_config_module
+                attention_layer_types = getattr(model_config_module, "_ATTENTION_LAYER_TYPES", {"full_attention"})
+                return sum(t in attention_layer_types for t in layer_types_value[start:end])
             elif block_type == "linear_attention":
                 return sum(t == "linear_attention" for t in layer_types_value[start:end])
             else:
