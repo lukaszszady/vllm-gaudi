@@ -426,6 +426,7 @@ class HpuPlatform(Platform):
         for option in ("return_sampling_mask", "enable_trace_replay"):
             if getattr(model_config, option, False):
                 unsupported.append(option)
+        if getattr(vllm_config, "watermark_config", None) is not None:
             unsupported.append("watermarking")
         if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:
             unsupported.append("prefill context parallel")
