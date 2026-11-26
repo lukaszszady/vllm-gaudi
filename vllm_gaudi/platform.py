@@ -309,7 +309,7 @@ class HpuPlatform(Platform):
         from vllm.config import CompilationMode, CUDAGraphMode
         compilation_config = vllm_config.compilation_config
         # Activate custom ops for v1.
-        compilation_config.custom_ops = ["all"]
+        compilation_config.custom_ops = ["all", *(op for op in compilation_config.custom_ops if op.startswith("-"))]
         compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         compilation_config.cudagraph_capture_sizes = []
 
@@ -426,8 +426,6 @@ class HpuPlatform(Platform):
         for option in ("return_sampling_mask", "enable_trace_replay"):
             if getattr(model_config, option, False):
                 unsupported.append(option)
-        if getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None:
-            unsupported.append("HiSparse")
         if getattr(vllm_config, "watermark_config", None) is not None:
             unsupported.append("watermarking")
         if getattr(parallel_config, "prefill_context_parallel_size", 1) > 1:

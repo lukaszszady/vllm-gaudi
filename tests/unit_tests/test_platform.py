@@ -641,7 +641,6 @@ def _dflash_spec(architectures, layer_types=None):
 _UNSUPPORTED_ENGINE_FEATURES = [
     ("return_sampling_mask", lambda c: setattr(c.model_config, "return_sampling_mask", True)),
     ("enable_trace_replay", lambda c: setattr(c.model_config, "enable_trace_replay", True)),
-    ("HiSparse", lambda c: setattr(c, "attention_config", SimpleNamespace(hisparse_config=object()))),
     ("watermarking", lambda c: setattr(c, "watermark_config", object())),
     ("prefill context parallel", lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2)),
     ("custom speculative method 'mine'",
@@ -670,6 +669,10 @@ def test_unsupported_engine_features_fail_at_startup(feature, enable):
     enable(vllm_config)
     with pytest.raises(ValueError, match=f"HPU does not support: {re.escape(feature)}\\."):
         _run_check_and_update_config(vllm_config)
+
+
+def test_hisparse_is_rejected_by_upstream_platform_check():
+    assert HpuPlatform.get_hisparse_backend_cls() is None
 
 
 @pytest.mark.parametrize(
