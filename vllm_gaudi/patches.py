@@ -9,10 +9,6 @@ Currently:
   ``current_platform.empty_cache()`` (a no-op on HPU).  This also makes the
   ``cleanup_dist_env_and_memory`` patch resilient to import-order issues.
 
-* ``torch.accelerator.current_stream`` — on HPU it returns a plain
-  ``torch.Stream`` whose ``synchronize()``/``query()`` raise ``RuntimeError``
-  (used e.g. by EPLB).  Return ``torch.hpu.current_stream()`` instead.
-
 * ``torch._C._host_emptyCache`` — does not exist on HPU; we install a no-op
   stub to prevent ``AttributeError`` in ``cleanup_dist_env_and_memory``.
 
@@ -155,21 +151,6 @@ def _hpu_accelerator_empty_cache() -> None:
     empty_cache = current_platform.empty_cache
     if empty_cache is not None:
         empty_cache()
-
-
-_orig_accelerator_current_stream = torch.accelerator.current_stream
-
-
-def _hpu_accelerator_current_stream(device=None):
-    """HPU-safe replacement for ``torch.accelerator.current_stream()``.
-
-    Returns the same stream as an HPU stream object, which supports
-    ``synchronize()`` and ``query()``.
-    """
-    hpu = getattr(torch, "hpu", None)
-    if hpu is None or not hasattr(hpu, "current_stream"):
-        return _orig_accelerator_current_stream(device)
-    return hpu.current_stream(device)
 
 
 def _hpu_accelerator_empty_host_cache() -> None:
@@ -2010,9 +1991,6 @@ def apply() -> None:
     _silence_remote_tokenizer_notice()
     # --- torch.accelerator.empty_cache ---
     torch.accelerator.empty_cache = _hpu_accelerator_empty_cache
-
-    # --- torch.accelerator.current_stream ---
-    torch.accelerator.current_stream = _hpu_accelerator_current_stream
 
     # --- torch.accelerator.empty_host_cache ---
     if hasattr(torch.accelerator, "empty_host_cache"):
