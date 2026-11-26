@@ -14,6 +14,11 @@ except Exception as e:
 orig = getattr(torch.profiler.profiler, "profile", None)
 print("PROBE torch.profiler.profiler.profile", orig, orig is torch.profiler.profile)
 A = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.HPU]
+PA = torch._C._profiler.ProfilerActivity
+A_PU1 = [PA.CPU, PA.PrivateUse1]
+print("PROBE PA members", [m for m in dir(PA) if not m.startswith("_")])
+OUT = os.environ.get("PROBE_OUT", "/tmp/probe_out")
+os.makedirs(OUT, exist_ok=True)
 
 def work():
     x = torch.randn(1024, 1024, device="hpu", dtype=torch.bfloat16)
@@ -41,7 +46,7 @@ def attempt(name, factory, export):
         p.__enter__()
         work()
         p.__exit__(None, None, None)
-        path = "/root/results/probe_%s.json" % name
+        path = os.path.join(OUT, "probe_%s.json" % name)
         export(p, path)
         check(path)
     except Exception:
@@ -62,6 +67,8 @@ attempt("wrapped_inner", lambda: torch.profiler.profile(activities=A), exp_inner
 if orig is not None and orig is not torch.profiler.profile:
     attempt("orig", lambda: orig(activities=A), exp_default)
     attempt("orig_inner", lambda: orig(activities=A), exp_inner)
+    attempt("orig_pu1", lambda: orig(activities=A_PU1), exp_default)
+    attempt("orig_pu1_inner", lambda: orig(activities=A_PU1), exp_inner)
 try:
     from torch.autograd.profiler import profile as ap2
     attempt("autograd_kineto", lambda: ap2(use_kineto=True, use_device="hpu"), exp_default)
