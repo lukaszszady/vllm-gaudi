@@ -36,6 +36,7 @@ from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, se
 from vllm.v1.kv_cache_interface import (AttentionSpec, KVCacheConfig, KVCacheLayerConfig, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
+from vllm.model_executor.offloader.base import set_offloader
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
 from vllm_gaudi.v1.worker.host_headroom import host_identity, host_memory_headroom_bytes
@@ -407,6 +408,7 @@ class HPUWorker(WorkerBase):
             )
 
     def shutdown(self):
+        set_offloader(None)
         self._model_runner_stash.clear()
         self._model_runner_state_stash.clear()
         if _process_is_exiting():
