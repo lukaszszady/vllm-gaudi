@@ -309,6 +309,18 @@ class HPUWorker(WorkerBase):
         # unload_model().
         self._loaded_model_ref: Any = None
 
+    def reload_weights(
+        self,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+        weights_path: str | None = None,
+        is_checkpoint_format: bool = True,
+    ) -> None:
+        self.model_runner.reload_weights(
+            weights_iterator=weights_iterator,
+            weights_path=weights_path,
+            is_checkpoint_format=is_checkpoint_format,
+        )
+
     def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config

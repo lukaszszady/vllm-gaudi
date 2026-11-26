@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 # SPDX-License-Identifier: Apache-2.0
 import collections
 from collections.abc import Mapping
@@ -8572,14 +8573,24 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             new_config = update_config(config, config_overrides)
             setattr(self, config_name, new_config)
 
-    def reload_weights(self) -> None:
+    def reload_weights(
+        self,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]] | None = None,
+        weights_path: str | None = None,
+        is_checkpoint_format: bool = True,
+    ) -> None:
         assert getattr(self, "model", None) is not None, \
             "Cannot reload weights before model is loaded."
         model_loader = get_model_loader(self.load_config)
         logger.info("Reloading weights inplace...")
-        model_loader.load_weights(self.model, model_config=self.model_config)
+        model_loader.load_weights(
+            self.model, 
+            model_config=self.model_config, 
+            weights_iterator=weights_iterator, 
+            weights_path=weights_path, 
+            is_checkpoint_format=is_checkpoint_format
+        )
         torch.hpu.synchronize()
-
     def _record_draft_token_ids(self, draft_token_ids: Optional[Union[list[list[int]], torch.Tensor]]) -> None:
         """Keep a step's drafts for take_draft_token_ids and, with async scheduling, for the next step's inputs.
 
