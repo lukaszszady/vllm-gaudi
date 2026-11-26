@@ -2977,17 +2977,23 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         return {}
 
+    @staticmethod
+    def _sync_for_encoder_timing():
+        if htorch.utils.internal.is_lazy():
+            htorch.core.mark_step()
+        torch.hpu.synchronize()
+
     @contextlib.contextmanager
     def _timed_encoder_operation(self, request_ids: list[str]):
         if not (self.enable_encoder_timing and request_ids):
             yield
             return
-        torch.hpu.synchronize()
+        self._sync_for_encoder_timing()
         start_time = time.perf_counter()
         try:
             yield
         finally:
-            torch.hpu.synchronize()
+            self._sync_for_encoder_timing()
             per_request_time = (time.perf_counter() - start_time) / len(request_ids)
             with self._encoder_timing_lock:
                 for req_id in request_ids:
