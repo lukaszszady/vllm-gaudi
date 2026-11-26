@@ -3067,11 +3067,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         has_connector = bool(adapter_manager.mm_mapping.connector) and all(c is not None for _, c in counts)
         lora_requests = {r for r, _ in items if r}
 
-        def build(row_counts):
+        def build(ids, row_counts):
             rank = self.lora_config.max_lora_rank
             mask = torch.zeros(sum(row_counts), self.lora_config.max_loras * rank, dtype=self.lora_config.lora_dtype)
             row = 0
-            for lora_id, n in zip(lora_ids, row_counts):
+            for lora_id, n in zip(ids, row_counts):
                 if lora_id != 0:
                     col = adapter_manager.lora_index_to_id.index(lora_id) * rank
                     mask[row:row + n, col:col + rank] = 1
@@ -3101,8 +3101,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if has_connector:
             connector_counts = [c for _, c in counts]
             activate(connector_counts, LoRAMappingType.CONNECTOR)
-            connector_mask = build(connector_counts)
-        self._set_mm_encoder_lora_masks(build(tower_counts), connector_mask)
+            connector_mask = build(lora_ids, connector_counts)
+        self._set_mm_encoder_lora_masks(build(lora_ids, tower_counts), connector_mask)
 
     # source: vllm/v1/worker/gpu_model_runner.py at vLLM b46907cce0 (file removed upstream)
     def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput", req_ids: list[str]):
