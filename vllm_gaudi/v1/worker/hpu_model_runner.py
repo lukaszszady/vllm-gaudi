@@ -2982,10 +2982,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if not (self.enable_encoder_timing and request_ids):
             yield
             return
+        torch.hpu.synchronize()
         start_time = time.perf_counter()
         try:
             yield
         finally:
+            torch.hpu.synchronize()
             per_request_time = (time.perf_counter() - start_time) / len(request_ids)
             with self._encoder_timing_lock:
                 for req_id in request_ids:
