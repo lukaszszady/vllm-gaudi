@@ -283,6 +283,7 @@ class InputBatch:
         self.generators: dict[int, torch.Generator] = {}
 
         self.num_logprobs: dict[str, int] = {}
+        self.logprob_token_ids: dict[str, list[int]] = {}
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -422,6 +423,12 @@ class InputBatch:
 
             if sampling_params.logprobs is not None:
                 self.num_logprobs[req_id] = sampling_params.logprobs
+                if sampling_params.logprob_token_ids is not None:
+                    self.logprob_token_ids[req_id] = sampling_params.logprob_token_ids
+                if sampling_params.logprob_token_ids is not None:
+                if sampling_params.logprob_token_ids is not None:
+                if sampling_params.logprob_token_ids is not None:
+                if sampling_params.logprob_token_ids is not None:
             # A request that already has outputs (resumed after preemption, or re-added after a skipped step)
             # sent its prompt logprobs before; scoring the prompt again would send them twice.
             if sampling_params.prompt_logprobs is not None and not request.output_token_ids:
@@ -490,6 +497,7 @@ class InputBatch:
         self.repetition_penalties_reqs.discard(req_id)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.logprob_token_ids.pop(req_id, None)
         self.num_prompt_logprobs.pop(req_id, None)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
 
@@ -713,6 +721,9 @@ class InputBatch:
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+                idx: ids
+                for req_id, idx in self.req_id_to_index.items()
+            },
         )
 
     def _get_cached_prompt_token_ids(self) -> Optional[torch.Tensor]:
@@ -856,6 +867,7 @@ class InputBatch:
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+            },
         )
 
     def set_async_sampled_token_ids(
