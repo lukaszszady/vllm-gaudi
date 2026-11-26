@@ -603,7 +603,7 @@ def dispatch_bgmv_linear(
     wb = wb.reshape(wb.shape[0] * wb.shape[1], wb.shape[2])
 
     out = x @ wa
-    assert (out.shape == mask.shape)
+    assert out.shape == mask.shape, f"LoRA mask shape {tuple(mask.shape)} does not match {tuple(out.shape)}"
     out = out * mask
     out = out @ wb
     y += out * scale
