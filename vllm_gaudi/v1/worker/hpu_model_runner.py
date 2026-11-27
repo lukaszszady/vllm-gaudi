@@ -968,7 +968,7 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
 
     mamba_like_arch = [
         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
-        "Qwen3NextForCausalLM", "NemotronHForCausalLM"
+        "Qwen3NextForCausalLM", "NemotronHForCausalLM", "FalconH1ForCausalLM"
     ]
     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
         return
@@ -987,6 +987,10 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
                 return layers[idx]
         return None
 
+    # Falcon-H1 registers its mixers as "model.<num_hidden_layers + N>.mixer",
+    # so the layer index cannot be parsed from the name; match the prefix.
+    prefix_to_module = {m.prefix: m for _, m in model.named_modules() if isinstance(getattr(m, 'prefix', None), str)}
+
     # Iterate through all KV cache groups
     for group_idx, kv_group in enumerate(kv_cache_config.kv_cache_groups):
         # kv_group.layer_names contains strings like "model.layers.5.mixer"
@@ -1002,13 +1006,15 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
                 # would also break the int(parts[-2]) index parsing).
                 if not layer_name.endswith('.mixer'):
                     continue
-                layer_idx = int(layer_name.split('.')[-2])  # "...layers.5.mixer" -> 5
-                layer = _get_decoder_layer_by_idx(model, layer_idx)
-                # The Mamba block is exposed as ".mamba" (Granite) or ".mixer"
-                # (Nemotron-H) depending on the model.
-                mamba_mixer = getattr(layer, 'mamba', None)
+                mamba_mixer = prefix_to_module.get(layer_name)
                 if mamba_mixer is None:
-                    mamba_mixer = getattr(layer, 'mixer', None)
+                    layer_idx = int(layer_name.split('.')[-2])  # "...layers.5.mixer" -> 5
+                    layer = _get_decoder_layer_by_idx(model, layer_idx)
+                    # The Mamba block is exposed as ".mamba" (Granite) or ".mixer"
+                    # (Nemotron-H) depending on the model.
+                    mamba_mixer = getattr(layer, 'mamba', None)
+                    if mamba_mixer is None:
+                        mamba_mixer = getattr(layer, 'mixer', None)
                 if mamba_mixer is not None:
                     # A 0-dim tensor, not a Python int, as in the linear_attn
                     # branch below: dynamo specializes on int VALUES, so with N
