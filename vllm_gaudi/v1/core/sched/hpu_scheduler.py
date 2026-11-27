@@ -29,7 +29,7 @@ class HPUScheduler(Scheduler):
         model_config = self.vllm_config.model_config
         return sum(
             model_config.get_num_layers_by_block_type(self.vllm_config.parallel_config, block_type)
-            for block_type in ("mamba", "gdn_attention", "linear_attention"))
+            for block_type in ("mamba", "hybrid", "gdn_attention", "linear_attention"))
 
     @cached_property
     def _align_to_mamba_block(self) -> bool:

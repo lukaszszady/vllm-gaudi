@@ -727,9 +727,9 @@ class HpuPlatform(Platform):
         model_config = getattr(vllm_config, 'model_config', None)
         if model_config is None:
             return False
-        # granitemoehybrid relabels plain mamba layers as "linear_attention"; the
-        # model runner excludes it explicitly or num_gdn is misdetected as > 0.
-        if getattr(model_config.hf_config, 'model_type', None) == 'granitemoehybrid':
+        # granitemoehybrid and jamba relabel plain mamba layers as "linear_attention";
+        # the model runner excludes them explicitly or num_gdn is misdetected as > 0.
+        if getattr(model_config.hf_config, 'model_type', None) in ('granitemoehybrid', 'jamba'):
             return False
         try:
             num_gdn = sum(
