@@ -1685,7 +1685,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # initialize_kv_cache) and re-triggers "not warmed-up" recompilations /
         # non-deterministic tool-calling output.
         self.num_gdn = 0
-        if (self.num_mamba_like_layers > 0 and self.model_config.hf_config.model_type != "granitemoehybrid"):
+        if (self.num_mamba_like_layers > 0
+                and self.model_config.hf_config.model_type not in ("granitemoehybrid", "jamba")):
             # Auto-enable hybrid cache for GDN/mamba-like models.
             gdn_types = ["gdn_attention", "linear_attention"]
             self.num_gdn = sum(
