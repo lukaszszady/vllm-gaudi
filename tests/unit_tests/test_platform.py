@@ -365,7 +365,6 @@ def test_update_block_size_for_backend_realigns_mamba_page_size(monkeypatch):
         block_size=128,
         user_specified_block_size=False,
         mamba_block_size=128,
-        mamba_cache_mode="align",
         mamba_page_size_padded=512,  # wrongly aligned to old block_size=128
         cache_dtype="auto",
         enable_prefix_caching=False,
@@ -495,6 +494,76 @@ def test_update_block_size_aligns_mamba_block_to_chunk_size(chunk_attr, chunk, b
     assert cache_config.mamba_page_size_padded == expected * attn_1tok
 
 
+@pytest.mark.parametrize("block_size, expected", [
+    (208, 256),
+    (768, 768),
+])
+def test_update_block_size_aligns_mamba_block_without_mamba_cache_mode_field(block_size, expected):
+    # New vLLM CacheConfig has no mamba_cache_mode; the mamba-aligned case is
+    # enable_prefix_caching=True.
+    from vllm.platforms import Platform
+
+    attn_1tok = 512
+    cache_config = SimpleNamespace(
+        block_size=128,
+        user_specified_block_size=False,
+        enable_prefix_caching=True,
+        mamba_block_size=block_size,
+        mamba_page_size_padded=block_size * attn_1tok,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="falcon_h1"),
+            hf_text_config=SimpleNamespace(mamba_chunk_size=256),
+            is_hybrid=True,
+        ),
+        cache_config=cache_config,
+    )
+
+    def _align_hybrid(vllm_config):
+        vllm_config.cache_config.block_size = block_size
+
+    with patch.object(Platform, "update_block_size_for_backend", _align_hybrid):
+        HpuPlatform.update_block_size_for_backend(vllm_config)
+
+    assert cache_config.block_size == expected
+    assert cache_config.mamba_block_size == expected
+    assert cache_config.mamba_page_size_padded == expected * attn_1tok
+
+
+def test_update_block_size_no_align_without_prefix_caching():
+    # Without the mamba_cache_mode field and without prefix caching, the
+    # mamba block must not be re-aligned.
+    from vllm.platforms import Platform
+
+    attn_1tok = 512
+    cache_config = SimpleNamespace(
+        block_size=128,
+        user_specified_block_size=False,
+        enable_prefix_caching=False,
+        mamba_block_size=208,
+        mamba_page_size_padded=208 * attn_1tok,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="falcon_h1"),
+            hf_text_config=SimpleNamespace(mamba_chunk_size=256),
+            is_hybrid=True,
+        ),
+        cache_config=cache_config,
+    )
+
+    def _align_hybrid(vllm_config):
+        vllm_config.cache_config.block_size = 208
+
+    with patch.object(Platform, "update_block_size_for_backend", _align_hybrid):
+        HpuPlatform.update_block_size_for_backend(vllm_config)
+
+    assert cache_config.block_size == 208
+    assert cache_config.mamba_block_size == 208
+    assert cache_config.mamba_page_size_padded == 208 * attn_1tok
+
+
 def test_update_block_size_keeps_user_specified_block_size():
     from vllm.platforms import Platform
 
@@ -567,7 +636,6 @@ def test_check_and_update_config_does_not_rescale_granitemoehybrid_mamba_page_si
         block_size=128,
         user_specified_block_size=False,
         mamba_block_size=528,
-        mamba_cache_mode="align",
         mamba_page_size_padded=CORRECT_MAMBA_PAGE_SIZE_PADDED,
         cache_dtype="auto",
         enable_prefix_caching=False,
@@ -709,15 +777,33 @@ _UNSUPPORTED_ENGINE_FEATURES = [
     ("Step5", lambda c: setattr(c.model_config, "architecture", "Step5ForCausalLM")),
 ]
 
+# Added upstream after Model Runner V1 was removed and served there only by Model Runner V2: (id, feature, enable).
+_UNSUPPORTED_MRV2_ONLY_FEATURES = [
+    ("DSpine drafts", "DFlash candidate-head drafts",
+     lambda c: setattr(c, "speculative_config", _dflash_spec(["DSpineDraftModel"]))),
+    ("Qwen3.5 slot decision", "Qwen3.5 slot decision models",
+     lambda c: setattr(c.model_config, "architecture", "Qwen3_5ForSlotDecision")),
+]
+
+
+def _assert_refused_at_startup(feature, enable):
+    vllm_config = _engine_config()
+    enable(vllm_config)
+    with pytest.raises(ValueError, match=f"HPU does not support: {re.escape(feature)}\\."):
+        _run_check_and_update_config(vllm_config)
+
 
 @pytest.mark.parametrize("feature, enable",
                          _UNSUPPORTED_ENGINE_FEATURES,
                          ids=[f for f, _ in _UNSUPPORTED_ENGINE_FEATURES])
 def test_unsupported_engine_features_fail_at_startup(feature, enable):
-    vllm_config = _engine_config()
-    enable(vllm_config)
-    with pytest.raises(ValueError, match=f"HPU does not support: {re.escape(feature)}\\."):
-        _run_check_and_update_config(vllm_config)
+    _assert_refused_at_startup(feature, enable)
+
+
+@pytest.mark.parametrize("feature, enable", [(f, e) for _, f, e in _UNSUPPORTED_MRV2_ONLY_FEATURES],
+                         ids=[i for i, _, _ in _UNSUPPORTED_MRV2_ONLY_FEATURES])
+def test_mrv2_only_features_fail_at_startup(feature, enable):
+    _assert_refused_at_startup(feature, enable)
 
 
 def test_watermarking_without_speculative_decoding_passes_startup():
