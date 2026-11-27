@@ -396,9 +396,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
     # NOTE(Xinyu): Make the loaded weight contiguous to avoid the transpose
     # during each graph execution
     def process_weights_after_loading(self, act_dtype: Optional[torch.dtype] = None):
-        # finalize_model_weights scans nn.Module children and calls their hook
-        # with no argument; skip here: the parent MLAAttention drives this
-        # processing with the real act_dtype.
+        # act_dtype is optional: finalize_model_weights calls this without it.
         if act_dtype is None:
             return
         super().process_weights_after_loading(act_dtype)
@@ -532,9 +530,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         self.is_chunked_attention = False
 
     def process_weights_after_loading(self, act_dtype: Optional[torch.dtype] = None):
-        # Keep the base no-op but accept a missing act_dtype, so the argument
-        # less call from finalize_model_weights does not raise; the parent
-        # Attention drives the processing.
+        # act_dtype is optional: finalize_model_weights calls this without it.
         del act_dtype
 
     def _maybe_init_alibi_biases(

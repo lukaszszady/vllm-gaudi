@@ -12,9 +12,7 @@ class HPUConv2dLayer(Conv2dLayer):
         K1, K2 = self.kernel_size
         H, W = H // K1, W // K2
 
-        # HPU doesn't support unfold; view whole patches only. Narrow to
-        # H*K1 x W*K2 like the valid stride==kernel conv so non-divisible
-        # spatial sizes match the reference instead of failing the view.
+        # HPU lacks unfold; narrow so the view matches a valid stride==kernel conv.
         x = x.narrow(2, 0, H * K1).narrow(3, 0, W * K2).contiguous()
         x = x.view(B, C, H, K1, W, K2)
         x = x.permute(0, 2, 4, 1, 3, 5).reshape(-1, self.input_size)  # [B*H*W, C*K1*K2]

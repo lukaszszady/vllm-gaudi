@@ -124,8 +124,7 @@ class HpuPlatform(Platform):
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
-        # float16 models are run in bfloat16 (see check_and_update_config); resolving "auto" to bfloat16 up front
-        # keeps quantization dtype checks consistent with the dtype actually used.
+        # float16 runs as bfloat16 (see check_and_update_config).
         return [torch.bfloat16, torch.float32]
 
     @classmethod
@@ -628,21 +627,18 @@ class HpuPlatform(Platform):
 
     @classmethod
     def _align_mamba_block_to_chunk_size(cls, vllm_config: "VllmConfig") -> None:
-        """Make the mamba block a multiple of the model's explicit mamba chunk
-        size and of the HPU block size 128, as the HPU runner requires with
-        prefix caching."""
+        """Align the mamba block size to the model's mamba chunk size."""
         from vllm.utils.math_utils import cdiv
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
-        if (model_config is None or not getattr(model_config, "is_hybrid", False)
-                or getattr(cache_config, "mamba_cache_mode", None) != "align"
+        if (model_config is None or not model_config.is_hybrid or cache_config.mamba_cache_mode != "align"
                 or cache_config.mamba_page_size_padded is None):
             return
         hf_text_config = model_config.hf_text_config
         chunk_size = (getattr(hf_text_config, "mamba_chunk_size", None) or getattr(hf_text_config, "chunk_size", None))
-        old_block_size = cache_config.block_size
         if not chunk_size:
             return
+        old_block_size = cache_config.block_size
         multiple = math.lcm(chunk_size, 128)
         if old_block_size % multiple == 0 or cache_config.mamba_page_size_padded % old_block_size != 0:
             return
