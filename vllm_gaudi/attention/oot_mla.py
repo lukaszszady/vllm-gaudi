@@ -245,19 +245,13 @@ class HPUMLAAttention(MLAAttention):
             if not should_load_quant_weights(quant_method):
                 set_default_quant_scales(self, register_buffer=False)
         else:
-            # Non-FP8 kv_b_proj: use upstream logic as before.
-            # On reload, upstream rebinds W_UV/W_UK_T to strided views of a
-            # temporary; keep the storage of the existing contiguous weights.
+            # Non-FP8: the upstream pass rebinds W_UV/W_UK_T (vllm#48251); cache the storage for reuse.
             prev_storage = {}
             for name in ("W_UV", "W_UK_T"):
                 param = getattr(self, name, None)
                 if isinstance(param, torch.nn.Parameter) and not param.is_meta and param.is_contiguous():
                     prev_storage[name] = param.data
             MLAAttention.process_weights_after_loading(self)
-            # Since vllm#48251 base registers W_UV/W_UK_T as nn.Parameter (via
-            # replace_parameter), so a plain tensor reassignment raises
-            # TypeError. Route the contiguous() update through replace_parameter
-            # to preserve the registration.
             for name in ("W_UV", "W_UK_T"):
                 weight = getattr(self, name).contiguous()
                 prev = prev_storage.get(name)

@@ -1069,15 +1069,7 @@ class InputBatch:
 
     @property
     def needs_output_token_ids(self) -> bool:
-        """Whether any sampler consumer reads output_token_ids this batch.
-
-        Penalties, bad_words and watermarking read it, so the -1 placeholders must be
-        repaired before sampling if any is active for any request.
-
-        Upstream also ORs in a custom-logitsprocs flag. HPU refuses custom
-        logits processors, and of the builtin ones only min_tokens reads the
-        outputs, for their count, which the placeholders keep right.
-        """
+        """Whether any sampler consumer (penalties, bad words, watermarking) reads output_token_ids."""
         return not self.no_penalties or bool(self.bad_words_token_ids) or bool(self.watermarking_reqs)
 
     @property
