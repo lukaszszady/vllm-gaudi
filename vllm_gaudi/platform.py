@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import math
 import os
 import types
 from typing import TYPE_CHECKING, Optional, Union
@@ -628,7 +629,8 @@ class HpuPlatform(Platform):
     @classmethod
     def _align_mamba_block_to_chunk_size(cls, vllm_config: "VllmConfig") -> None:
         """Make the mamba block a multiple of the model's explicit mamba chunk
-        size, as the HPU runner requires with prefix caching."""
+        size and of the HPU block size 128, as the HPU runner requires with
+        prefix caching."""
         from vllm.utils.math_utils import cdiv
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
@@ -639,10 +641,12 @@ class HpuPlatform(Platform):
         hf_text_config = model_config.hf_text_config
         chunk_size = (getattr(hf_text_config, "mamba_chunk_size", None) or getattr(hf_text_config, "chunk_size", None))
         old_block_size = cache_config.block_size
-        if (not chunk_size or old_block_size % chunk_size == 0
-                or cache_config.mamba_page_size_padded % old_block_size != 0):
+        if not chunk_size:
             return
-        new_block_size = chunk_size * cdiv(old_block_size, chunk_size)
+        multiple = math.lcm(chunk_size, 128)
+        if old_block_size % multiple == 0 or cache_config.mamba_page_size_padded % old_block_size != 0:
+            return
+        new_block_size = multiple * cdiv(old_block_size, multiple)
         attn_page_size_1_token = cache_config.mamba_page_size_padded // old_block_size
         cache_config.mamba_page_size_padded = new_block_size * attn_page_size_1_token
         cache_config.block_size = new_block_size

@@ -452,14 +452,17 @@ def test_update_block_size_restores_hpu_default_after_multi_backend_selection():
     log.info.assert_any_call("Restoring HPU block_size to 128 after multi-backend default selection.")
 
 
-@pytest.mark.parametrize("chunk_attr, block_size, expected", [
-    ("mamba_chunk_size", 896, 1024),
-    ("chunk_size", 896, 1024),
-    ("mamba_chunk_size", 208, 256),
-    ("mamba_chunk_size", 768, 768),
-    (None, 896, 896),
+@pytest.mark.parametrize("chunk_attr, chunk, block_size, expected", [
+    ("mamba_chunk_size", 256, 896, 1024),
+    ("chunk_size", 256, 896, 1024),
+    ("mamba_chunk_size", 256, 208, 256),
+    ("mamba_chunk_size", 256, 768, 768),
+    ("mamba_chunk_size", 64, 160, 256),
+    ("mamba_chunk_size", 64, 192, 256),
+    ("mamba_chunk_size", 64, 256, 256),
+    (None, 256, 896, 896),
 ])
-def test_update_block_size_aligns_mamba_block_to_chunk_size(chunk_attr, block_size, expected):
+def test_update_block_size_aligns_mamba_block_to_chunk_size(chunk_attr, chunk, block_size, expected):
     from vllm.platforms import Platform
 
     attn_1tok = 512
@@ -473,7 +476,9 @@ def test_update_block_size_aligns_mamba_block_to_chunk_size(chunk_attr, block_si
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(model_type="falcon_h1"),
-            hf_text_config=SimpleNamespace(**({chunk_attr: 256} if chunk_attr else {})),
+            hf_text_config=SimpleNamespace(**({
+                chunk_attr: chunk
+            } if chunk_attr else {})),
             is_hybrid=True,
         ),
         cache_config=cache_config,
