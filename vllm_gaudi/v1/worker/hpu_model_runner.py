@@ -5653,6 +5653,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             pooler_output_list = []
             pooling_params = self.input_batch.pooling_params
             pooling_states = self.input_batch.pooling_states
+            pp_group = get_pp_group()
             htorch.core.mark_step()
             for i, prefillInputData in enumerate(prefillInputData_list):
                 (req_id, input_ids, position_ids, num_scheduled_tokens, attn_metadata,
@@ -5660,6 +5661,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 model_kwargs = {}
                 if token_type_ids is not None and len(token_type_ids) > 0:
                     model_kwargs["token_type_ids"] = token_type_ids
+                if not pp_group.is_first_rank:
+                    model_kwargs["intermediate_tensors"] = IntermediateTensors(
+                        pp_group.recv_tensor_dict(all_gather_group=get_tp_group()))
 
                 lora_mask, lora_logits_mask = self._configure_lora(input_ids.view(1, -1), self.requests, [req_id], True)
                 if lora_mask is not None:
@@ -5673,6 +5677,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         **model_kwargs,
                     )
                 htorch.core.mark_step()
+                if isinstance(hidden_states, IntermediateTensors):
+                    pp_group.send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
+                    continue
                 # Input was padded to a prompt bucket; pool only the tokens of
                 # this request so lengths match the pooling metadata.
                 flattened = hidden_states.view(-1, hidden_states.shape[-1])[:num_scheduled_tokens]
@@ -5693,6 +5700,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 req_ids_list.append(req_id)
                 pooler_output_list.append(pooled_output[0])
             htorch.core.mark_step()
+            if not pp_group.is_last_rank:
+                return EMPTY_MODEL_RUNNER_OUTPUT
             pooler_output_list_cpu = [tensor.cpu() for tensor in pooler_output_list]
             assert_output_rows(req_ids_list, len(pooler_output_list_cpu))
             pooled_output = ModelRunnerOutput(
