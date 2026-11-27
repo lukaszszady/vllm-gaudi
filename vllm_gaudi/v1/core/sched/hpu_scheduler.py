@@ -20,7 +20,7 @@ class HPUScheduler(Scheduler):
 
         Hybrid GDN / linear-attention models (e.g. Qwen3.5, Qwen3-Next) type
         their layers "gdn_attention"/"linear_attention", so a "mamba"-only query
-        returns 0. Summing all three keeps this scheduler override in lock-step
+        returns 0. Summing all mamba-like types keeps this scheduler override in lock-step
         with the runner; otherwise the override self-disables and the runner
         asserts ``context_lens[0] % mamba_chunk_size == 0`` on an unaligned
         value, killing every TP worker. Layer typing is fixed for the model's

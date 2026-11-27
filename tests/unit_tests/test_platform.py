@@ -178,8 +178,9 @@ def test_compact_gdn_inactive_without_gdn_layers():
     assert HpuPlatform._compact_gdn_active(_fake_vllm_config(gdn_layers=0)) is False
 
 
-def test_compact_gdn_excludes_granitemoehybrid():
-    cfg = _fake_vllm_config(model_type="granitemoehybrid", gdn_layers=4)
+@pytest.mark.parametrize("model_type", ["granitemoehybrid", "jamba"])
+def test_compact_gdn_excludes_relabeled_mamba_hybrids(model_type):
+    cfg = _fake_vllm_config(model_type=model_type, gdn_layers=4)
     assert HpuPlatform._compact_gdn_active(cfg) is False
 
 
