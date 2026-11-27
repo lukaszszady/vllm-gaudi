@@ -1667,7 +1667,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        mamba_like = ["mamba", "gdn_attention", "linear_attention"]
+        # "hybrid" layers (Falcon-H1, Zamba2) hold mamba and attention in one layer.
+        mamba_like = ["mamba", "hybrid", "gdn_attention", "linear_attention"]
 
         self.num_mamba_like_layers = sum(
             self.model_config.get_num_layers_by_block_type(self.parallel_config, block_type)
