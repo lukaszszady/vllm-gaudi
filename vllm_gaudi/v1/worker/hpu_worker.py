@@ -688,7 +688,6 @@ class HPUWorker(WorkerBase):
         msg = ("Model profiling run "
                f"took {m.get_summary_string()}")
         logger.info(msg)
-        self._profile_pp_comm()
         # At this point we should've allocated the maximum workspace for all
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
@@ -811,23 +810,6 @@ class HPUWorker(WorkerBase):
         # Coerce to int here so every downstream path (uniform AND
         # heterogeneous) receives an integer byte budget.
         return int(available)
-
-    def _profile_pp_comm(self) -> None:
-        """Run a PP send/recv of a max-sized hidden-states tensor so that the
-        communicator and transfer buffers are allocated before the KV cache
-        budget is computed. No-op without pipeline parallelism."""
-        pp_group = get_pp_group()
-        if pp_group.world_size == 1:
-            return
-        shape = (self.scheduler_config.max_num_batched_tokens, self.model_config.get_hidden_size())
-        tensors = {"hidden_states": torch.zeros(shape, dtype=self.model_config.dtype, device='hpu')}
-        if not pp_group.is_first_rank:
-            tensors = pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
-        if not pp_group.is_last_rank:
-            pp_group.send_tensor_dict(tensors, all_gather_group=get_tp_group())
-        torch.hpu.synchronize()
-        del tensors
-        gc.collect()
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
