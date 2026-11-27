@@ -452,6 +452,43 @@ def test_update_block_size_restores_hpu_default_after_multi_backend_selection():
     log.info.assert_any_call("Restoring HPU block_size to 128 after multi-backend default selection.")
 
 
+@pytest.mark.parametrize("chunk_attr, block_size, expected", [
+    ("mamba_chunk_size", 896, 1792),
+    ("chunk_size", 896, 1792),
+    ("mamba_chunk_size", 768, 768),
+    (None, 896, 896),
+])
+def test_update_block_size_aligns_mamba_block_to_chunk_size(chunk_attr, block_size, expected):
+    from vllm.platforms import Platform
+
+    attn_1tok = 512
+    cache_config = SimpleNamespace(
+        block_size=128,
+        user_specified_block_size=False,
+        mamba_cache_mode="align",
+        mamba_block_size=block_size,
+        mamba_page_size_padded=block_size * attn_1tok,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="falcon_h1"),
+            hf_text_config=SimpleNamespace(**({chunk_attr: 256} if chunk_attr else {})),
+            is_hybrid=True,
+        ),
+        cache_config=cache_config,
+    )
+
+    def _align_hybrid(vllm_config):
+        vllm_config.cache_config.block_size = block_size
+
+    with patch.object(Platform, "update_block_size_for_backend", _align_hybrid):
+        HpuPlatform.update_block_size_for_backend(vllm_config)
+
+    assert cache_config.block_size == expected
+    assert cache_config.mamba_block_size == expected
+    assert cache_config.mamba_page_size_padded == expected * attn_1tok
+
+
 def test_update_block_size_keeps_user_specified_block_size():
     from vllm.platforms import Platform
 

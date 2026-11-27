@@ -611,6 +611,7 @@ class HpuPlatform(Platform):
             super().update_block_size_for_backend(vllm_config)
         else:
             super().update_block_size_for_backend(vllm_config)
+            cls._align_mamba_block_to_chunk_size(vllm_config)
             # Upstream keeps vLLM's default block size (16) when a model has
             # more than one attention backend and every backend accepts it.
             # Llama-4 does: full attention plus a chunked-local subclass.
@@ -623,6 +624,29 @@ class HpuPlatform(Platform):
                     and cache_config.block_size == CacheConfig.DEFAULT_BLOCK_SIZE):
                 logger.info("Restoring HPU block_size to 128 after multi-backend default selection.")
                 cache_config.block_size = 128
+
+    @classmethod
+    def _align_mamba_block_to_chunk_size(cls, vllm_config: "VllmConfig") -> None:
+        """Make the mamba block a multiple of the model's explicit mamba chunk
+        size, as the HPU runner requires with prefix caching."""
+        from math import lcm
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        if (model_config is None or not getattr(model_config, "is_hybrid", False)
+                or getattr(cache_config, "mamba_cache_mode", None) != "align"
+                or cache_config.mamba_page_size_padded is None):
+            return
+        hf_text_config = model_config.hf_text_config
+        chunk_size = (getattr(hf_text_config, "mamba_chunk_size", None) or getattr(hf_text_config, "chunk_size", None))
+        if not chunk_size or cache_config.block_size % chunk_size == 0:
+            return
+        old_block_size = cache_config.block_size
+        new_block_size = lcm(old_block_size, chunk_size)
+        cache_config.mamba_page_size_padded = cache_config.mamba_page_size_padded // old_block_size * new_block_size
+        cache_config.block_size = new_block_size
+        cache_config.mamba_block_size = new_block_size
+        logger.info("Raised hybrid block_size from %d to %d to be a multiple of mamba chunk size %d.", old_block_size,
+                    new_block_size, chunk_size)
 
     @classmethod
     def is_pin_memory_available(cls):
