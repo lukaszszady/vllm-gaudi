@@ -453,8 +453,9 @@ def test_update_block_size_restores_hpu_default_after_multi_backend_selection():
 
 
 @pytest.mark.parametrize("chunk_attr, block_size, expected", [
-    ("mamba_chunk_size", 896, 1792),
-    ("chunk_size", 896, 1792),
+    ("mamba_chunk_size", 896, 1024),
+    ("chunk_size", 896, 1024),
+    ("mamba_chunk_size", 208, 256),
     ("mamba_chunk_size", 768, 768),
     (None, 896, 896),
 ])

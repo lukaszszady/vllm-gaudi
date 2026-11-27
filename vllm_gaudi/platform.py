@@ -629,7 +629,7 @@ class HpuPlatform(Platform):
     def _align_mamba_block_to_chunk_size(cls, vllm_config: "VllmConfig") -> None:
         """Make the mamba block a multiple of the model's explicit mamba chunk
         size, as the HPU runner requires with prefix caching."""
-        from math import lcm
+        from vllm.utils.math_utils import cdiv
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         if (model_config is None or not getattr(model_config, "is_hybrid", False)
@@ -638,11 +638,13 @@ class HpuPlatform(Platform):
             return
         hf_text_config = model_config.hf_text_config
         chunk_size = (getattr(hf_text_config, "mamba_chunk_size", None) or getattr(hf_text_config, "chunk_size", None))
-        if not chunk_size or cache_config.block_size % chunk_size == 0:
-            return
         old_block_size = cache_config.block_size
-        new_block_size = lcm(old_block_size, chunk_size)
-        cache_config.mamba_page_size_padded = cache_config.mamba_page_size_padded // old_block_size * new_block_size
+        if (not chunk_size or old_block_size % chunk_size == 0
+                or cache_config.mamba_page_size_padded % old_block_size != 0):
+            return
+        new_block_size = chunk_size * cdiv(old_block_size, chunk_size)
+        attn_page_size_1_token = cache_config.mamba_page_size_padded // old_block_size
+        cache_config.mamba_page_size_padded = new_block_size * attn_page_size_1_token
         cache_config.block_size = new_block_size
         cache_config.mamba_block_size = new_block_size
         logger.info("Raised hybrid block_size from %d to %d to be a multiple of mamba chunk size %d.", old_block_size,
