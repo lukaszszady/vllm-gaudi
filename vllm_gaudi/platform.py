@@ -627,7 +627,7 @@ class HpuPlatform(Platform):
 
     @classmethod
     def _align_mamba_block_to_chunk_size(cls, vllm_config: "VllmConfig") -> None:
-        """Align the mamba block size to the model's mamba chunk size."""
+        """Align the mamba block size to lcm(mamba chunk size, HPU block size 128)."""
         from vllm.utils.math_utils import cdiv
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config

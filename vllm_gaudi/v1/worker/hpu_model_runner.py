@@ -3062,6 +3062,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if hasattr(model, "mm_lora_item_hook"):
             model.mm_lora_item_hook = None
 
+    def _use_mm_lora(self) -> bool:
+        return bool(self.lora_config) and self.lora_manager.supports_tower_connector_lora()
+
     def _set_mm_encoder_lora(self, items: list[tuple[Optional[LoRARequest], Any]]) -> None:
         """Activate LoRAs and build per-token masks for one tower/connector batch."""
         adapter_manager = self.lora_manager._adapter_manager
@@ -3184,7 +3187,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
-        use_mm_lora = bool(self.lora_config) and self.lora_manager.supports_tower_connector_lora() \
+        use_mm_lora = self._use_mm_lora() \
             and len(mm_lora_items) == len(mm_kwargs)
         item_start = 0
         encoder_req_ids = [r for r in req_ids if r in scheduler_output.scheduled_encoder_inputs]
@@ -5927,8 +5930,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             structured_decode_req_ids: list[str] = []
             self.use_structured_output = True
 
-        is_first_pp_rank = get_pp_group().is_first_rank
-        is_last_pp_rank = get_pp_group().is_last_rank
+        pp_group = get_pp_group()
+        is_first_pp_rank = pp_group.is_first_rank
+        is_last_pp_rank = pp_group.is_last_rank
         ######################### PREFILLS #########################
         if num_prefills > 0:
             htorch.core.mark_step()
@@ -7728,7 +7732,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         vision_bucket_manager = self.get_model().vision_bucket_manager
         is_batch_based = vision_bucket_manager.is_batch_based
         mm_config = self.model_config.get_multimodal_config()
-        use_mm_lora = bool(self.lora_config) and self.lora_manager.supports_tower_connector_lora()
+        use_mm_lora = self._use_mm_lora()
 
         is_image_warmup = (mm_config is not None and mm_config.limit_per_prompt.get("image") is not None
                            and "image" in self.mm_budget.mm_limits and self.mm_budget.mm_limits['image'] != 0)

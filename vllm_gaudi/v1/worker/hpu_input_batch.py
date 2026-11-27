@@ -1053,15 +1053,7 @@ class InputBatch:
 
     @property
     def needs_output_token_ids(self) -> bool:
-        """Whether any sampler consumer reads output_token_ids this batch.
-
-        Penalties, bad_words and watermarking read it, so the -1 placeholders must be
-        repaired before sampling if any is active for any request.
-
-        Upstream also ORs in a custom-logitsprocs flag; unreachable here because
-        batch_update_builder is never populated on HPU (see the PR#16728 TODO in
-        _make_sampling_metadata). Add it back when batch_update is enabled.
-        """
+        """Whether any sampler consumer (penalties, bad words, watermarking) reads output_token_ids."""
         return not self.no_penalties or bool(self.bad_words_token_ids) or bool(self.watermarking_reqs)
 
     @property
