@@ -597,6 +597,23 @@ class HPUWorker(WorkerBase):
         logger.info("[HPUWorker] Restored stashed runner for model: %s", restored_config.model_config.model)
         return {"restored": True}
 
+    def _diag_mem(self, tag: str) -> None:
+        """Temporary diagnostic (VLLM_HPU_MEM_DIAG=1): log device memory as seen by
+        the driver (mem_get_info) vs. the PyTorch allocator, per PP rank."""
+        if os.environ.get('VLLM_HPU_MEM_DIAG', '0') != '1' or is_fake_hpu():
+            return
+        free, total = torch.hpu.mem_get_info()
+        try:
+            alloc, reserved = torch.hpu.memory_allocated(), torch.hpu.memory_reserved()
+            peak = torch.hpu.max_memory_allocated()
+        except Exception:  # API may be missing on older stacks
+            alloc = reserved = peak = -1
+        kv = sum(t.numel() * t.element_size() for kvs in (getattr(self.model_runner, 'kv_caches', None) or [])
+                 for t in (kvs if isinstance(kvs, (tuple, list)) else (kvs, )) if isinstance(t, torch.Tensor))
+        logger.warning("MEMDIAG[pp_rank=%s] %s: free=%d total=%d driver_used=%d torch_alloc=%d torch_reserved=%d "
+                       "torch_peak=%d kv_bytes=%d non_torch_used=%d", get_pp_group().rank_in_group, tag, free, total,
+                       total - free, alloc, reserved, peak, kv, (total - free) - reserved)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how many
@@ -691,6 +708,7 @@ class HPUWorker(WorkerBase):
         # At this point we should've allocated the maximum workspace for all
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
+        self._diag_mem("determine_available_memory(after model load, no dummy forward)")
 
         try:
             graph_reserved_mem = (float(os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
@@ -849,7 +867,9 @@ class HPUWorker(WorkerBase):
         msg = ("Initializing cache engine "
                f"took {m.get_summary_string()}")
         logger.info(msg)
+        self._diag_mem("after initialize_kv_cache")
         self.compile_or_warm_up_model()
+        self._diag_mem("after compile_or_warm_up_model")
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Don't run the warmup if the model is already warmed up
@@ -865,7 +885,18 @@ class HPUWorker(WorkerBase):
         )
 
     def sample_tokens(self, grammar_output: "GrammarOutput|None") -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        if os.environ.get('VLLM_HPU_MEM_DIAG', '0') != '1':
+            return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        self._diag_mem("sample_tokens enter")
+        try:
+            return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
+        except RuntimeError:
+            self._diag_mem("sample_tokens FAILED")
+            try:
+                logger.warning("MEMDIAG memory_stats: %s", torch.hpu.memory_stats())
+            except Exception:
+                pass
+            raise
 
     @torch.inference_mode()
     def execute_model(
