@@ -393,7 +393,7 @@ def test_update_block_size_for_backend_realigns_mamba_page_size(monkeypatch):
 
 def _non_hybrid_vllm_config(block_size, user_specified):
     return SimpleNamespace(
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="llama4")),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="llama4"), is_hybrid=False),
         cache_config=SimpleNamespace(block_size=block_size, user_specified_block_size=user_specified),
     )
 

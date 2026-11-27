@@ -3060,8 +3060,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
     def _clear_mm_encoder_lora(self) -> None:
         self._set_mm_encoder_lora_masks(None, None)
-        if hasattr(self.get_model(), "mm_lora_item_hook"):
-            self.get_model().mm_lora_item_hook = None
+        model = self.get_model()
+        if hasattr(model, "mm_lora_item_hook"):
+            model.mm_lora_item_hook = None
 
     def _set_mm_encoder_lora(self, items: list[tuple[Optional[LoRARequest], Any]]) -> None:
         """Activate LoRAs and build per-token masks for one tower/connector batch."""
@@ -3074,6 +3075,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                            num_mm_embeds=f.mm_position.get_num_embeds()) for _, f in items
         ]
         tower_counts = [t for t, _ in counts]
+        connector_counts = [c for _, c in counts]
         has_connector = bool(adapter_manager.mm_mapping.connector) and all(c is not None for _, c in counts)
         lora_requests = {r for r, _ in items if r}
 
@@ -3096,7 +3098,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         activate(tower_counts, LoRAMappingType.TOWER)
         if hasattr(model, "mm_lora_item_hook"):
             # The model pads each item itself, so it requests masks per item at the padded row count.
-            connector_counts = [c for _, c in counts]
             if has_connector:
                 activate(connector_counts, LoRAMappingType.CONNECTOR)
 
@@ -3109,7 +3110,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             return
         connector_mask = None
         if has_connector:
-            connector_counts = [c for _, c in counts]
             activate(connector_counts, LoRAMappingType.CONNECTOR)
             connector_mask = build(lora_ids, connector_counts)
         self._set_mm_encoder_lora_masks(build(lora_ids, tower_counts), connector_mask)
@@ -3489,30 +3489,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         compiled = [(name, module) for name, module in model.named_modules()
                     if name and isinstance(module, torch._dynamo.eval_frame.OptimizedModule)]
 
-        def swap(name, module):
-            parent = model
-            for part in name.split(".")[:-1]:
-                if isinstance(parent, torch.nn.ModuleList):
-                    parent = parent[int(part)]
-                elif isinstance(parent, torch.nn.ModuleDict):
-                    parent = parent[part]
-                else:
-                    parent = getattr(parent, part)
-            last = name.split(".")[-1]
-            if isinstance(parent, torch.nn.ModuleList):
-                parent[int(last)] = module
-            elif isinstance(parent, torch.nn.ModuleDict):
-                parent[last] = module
-            else:
-                setattr(parent, last, module)
-
         for name, module in compiled:
-            swap(name, module._orig_mod)
+            setattr_nested(model, name, module._orig_mod)
         try:
             yield model
         finally:
             for name, module in compiled:
-                swap(name, module)
+                setattr_nested(model, name, module)
 
     def is_decoder_only(self, req_id) -> bool:
         return bool(req_id in self.input_batch.req_type and \
