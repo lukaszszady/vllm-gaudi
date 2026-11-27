@@ -614,6 +614,32 @@ class HPUWorker(WorkerBase):
                        "torch_peak=%d kv_bytes=%d non_torch_used=%d", get_pp_group().rank_in_group, tag, free, total,
                        total - free, alloc, reserved, peak, kv, (total - free) - reserved)
 
+    def _diag_probe_alloc(self) -> None:
+        """Temporary diagnostic: how much device memory is really allocatable."""
+        step = 256 << 20
+        held = []
+        got = 0
+        err = ''
+        try:
+            while got < (32 << 30):
+                held.append(torch.empty(step, dtype=torch.uint8, device='hpu'))
+                torch.hpu.synchronize()
+                got += step
+        except RuntimeError as e:
+            err = str(e)[:200]
+        logger.warning("MEMDIAG[pp_rank=%s] probe allocatable=%d in 256MiB steps err=%s",
+                       get_pp_group().rank_in_group, got, err)
+        del held
+        small_err = ''
+        try:
+            t = torch.empty(2 << 20, dtype=torch.uint8, device='hpu')
+            t.fill_(1)
+            t[:8].cpu()
+        except RuntimeError as e:
+            small_err = str(e)[:200]
+        logger.warning("MEMDIAG[pp_rank=%s] probe 2MiB alloc+cpu err=%s stats=%s", get_pp_group().rank_in_group,
+                       small_err, torch.hpu.memory_stats())
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how many
@@ -888,6 +914,9 @@ class HPUWorker(WorkerBase):
         if os.environ.get('VLLM_HPU_MEM_DIAG', '0') != '1':
             return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
         self._diag_mem("sample_tokens enter")
+        if not getattr(self, '_diag_probed', False):
+            self._diag_probed = True
+            self._diag_probe_alloc()
         try:
             return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
         except RuntimeError:
