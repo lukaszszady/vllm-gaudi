@@ -342,8 +342,8 @@ class HPUMambaMixer2(MambaMixer2):
 
         if mup_vector is not None:
             gate_size = self.tped_intermediate_size
-            states_proj = states_proj * mup_vector[gate_size:]
-            gate = gate * mup_vector[:gate_size]
+            states_proj = states_proj * mup_vector[..., gate_size:]
+            gate = gate * mup_vector[..., :gate_size]
 
         # 2. Prepare output buffer for conv + SSM
         ssm_output = torch.empty(
